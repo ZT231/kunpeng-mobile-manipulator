@@ -1,0 +1,100 @@
+# 移动操作机器人 · IoT 栈最小闭环
+# 架构: 模拟设备 --MQTT--> EMQX --(eKuiper 规则引擎)--> InfluxDB --Grafana 看板
+# 平台: KunPeng Pro (openEuler 22.03, aarch64) + Docker arm64 镜像
+# 所有镜像均为官方 multi-arch, 在鲲鹏上自动拉取 arm64 版本
+# 已核实: emqx:5.8.8(含arm64) / lfedge/ekuiper:2.1.0-full(含influx2插件) / influxdb:2.7 / grafana:11.3.0 均为有效 tag
+
+networks:
+  iot:
+    driver: bridge
+
+volumes:
+  emqx-data:
+  ekuiper-data:
+  influxdb-data:
+  grafana-data:
+
+services:
+  # ---- MQTT Broker (边网关) ----
+  emqx:
+    image: emqx:5.8.8
+    container_name: emqx
+    restart: unless-stopped
+    ports:
+      - "1883:1883"      # MQTT 设备/客户端接入
+      - "18083:18083"    # EMQX Web 控制台 (admin / robotics123)
+    environment:
+      # 固定 Dashboard 密码, 方便登录; 生产环境应改复杂
+      EMQX_DASHBOARD__DEFAULT__PASSWORD: "robotics123"
+      EMQX_NODE__NAME: "emqx@127.0.0.1"
+    healthcheck:
+      # EMQX 5.x 官方推荐的容器健康检查命令
+      test: ["CMD", "emqx", "ctl", "status"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    networks: [iot]
+    volumes:
+      - emqx-data:/opt/emqx/data
+
+  # ---- 边缘规则引擎 (eKuiper) ----
+  ekuiper:
+    image: lfedge/ekuiper:2.1.0-full
+    container_name: ekuiper
+    restart: unless-stopped
+    ports:
+      - "9081:9081"      # eKuiper REST API
+    environment:
+      # 让 eKuiper 的 MQTT source 连到同网络内的 emqx
+      MQTT_SOURCE__DEFAULT__SERVER: "tcp://emqx:1883"
+    depends_on:
+      emqx:
+        condition: service_healthy
+    networks: [iot]
+    volumes:
+      - ekuiper-data:/kuiper/data
+
+  # ---- 时序数据库 (InfluxDB 2.x) ----
+  influxdb:
+    image: influxdb:2.7
+    container_name: influxdb
+    restart: unless-stopped
+    ports:
+      - "8086:8086"      # InfluxDB HTTP API
+    environment:
+      # 首次启动自动初始化 (setup 模式), 之后忽略
+      DOCKER_INFLUXDB_INIT_MODE: "setup"
+      DOCKER_INFLUXDB_INIT_USERNAME: "admin"
+      DOCKER_INFLUXDB_INIT_PASSWORD: "robotics123"
+      DOCKER_INFLUXDB_INIT_ORG: "robotics"
+      DOCKER_INFLUXDB_INIT_BUCKET: "telemetry"
+      DOCKER_INFLUXDB_INIT_ADMIN_TOKEN: "robotics_admin_token_2026"
+    healthcheck:
+      # InfluxDB 2.x 官方镜像未内置 HEALTHCHECK, 且大概率没装 curl;
+      # 用自带的 influx CLI 的 ping 子命令做健康检查 (已核实正确)
+      test: ["CMD", "influx", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 30s
+    networks: [iot]
+    volumes:
+      - influxdb-data:/var/lib/influxdb2
+
+  # ---- 看板 (Grafana) ----
+  grafana:
+    image: grafana/grafana:11.3.0
+    container_name: grafana
+    restart: unless-stopped
+    ports:
+      - "3000:3000"      # Grafana Web (admin / robotics123)
+    environment:
+      GF_SECURITY_ADMIN_PASSWORD: "robotics123"
+    depends_on:
+      influxdb:
+        condition: service_healthy
+    networks: [iot]
+    volumes:
+      - grafana-data:/var/lib/grafana
+      # 自动注入 InfluxDB 数据源, 打开即有, 无需手动配
+      - ./grafana/provisioning:/etc/grafana/provisioning

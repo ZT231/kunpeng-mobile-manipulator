@@ -1,0 +1,6 @@
+# 行尾统一：仓库内一律以 LF 存储，检出时按类型转换
+# - .bat 检出为 CRLF：cmd.exe 解析批处理必须 CRLF，LF 会直接报语法错
+# - .sh 必须 LF：CRLF 会让 shebang 失效
+* text=auto
+*.bat text eol=crlf
+*.sh  text eol=lf
