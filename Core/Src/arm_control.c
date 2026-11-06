@@ -17,13 +17,15 @@ static const uint16_t servo_max[ARM_CHANNEL_COUNT] =
     SERVO_J4_MAX, SERVO_J5_MAX, SERVO_J6_MAX
 };
 
-static const uint16_t servo_mid[ARM_CHANNEL_COUNT] =
+/* 六路「初始位」表：上电与 HOME 命令的目标脉宽，来自 main.h 的 SERVO_Jx_INIT。
+ * 注意：这不是运动学 0° 的标定零位（那个在 arm_params.json 的 map 里）。 */
+static const uint16_t servo_init[ARM_CHANNEL_COUNT] =
 {
-    SERVO_J1_MID, SERVO_J2_MID, SERVO_J3_MID,
-    SERVO_J4_MID, SERVO_J5_MID, SERVO_J6_MID
+    SERVO_J1_INIT, SERVO_J2_INIT, SERVO_J3_INIT,
+    SERVO_J4_INIT, SERVO_J5_INIT, SERVO_J6_INIT
 };
 
-/* 目标脉宽、当前脉宽、HOME 位 */
+/* 目标脉宽、当前脉宽、初始位（HOME 位） */
 static uint16_t target_pulse[ARM_CHANNEL_COUNT];
 static uint16_t current_pulse[ARM_CHANNEL_COUNT];
 static uint16_t home_pulse[ARM_CHANNEL_COUNT];
@@ -129,15 +131,16 @@ void Arm_Init(void)
 
     for (i = 0U; i < ARM_CHANNEL_COUNT; i++)
     {
-        home_pulse[i] = servo_mid[i];
+        home_pulse[i] = servo_init[i];
         target_pulse[i] = home_pulse[i];
         current_pulse[i] = home_pulse[i];
         last_sent[i] = PULSE_SENT_NONE;   /* 标记"还没下发"，让第一拍 Arm_Update 可以补发 */
     }
 
-    /* 上电先把六路输出到安全的 HOME 位。
+    /* 上电先把六路输出到安全的初始位（HOME 位）。
      * 注意：这里无法"缓启"——开环控制没有位置反馈，不知道舵机当前停在哪，
-     * 写任何值对舵机来说都是突变。所以上电前必须人工把臂摆到接近中位。 */
+     * 写任何值对舵机来说都是突变。所以上电前必须人工把臂摆到接近「初始位」
+     * （折叠姿态）；尤其 J2/J3/J4 的初始位与标定零位相差很大，摆错会猛甩。 */
     for (i = 0U; i < ARM_CHANNEL_COUNT; i++)
     {
         /* 只有写成功才记账；失败的通道 last_sent 保持 0xFFFF，

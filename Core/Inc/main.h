@@ -82,20 +82,28 @@ void Error_Handler(void);
 #define SERVO_J2_MAX  2150U
 #define SERVO_J3_MIN  520U    /* 小臂：实测 520(逆110°)~2500(顺130°) */
 #define SERVO_J3_MAX  2500U
-#define SERVO_J4_MIN  520U    /* 腕部俯仰：实测 520(顺100°)~2500(逆130°) */
-#define SERVO_J4_MAX  2500U
+#define SERVO_J4_MIN  500U    /* 腕部俯仰：软限位 500~1850（另行收窄留安全余量） */
+#define SERVO_J4_MAX  1850U   /* 物理实测端点 520~2500 仍记在 arm_params.json，勿覆盖 */
 #define SERVO_J5_MIN  500U    /* 腕部旋转：MG996R，顺时针70°，逆时针82° */
 #define SERVO_J5_MAX  2500U
-#define SERVO_J6_MIN  900U   /* 夹爪：受结构限制，实测900（夹爪张开到极限）~2100（闭合到极限） */
-#define SERVO_J6_MAX  2100U
+#define SERVO_J6_MIN  900U   /* 夹爪：900=张开极限；软限位上限 2000（另行收窄留夹持余量） */
+#define SERVO_J6_MAX  2000U  /* 物理实测闭合端点 2100 仍记在 arm_params.json / 标定记录，勿覆盖 */
 
-/* 每路舵机的中位（HOME）脉宽（us，实测该关节 0° 时的脉宽） */
-#define SERVO_J1_MID  1550U
-#define SERVO_J2_MID  1470U
-#define SERVO_J3_MID  1500U
-#define SERVO_J4_MID  1500U
-#define SERVO_J5_MID  1450U
-#define SERVO_J6_MID  1500U
+/* 每路舵机的「初始位」脉宽（us）。
+ * 大白话：上电瞬间、以及收到 HOME 命令时，六路舵机各自要摆到的那个安全姿态
+ *         （折叠收拢、重心靠近基座，不是一条直线）。
+ * 规范定义：Arm_Init() 直接写入 PCA9685 的开环位置指令，同时是
+ *          Arm_CommandHome() / Arm_CommandResume() 的目标值。
+ * ⚠️ 注意区分「初始位」与「标定零位」：标定零位是该关节 0° 对应的脉宽，
+ *    记录在 kunpeng/robot/arm_params.json 的 pulse_mid / map 中点，供逆解算角度用。
+ *    两者不是一回事 —— 不要拿这里的值去改 arm_params.json，会破坏运动学映射。
+ */
+#define SERVO_J1_INIT  1580U
+#define SERVO_J2_INIT  1900U
+#define SERVO_J3_INIT  2400U
+#define SERVO_J4_INIT  700U
+#define SERVO_J5_INIT  1450U
+#define SERVO_J6_INIT  1500U
 
 /* USER CODE END Private defines */
 

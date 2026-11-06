@@ -418,7 +418,7 @@ def interactive_menu(host: ArmHost, duration_s: float, out_dir: str):
 ------------------------------------------------------
  [1]  PING        链路测试
  [2]  STATE       查询状态 + 六路当前脉宽
- [3]  HOME        回 HOME 位
+ [3]  HOME        回初始位
  [4]  STOP        急停冻结
  [5]  RESUME      解除急停(回手动)
  [6]  MANUAL      切手动(电位器控制)
