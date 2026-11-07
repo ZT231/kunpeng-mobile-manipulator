@@ -145,9 +145,33 @@ python3 kunpeng/robot/handeye_calib.py solve --samples samples.json --out handey
 
 > **第三方代码声明**：`Drivers/`（ST HAL）、`Middlewares/`（FreeRTOS、CMSIS）为 ST / FreeRTOS 官方库，非本人编写。
 
+## S3b 鲲鹏端模块 · README 三行法（面试前复习提纲）
+
+> 规矩：每写完一个模块补三行 —— ① 用了什么语法 ② 为什么这么设计 ③ 不这么写会出什么问题。
+> 用大白话写，重点在「为什么」，面试前直接拿这一节当提纲。
+
+**模块 A：`kunpeng/vision/detector_service.py`（8080 视觉服务，B 抽帧推理 + C 采集格式）**
+
+- **① 用了什么语法**：`argparse` 收启动参数（`--fourcc` 用 `type=str.upper` + `choices` 把取值锁在 MJPG/YUYV/AUTO）；用一个类 `Detector` 把「开摄像头 → 循环读帧 → JPEG 编码 → 推 HTTP」装在一起；`threading.Thread` 开后台线程专门跑 YOLO 推理；`cv2.VideoCapture(src, cv2.CAP_V4L2)` 显式指定 V4L2 后端、`CAP_PROP_FOURCC` 协商像素格式、`cv2.imencode` 编码；自己写 `fourcc_to_str()` 用位移 `>>` 和 `& 0xFF` 把驱动返回的整数还原成 `MJPG` 四个字符；帧号 `_jpeg_frame_id` 做去重。
+- **② 为什么这么设计**：采集是每帧都要干的事，推理在纯 CPU 上很慢，两者必须拆开 —— 推理放独立线程、每 N 帧才跑一次（抽帧），画面才不会被一次 140ms 的推理卡住。FourCC 设完还要**回读一次**打印实际协商值，是因为 `cap.set()` 只是「请求」，摄像头可以不接受；不回读就会把「我以为设了 MJPG」当成事实，排障时被假象误导。
+- **③ 不这么写会出什么问题**：不抽帧 → 每帧都等 YOLO，画面 ~7FPS 卡成 PPT；不显式 `CAP_V4L2` → OpenCV 会去乱试奥比中光深度相机后端，刷一堆无关警告；不默认 MJPG → 摄像头协商到未压缩 YUYV，640×480 在 USB2.0 下物理只给 10FPS，Python 层再怎么优化都没用；不回读 → 改了参数却不知道到底生效没有。
+
+**模块 B：`kunpeng/web/web_control.py`（5000 网页控制台，A 方案点选抓取）**
+
+- **① 用了什么语法**：Flask 单文件，`render_template_string` 把整页 HTML/CSS/JS 内嵌在 `PAGE` 字符串里；`pyserial` 串口收发 + 独立 `_rx_loop` 收帧线程；模块级全局软引用 `_IK = None` 配 `init_ik()` 里的 `try/except` 做可选功能降级；`/api/ik/solve` 这类 JSON 接口用 `request.get_json()` / `jsonify()`；协议帧自己算 XOR 拼成 `$JOINT,...*CK\r\n`；前端原生 JS `fetch` + 事件监听点画面取点，两步「① 试算 → ② 确认下发」。
+- **② 为什么这么设计**：`arm_ik.py` / `arm_params.json` 不在板上最小上传集里，硬 `import` 会让缺文件时整个 5000 起不来 —— 所以让 `_IK` 允许是 None，缺了只关掉「点选抓取」，PING/MOVE/STATE/视频主链路照跑。下发前先试算再确认，是因为六路脉宽会真驱动舵机，不给二次确认，误点一下画面臂就猛甩。
+- **③ 不这么写会出什么问题**：硬 import → 板上少一个文件整站打不开，还容易误判成 Flask/端口故障；不做两步确认 → 误触直接下发；不裁软限位 → IK 解出的越界脉宽把舵机顶到堵转；改了内嵌 `PAGE` 不重启进程 → 浏览器刷到天亮还是旧页面（`?v=N` 只清浏览器缓存，不清 Python 进程内存）。
+
+> **为什么删掉 2D 侧视姿态图**（2026-11-07）：那张图只是把脉宽线性映射成角度画个示意，标题自己就写着「非运动学正解」，
+> 没有连杆长度也没有零位偏置，面试官一问「怎么算的」就会露馅；而且 A 方案已经有真逆解，留着反而多余。
+> 删掉是**诚实边界**，不是功能倒退。
+
 ## 开发中遇到的问题与解决（16 条）
 
 按模块记录开发中实际遇到、并已解决的问题，附根因分析。
+
+> S3b 阶段（鲲鹏视觉服务 + 网页控制台）的排障记录按「现象 → 排查过程 → 根因 → 解决 → 一句话面试说辞」
+> 五段式单独维护在 `docs/排障记录-S3b.md`；本节 16 条是固件 / 旧 PC 上位机阶段的历史记录。
 
 **RFID（RC522）**
 
