@@ -78,14 +78,89 @@ PULSE_RANGES = [
     (900, 2000, 1500),   # J6（软限位收窄；物理实测闭合端点 2100 仍记在 arm_params.json）
 ]
 
-# 「标定零位」= 各关节 0° 对应的脉宽，来自 kunpeng/robot/arm_params.json
-# 的 map 中点 / pulse_mid。它只给 2D 姿态示意图当角度基准用，
-# 不是上电初始位、也不是逆解的目标值 —— 千万不要和上面第三列混为一谈：
-# 若拿初始位当零位，折叠姿态会被画成一条直线（正是要避免的奇异位形示意）。
-CAL_ZERO_PULSE = [1550, 1470, 1500, 1500, 1450, 1500]
 JOINT_LIMITS = {
     JOINT_NAMES[i]: PULSE_RANGES[i] for i in range(CHANNEL_COUNT)
 }
+
+
+# ---------------------------------------------------------------------------
+# A 方案：点击画面取点 -> 逆解 -> 六路脉宽 -> JOINT 下发（可选功能）
+#
+# ① 用了什么语法：模块级可选 import + 字典配置 + 纯函数（不碰任何已有全局状态）。
+# ② 为什么这么设计：逆解依赖 arm_ik.py / arm_params.json 两个文件，鲲鹏板最小上传集
+#    本来不含它们；做成「找不到就 _IK=None、接口返回明确原因」的软降级，不传文件
+#    也不会影响已跑通的 PING/MOVE/STATE/视频/检测框链路，删掉文件即可回滚。
+# ③ 不这么写会怎样：若在模块顶部硬 import，板上缺文件会让整个 Flask 起不来，
+#    连网页都打不开 —— 一个可选功能拖垮主链路，是典型的耦合事故。
+# ---------------------------------------------------------------------------
+_IK = None                 # ArmIK 实例；None = 未就绪
+_IK_ERROR = ""             # 未就绪原因，给页面看
+_IK_MAP = {
+    "span_x": 30.0,        # 画面宽度对应工作台多少 cm（手工标定，非相机内参）
+    "span_y": 22.5,        # 画面高度对应工作台多少 cm（4:3 时约 span_x*3/4）
+    "center_x": 0.0,       # 画面中心对应的工作台 x（cm）
+    "center_y": 18.0,      # 画面中心对应的工作台 y（cm），正前方
+    "z": 2.0,              # 抓取高度 cm（init_ik 成功后用 arm_params.json 的 grab_height 覆盖）
+    "tilt": 0.0,           # 夹爪前倾角（度），0 = 垂直向下
+    "claw": 0.0,           # J6 夹爪开合（度），0 = 闭合
+    "wrist": 0.0,          # J5 夹爪朝向（度）
+}
+
+
+def init_ik(ik_dir):
+    """尝试加载逆解模块；失败只记原因、绝不抛异常拖垮网页服务。"""
+    global _IK, _IK_ERROR
+    d = os.path.expanduser(ik_dir or "~/kunpeng_vision")
+    try:
+        if d not in sys.path:
+            sys.path.insert(0, d)
+        from arm_ik import ArmIK
+        _IK = ArmIK()          # 默认读同目录 arm_params.json；标定文件全程只读
+        _IK_ERROR = ""
+        _IK_MAP["z"] = _IK.grab_h
+        return True
+    except Exception as e:
+        _IK = None
+        _IK_ERROR = "未找到逆解模块（%s）：%s" % (d, e)
+        return False
+
+
+def pixel_to_table(u, v, w, h):
+    """像素 (u,v) -> 工作台 (x,y) cm。
+
+    大白话：把画面按比例铺到桌面上，中心对准 (center_x, center_y)，
+    往右 x 变大、往上 y 变大（正前方）。这是「平面约束单目定位」的退化解，
+    z 由外部给定，不是相机测出来的。
+    规范定义：已知 Z=const 的平面，用线性比例（单应性矩阵的仿射近似）把像素
+    反投影到该平面；无相机内参与畸变校正，只适合固定视角的桌面示意。
+    """
+    if not w or not h:
+        raise ValueError("图像尺寸为空，等画面 LIVE 后再取点")
+    x = _IK_MAP["center_x"] + (float(u) / float(w) - 0.5) * _IK_MAP["span_x"]
+    y = _IK_MAP["center_y"] + (0.5 - float(v) / float(h)) * _IK_MAP["span_y"]
+    return x, y
+
+
+def solve_to_pulses(x, y):
+    """工作台 (x,y) -> 6 路脉宽，并裁到固件软限位 PULSE_RANGES。
+
+    返回 (pulses, clamped)：clamped 列出被裁的关节，供页面提示「目标超出可达范围」。
+    为什么 Python 侧也裁一遍：固件 cmd_joint 也会 clamp_pulse，但那是静默裁剪；
+    这边显式裁并回报，人才能知道 IK 解其实越界了，而不是以为「算得很准」。
+    """
+    if _IK is None:
+        raise RuntimeError(_IK_ERROR or "逆解模块未就绪")
+    angles = _IK.solve(x, y, z=_IK_MAP["z"], wrist=_IK_MAP["wrist"],
+                       claw=_IK_MAP["claw"], tilt=_IK_MAP["tilt"])
+    raw = _IK.to_pulses(angles)
+    pulses, clamped = [], []
+    for i, p in enumerate(raw):
+        lo, hi, _ = PULSE_RANGES[i]
+        q = max(lo, min(hi, int(p)))
+        if q != int(p):
+            clamped.append(JOINT_NAMES[i])
+        pulses.append(q)
+    return pulses, clamped
 
 
 # ---------------------------------------------------------------------------
@@ -532,7 +607,9 @@ PAGE = r"""
   .overlay{position:absolute;inset:0;pointer-events:none;}
   .dbox{position:absolute;border:2px solid var(--ac);border-radius:3px;}
   .dbox b{position:absolute;top:-19px;left:-2px;background:var(--ac);color:#111;font-size:11px;font-weight:500;padding:1px 5px;border-radius:3px;white-space:nowrap;}
-  .cross{position:absolute;background:#ffffff33;}
+  .cross{position:absolute;background:#ffffff33;pointer-events:none;}
+  .vwrap.pickable img{cursor:crosshair;}
+  .pick{position:absolute;width:14px;height:14px;border:2px solid var(--ok);border-radius:50%;transform:translate(-50%,-50%);box-shadow:0 0 0 1px #0009;pointer-events:none;display:none;}
   .badge{position:absolute;top:8px;left:8px;font-size:11px;padding:3px 9px;border-radius:20px;background:#3a1d1d;color:#ffb0b0;}
   .badge.live{background:#12402a;color:#8ff0bd;}
   .vmeta{position:absolute;right:8px;bottom:8px;font-size:11px;color:#c3cbe8;background:#0009;padding:2px 7px;border-radius:4px;}
@@ -591,6 +668,7 @@ PAGE = r"""
         <div class="cross" style="left:50%;top:0;bottom:0;width:1px"></div>
         <div class="cross" style="top:50%;left:0;right:0;height:1px"></div>
         <div class="overlay" id="overlay"></div>
+        <div class="pick" id="pickMark"></div>
         <div class="badge" id="camBadge">OFFLINE</div>
         <div class="vmeta" id="vsize">--</div>
       </div>
@@ -604,21 +682,39 @@ PAGE = r"""
     </section>
 
     <section class="panel">
-      <h2><span>姿态示意 · 2D 侧视</span><span class="tip">按实际脉宽线性映射，仅供观察趋势，非运动学正解</span></h2>
-      <svg id="armSvg" viewBox="0 0 340 200" style="width:100%;height:auto;background:#0a0e1a;border-radius:8px">
-        <line x1="20" y1="180" x2="320" y2="180" stroke="#2a3352" stroke-width="2"></line>
-        <rect x="52" y="160" width="46" height="20" rx="3" fill="#232c4d" stroke="#3a456b"></rect>
-        <circle id="j2c" cx="75" cy="160" r="6" fill="#ffa940"></circle>
-        <line id="seg2" x1="75" y1="160" x2="75" y2="100" stroke="#7fd3ff" stroke-width="7" stroke-linecap="round"></line>
-        <circle id="j3c" cx="75" cy="100" r="6" fill="#ffa940"></circle>
-        <line id="seg3" x1="75" y1="100" x2="140" y2="100" stroke="#7fd3ff" stroke-width="6" stroke-linecap="round"></line>
-        <circle id="j4c" cx="140" cy="100" r="5" fill="#ffa940"></circle>
-        <line id="seg4" x1="140" y1="100" x2="180" y2="100" stroke="#35d07f" stroke-width="5" stroke-linecap="round"></line>
-        <line id="g1" x1="180" y1="100" x2="196" y2="90" stroke="#35d07f" stroke-width="4" stroke-linecap="round"></line>
-        <line id="g2" x1="180" y1="100" x2="196" y2="110" stroke="#35d07f" stroke-width="4" stroke-linecap="round"></line>
-        <text id="j1txt" x="12" y="195" font-size="11" fill="#6f7aa0">J1 基座 yaw：1500 μs</text>
-      </svg>
+      <h2><span>A 方案 · 点选抓取（开环）</span><span class="tip">平面约束单目定位，不是真 3D</span></h2>
+      <div class="row">
+        <label style="font-size:12px;display:flex;align-items:center;gap:6px;flex:none;color:#c3cbe8">
+          <input type="checkbox" id="ikPickOn" style="flex:none;width:auto"> 允许点击画面取点
+        </label>
+        <span class="pill warn" id="ikState">检测中…</span>
+      </div>
+      <div style="font-size:11px;color:#ffc37a;margin-top:8px;line-height:1.6">
+        ⚠ 只做「像素 → 桌面平面 → 逆解 → 脉宽」，没有深度相机、没有力控、没有关节回读。
+        确认下发会让<b>六路舵机同时运动</b>，请先确认臂周围无人、无障碍物。
+      </div>
+      <div class="row" style="margin-top:8px">
+        <button class="sm" id="btnIkDry" onclick="ikSolve(false)" disabled>① 试算（不动臂）</button>
+        <button class="sm ac" id="btnIkApply" onclick="ikSolve(true)" disabled>② 确认下发</button>
+        <button class="sm" onclick="ikClear()">清除取点</button>
+      </div>
+      <div id="ikOut" style="font-family:ui-monospace,Menlo,monospace;font-size:11px;line-height:1.7;color:#a9c6e8;margin-top:9px;white-space:pre-wrap">(未取点)</div>
+      <details style="margin-top:8px">
+        <summary style="cursor:pointer;font-size:12px;color:var(--muted)">画面 → 桌面 标定参数（现场调，改完立即生效）</summary>
+        <div class="g" style="margin-top:8px">
+          <input type="text" id="ik_span_x"   placeholder="span_x 画面宽=多少 cm">
+          <input type="text" id="ik_span_y"   placeholder="span_y 画面高=多少 cm">
+          <input type="text" id="ik_center_x" placeholder="center_x 画面中心 x">
+          <input type="text" id="ik_center_y" placeholder="center_y 画面中心 y">
+          <input type="text" id="ik_z"        placeholder="z 抓取高度 cm">
+        </div>
+        <div class="row" style="margin-top:8px">
+          <button class="sm" onclick="ikSaveCalib()">保存参数</button>
+          <span class="tip" id="ikCalibTip"></span>
+        </div>
+      </details>
     </section>
+
   </div>
 
   <div>
@@ -656,7 +752,7 @@ PAGE = r"""
           <span class="jval" id="v{{i}}">{{inits[i]}}</span>
         </div>
         <input type="range" id="s{{i}}" min="{{mins[i]}}" max="{{maxs[i]}}" value="{{inits[i]}}"
-               data-init="{{inits[i]}}" data-cal="{{calibs[i]}}"
+               data-init="{{inits[i]}}"
                oninput="drag({{i}}, this)"
                onchange="endDrag({{i}}, this)">
         <div class="jbtns">
@@ -825,13 +921,12 @@ async function autoInit(){
 }
 
 // =========================================================================
-// 以下为 UI 升级新增部分（视频链路 / 检测叠加 / 姿态示意 / 遥测）
+// 以下为 UI 升级新增部分（视频链路 / 检测叠加 / 遥测）
 // 设计原则：上面的串口收发函数一个字都不改，只在这里「包装」和「追加」。
 // 好处：即使新功能全挂了，PING/MOVE/STATE 仍然按原来已实机验证的方式工作。
 // =========================================================================
 
 // 从滑杆 DOM 读限位和初始位，避免再往模板里塞一份数据（单一数据源）
-// 注意：data-cal 是「标定零位」，只给 2D 姿态图用，和 data-init 不是一回事。
 const INITS = [], MINS = [], MAXS = [];
 for (let i = 0; i < 6; i++) {
   const s = document.getElementById('s' + i);
@@ -991,70 +1086,6 @@ function startDetections() {
   }, 400);
 }
 
-// 2D 侧视姿态：把每路脉宽按 (实际-标定零位)/半行程 归一化，再累积成连杆角度。
-// 这是「示意」，不是运动学正解 —— 没有连杆长度、零位偏置，别拿它算坐标。
-//
-// ⚠️ 基准必须用「标定零位」(data-cal)，不能用「初始位」(data-init)：
-//    初始位是折叠姿态，拿它当 0° 会把折叠臂画成一条竖直线，正好画反了。
-//
-// J2、J4 舵机是反装的，脉宽增大时连杆往反方向转。用一张符号表把「硬件方向」
-// 和「画图方向」对齐，比在算式里到处写负号好维护。
-// defl(i) = (实际 - 标定零位)/半行程，值域严格落在 [-1,+1]；DRAW_SIGN[i] = -1 表示方向取反。
-// 半行程取「标定零位到两端较远的那一段」，不能直接用软限位半行程，原因见函数内注释。
-// 侧视只画 J2/J3/J4 三段；J1 是水平 yaw 不体现在侧视，J6 只控夹爪开合。
-const DRAW_SIGN = [1, -1, 1, -1, 1, 1];
-
-function drawArm() {
-  const P = function (deg) { const r = deg * Math.PI / 180; return [Math.cos(r), Math.sin(r)]; };
-  const defl = function (i) {
-    const s = document.getElementById('s' + i);
-    const cal = +s.dataset.cal, lo = +s.min, hi = +s.max;
-    // 分母不能再用「软限位半行程」(hi-lo)/2：软限位的中点未必等于标定零位。
-    // J4 收窄成 500~1850 后中点 1175、零位仍是 1500，用 (hi-lo)/2=675 会让
-    // defl 冲到 -1.48，超出设计域 [-1,+1]，连杆角度被放大 → 侧视图画歪。
-    // 规范：归一化 f(x)=(x-zero)/half 要保证值域落在 [-1,1]，
-    //       需取 half = max(MAX-zero, zero-MIN)（到两端较远的那一段）。
-    const half = Math.max(hi - cal, cal - lo) || 1;   // ||1 防万一除零
-    return (+s.value - cal) / half;
-  };
-  const bx = 75, by = 160, L2 = 62, L3 = 56, L4 = 34;
-  const a2 = -90 + DRAW_SIGN[1] * defl(1) * 55;
-  const a3 = a2  + DRAW_SIGN[2] * defl(2) * 70;
-  const a4 = a3  + DRAW_SIGN[3] * defl(3) * 55;
-  const p1 = [bx + P(a2)[0] * L2, by + P(a2)[1] * L2];
-  const p2 = [p1[0] + P(a3)[0] * L3, p1[1] + P(a3)[1] * L3];
-  const p3 = [p2[0] + P(a4)[0] * L4, p2[1] + P(a4)[1] * L4];
-
-  const seg = function (id, a, b) {
-    const e = document.getElementById(id);
-    e.setAttribute('x1', a[0].toFixed(1)); e.setAttribute('y1', a[1].toFixed(1));
-    e.setAttribute('x2', b[0].toFixed(1)); e.setAttribute('y2', b[1].toFixed(1));
-  };
-  const dot = function (id, p) {
-    const e = document.getElementById(id);
-    e.setAttribute('cx', p[0].toFixed(1)); e.setAttribute('cy', p[1].toFixed(1));
-  };
-  seg('seg2', [bx, by], p1); seg('seg3', p1, p2); seg('seg4', p2, p3);
-  dot('j3c', p1); dot('j4c', p2);
-
-  // J6 夹爪：两指从腕部末端 p3 出发，长度恒为 jawLen，只是朝 a4±openDeg 张开。
-  // ⚠️ 旧画法把两根线都画在 perp 轴上（一正一反、共线），合起来就是「一条直线」，
-  //    拖动 J6 只看到这根线变长变短，不像夹爪 —— SVG 静态初始值本来是 V 形，
-  //    是 drawArm() 每次重画把它覆盖坏了。
-  // 这里用极坐标而不是「沿连杆 + 横向偏移」：后者指长 sqrt(jawLen²+gap²) 会随
-  // J6 一起变，又回到「边长变短」的观感；极坐标下指长严格恒定，只有张角在变。
-  // J6 是反向标定：脉宽小=张开（按钮 900），脉宽大=闭合（按钮 1900 / 上限 2000）。
-  // defl(5) 在 900 时是 -1，所以用减号：900 -> gap=14 大张、2000 -> gap≈1 合拢。
-  const gap = 7 - defl(5) * 7;              // J6 开合量 0~14
-  const jawLen = 16;                        // 两指长度固定，绝不随 J6 变化
-  const openDeg = 4 + gap * 1.6;            // 开合量→两指半张角（约 4°~26°），闭合时也留一点 V
-  seg('g1', p3, [p3[0] + P(a4 - openDeg)[0] * jawLen,
-                 p3[1] + P(a4 - openDeg)[1] * jawLen]);
-  seg('g2', p3, [p3[0] + P(a4 + openDeg)[0] * jawLen,
-                 p3[1] + P(a4 + openDeg)[1] * jawLen]);
-  tag('j1txt', 'J1 基座 yaw：' + document.getElementById('s0').value + ' μs');
-}
-
 // 偏差 = 最后一次 MOVE 目标 vs 1s 回填的真实脉宽，取 6 路最大值。
 // 只读 DOM，不额外发 STATE —— 绝不增加串口流量。
 setInterval(function () {
@@ -1067,13 +1098,147 @@ setInterval(function () {
 }, 300);
 
 setInterval(function () { tag('clock', new Date().toLocaleTimeString('zh-CN', { hour12: false })); }, 1000);
-setInterval(drawArm, 200);
 
 // 启动时拉配置（新增的 /api/config，纯读，不碰串口）
 fetch('/api/config').then(function (r) { return r.json(); }).then(function (c) {
-  CFG = c; setupVideo(); startDetections(); drawArm();
+  CFG = c; setupVideo(); startDetections();
 }).catch(function () {
-  setupVideo(); startDetections(); drawArm();
+  setupVideo(); startDetections();
+});
+
+// =========================================================================
+// A 方案：点击画面取点 -> 试算 -> 确认下发（和上面的控制链路零耦合）
+//
+// ① 用了什么语法：addEventListener('click') + getBoundingClientRect() 坐标换算 +
+//    async/await + 模块级状态变量（ikPoint / ikLast / ikReady / ikPickOn）。
+// ② 为什么这么设计：取点默认关闭（checkbox），试算与下发拆成两个按钮并二次 confirm，
+//    因为六路舵机会同时运动；且 <img> 被 object-fit:fill 拉伸过，必须用
+//    「显示矩形 → 原始分辨率」的比例换算，不能拿 e.offsetX 直接当像素坐标。
+// ③ 不这么写会怎样：误点一下画面臂就猛甩；或画面被拉伸后取点整体偏移，
+//    逆解算出的 (x,y) 全错，还误以为 IK 不准。
+// =========================================================================
+
+const IK_NAMES = {{names|tojson}};     // 和后端的 JOINT_NAMES 用同一份数据
+let ikReady = false, ikPickOn = false, ikPoint = null, ikLast = null;
+
+function tagIk(s) { document.getElementById('ikOut').textContent = s; }
+
+function onCamClick(e) {
+  if (!ikPickOn) return;                       // 默认关，必须手动勾选才生效
+  const img = document.getElementById('camImg');
+  if (!CFG.video_url || img.style.display === 'none' || !img.naturalWidth) {
+    log('⚠ 画面未 LIVE，不能取点'); return;
+  }
+  const rect = img.getBoundingClientRect();
+  const dx = e.clientX - rect.left, dy = e.clientY - rect.top;
+  if (dx < 0 || dy < 0 || dx > rect.width || dy > rect.height) return;
+  // 显示尺寸 -> 原始分辨率：object-fit:fill 把 640×480 拉伸成容器大小，
+  // 所以 u = 显示横向比例 × naturalWidth，v 同理。
+  const u = dx / rect.width * img.naturalWidth;
+  const v = dy / rect.height * img.naturalHeight;
+  ikPoint = {
+    u: Math.round(u), v: Math.round(v),
+    w: img.naturalWidth, h: img.naturalHeight,
+    px: dx / rect.width * 100, py: dy / rect.height * 100
+  };
+  const mk = document.getElementById('pickMark');
+  mk.style.display = 'block';
+  mk.style.left = ikPoint.px + '%'; mk.style.top = ikPoint.py + '%';
+  tagIk('取点  像素 (' + ikPoint.u + ', ' + ikPoint.v + ')  /  图像 '
+      + ikPoint.w + '×' + ikPoint.h + '\n点「① 试算」看逆解结果（此时绝不动臂）');
+  document.getElementById('btnIkDry').disabled = false;
+  document.getElementById('btnIkApply').disabled = true;   // 换了点必须重新试算
+  ikLast = null;
+}
+
+async function ikSolve(apply) {
+  if (!ikPoint) { log('⚠ 先点画面取一个点'); return; }
+  if (!ikReady) { log('⚠ 逆解模块未就绪，不能解算'); return; }
+  if (apply) {
+    if (!connected) { log('⚠ 串口未连接，先点「连接」'); return; }
+    if (!ikLast || !ikLast.ok) { log('⚠ 请先「① 试算」成功再下发'); return; }
+    if (!confirm('确认下发 JOINT 到机械臂？\n六路目标脉宽：' + ikLast.pulses.join(', ')
+        + '\n\n六路舵机会同时运动，请确认臂周围无人、无障碍物。')) return;
+  }
+  const body = { u: ikPoint.u, v: ikPoint.v, w: ikPoint.w, h: ikPoint.h, apply: !!apply };
+  log((apply ? '>> 下发 ' : '>> 试算 ') + '像素 (' + ikPoint.u + ', ' + ikPoint.v + ')');
+  const r = await post('/api/ik/solve', body);
+  if (!r) return;
+  if (!r.ok) { log('✗ ' + r.error); tagIk('✗ ' + r.error); return; }
+  ikLast = r;
+  let s = '像素 (' + ikPoint.u + ',' + ikPoint.v + ')  →  桌面 (x=' + r.x
+        + ', y=' + r.y + ', z=' + r.z + ') cm\n'
+        + '目标脉宽(μs)：' + r.pulses.map(function (p, i) {
+            return IK_NAMES[i] + '=' + p;
+          }).join('  ') + '\n';
+  s += (r.clamped && r.clamped.length)
+     ? '⚠ 超出软限位被裁剪：' + r.clamped.join(',') + '（IK 解不完全可达）\n'
+     : '✓ 六路均在软限位内\n';
+  if (r.applied) {
+    s += '\n已下发：JOINT,' + r.pulses.join(',') + '\n固件应答：' + (r.resp || '(空)') + '\n';
+    if (r.state_pulses && r.state_pulses.length === 6)
+      s += 'STATE 瞬时值：' + r.state_pulses.join(',') + '\n  → ' + r.state_note + '\n';
+    s += r.note;
+  } else {
+    s += '\n【仅试算，未下发】确认无误后再点「② 确认下发」。';
+  }
+  tagIk(s);
+  document.getElementById('btnIkApply').disabled = r.applied;   // 下发过就禁用，防连点
+  log(r.applied ? ('<< ' + r.resp + ' | 目标 ' + r.pulses.join(','))
+                : ('<< 试算完成 目标 ' + r.pulses.join(',')));
+}
+
+function ikClear() {
+  ikPoint = null; ikLast = null;
+  document.getElementById('pickMark').style.display = 'none';
+  tagIk('(未取点)');
+  document.getElementById('btnIkDry').disabled = true;
+  document.getElementById('btnIkApply').disabled = true;
+}
+
+async function ikSaveCalib() {
+  const keys = ['span_x', 'span_y', 'center_x', 'center_y', 'z'];
+  const body = {};
+  for (const k of keys) {
+    const val = parseFloat(document.getElementById('ik_' + k).value);
+    if (!isFinite(val)) { tag('ikCalibTip', '✗ ' + k + ' 不是数字'); return; }
+    body[k] = val;
+  }
+  const r = await post('/api/ik/calib', body);
+  if (r && r.ok) {
+    tag('ikCalibTip', '✓ 已保存 ' + r.changed.length + ' 项，重新试算即生效');
+    log('画面→桌面标定参数已更新：' + JSON.stringify(body));
+  } else {
+    tag('ikCalibTip', '✗ ' + (r ? r.error : '请求失败'));
+  }
+}
+
+// 取点开关：默认关闭，防止看画面时误触发运动
+document.getElementById('ikPickOn').addEventListener('change', function (e) {
+  ikPickOn = e.target.checked;
+  document.getElementById('vwrap').classList.toggle('pickable', ikPickOn);
+  log(ikPickOn ? '已开启「点击画面取点」' : '已关闭「点击画面取点」');
+});
+document.getElementById('camImg').addEventListener('click', onCamClick);
+
+// 启动拉 IK 状态（纯读）；未就绪时把原因直接写进面板，不让人瞎点
+fetch('/api/ik/config').then(function (r) { return r.json(); }).then(function (c) {
+  ikReady = !!c.ready;
+  const badge = document.getElementById('ikState');
+  badge.textContent = c.ready ? '逆解已就绪' : '逆解未就绪';
+  badge.className = 'pill' + (c.ready ? '' : ' warn');
+  if (!c.ready) {
+    tagIk('逆解未就绪：' + c.error
+        + '\n\n需要在板上 ~/kunpeng_vision/ 放 arm_ik.py + arm_params.json，'
+        + '再重启 5000 服务（Ctrl+C 后重新 python3 web_control.py ...）。');
+  }
+  const m = c.map || {};
+  ['span_x', 'span_y', 'center_x', 'center_y', 'z'].forEach(function (k) {
+    const el = document.getElementById('ik_' + k);
+    if (el && m[k] !== undefined && m[k] !== null) el.value = m[k];
+  });
+}).catch(function () {
+  document.getElementById('ikState').textContent = '逆解状态读取失败';
 });
 </script>
 </body>
@@ -1092,7 +1257,6 @@ def index():
         mins=[r[0] for r in PULSE_RANGES],
         maxs=[r[1] for r in PULSE_RANGES],
         inits=[r[2] for r in PULSE_RANGES],
-        calibs=CAL_ZERO_PULSE,
     )
 
 
@@ -1202,6 +1366,114 @@ def api_config():
     )
 
 
+# ---------------------------------------------------------------------------
+# A 方案：点选抓取的三个接口（逆解实现见文件顶部 _IK / pixel_to_table / solve_to_pulses）
+#
+# ① 用了什么语法：Flask 路由 + request.get_json + 字典组装 jsonify + 分层 try/except。
+# ② 为什么这么设计：拆成「看状态 / 改标定 / 解算」三个独立接口，且解算默认
+#    apply=False 只试算 —— 六路舵机会同时运动，必须让人先看到脉宽再确认下发。
+# ③ 不这么写会怎样：点一下画面就让臂猛甩；逆解抛 ValueError（目标超出可达范围）
+#    还会变成 500 错误页，页面拿不到任何有用提示。
+# ---------------------------------------------------------------------------
+@app.route("/api/ik/config")
+def api_ik_config():
+    """给页面看：逆解是否就绪、失败原因、当前「画面→桌面」映射参数。纯读，不碰串口。"""
+    return jsonify(
+        ok=True,
+        ready=_IK is not None,
+        error=_IK_ERROR,
+        map=dict(_IK_MAP),
+        ranges=PULSE_RANGES,
+    )
+
+
+@app.route("/api/ik/calib", methods=["POST"])
+def api_ik_calib():
+    """现场标定「画面→桌面」线性映射。
+
+    大白话：镜头装歪了、画面里桌子看起来更大更小时，改这几个数就能对齐，不用重烧代码。
+    规范定义：只更新白名单里的标量键并做数值类型校验，避免把 _IK_MAP 写成字符串，
+    导致后面 pixel_to_table 里 float() 抛 TypeError（配置污染比逻辑 bug 更难查）。
+    """
+    data = request.get_json(force=True, silent=True) or {}
+    changed = []
+    for key in ("span_x", "span_y", "center_x", "center_y", "z", "tilt", "claw", "wrist"):
+        if key not in data:
+            continue
+        value = data[key]
+        # bool 是 int 的子类，必须单独挡掉，否则 True 会被悄悄写成 1.0
+        if isinstance(value, bool) or not isinstance(value, (int, float)):
+            return jsonify(ok=False, error="%s 必须是数字" % key)
+        if key in ("span_x", "span_y") and float(value) <= 0:
+            return jsonify(ok=False, error="%s 必须大于 0" % key)
+        _IK_MAP[key] = float(value)
+        changed.append(key)
+    return jsonify(ok=True, changed=changed, map=dict(_IK_MAP))
+
+
+@app.route("/api/ik/solve", methods=["POST"])
+def api_ik_solve():
+    """像素 (u,v,w,h) -> 桌面 (x,y) -> IK -> 6 路脉宽。
+
+    apply=False（默认）：只试算，一个字节都不往串口发。
+    apply=True：构造 JOINT,<p0>..<p5> 下发，并回读一次 STATE 的瞬时值。
+
+    诚实边界：STATE 返回的是斜坡推进中的「当前脉宽」，不是「已到位确认」；
+    到位与否靠页面已有的 1s 轮询 /api/state 持续观察，这里绝不假装确认。
+    """
+    data = request.get_json(force=True, silent=True) or {}
+    try:
+        x, y = pixel_to_table(
+            float(data.get("u", 0)), float(data.get("v", 0)),
+            float(data.get("w", 0)), float(data.get("h", 0)))
+        pulses, clamped = solve_to_pulses(x, y)
+    except (ValueError, RuntimeError) as e:
+        # 目标过近 / 超出可达范围 / 逆解模块没就绪，都归成「能看懂的一句话」
+        return jsonify(ok=False, error=str(e))
+    except Exception as e:
+        return jsonify(ok=False, error="逆解异常：%s" % e)
+
+    out = dict(ok=True, x=round(x, 2), y=round(y, 2), z=_IK_MAP["z"],
+               pulses=pulses, clamped=clamped, applied=False, resp="")
+
+    if not data.get("apply"):
+        out["note"] = "仅试算，未下发任何串口命令"
+        return jsonify(out)
+
+    if _HOST is None:
+        out["ok"] = False
+        out["error"] = "串口未连接：试算结果已保留，先点页面「连接」再下发"
+        return jsonify(out)
+
+    payload = "JOINT,%s" % ",".join(str(int(p)) for p in pulses)
+    try:
+        out["resp"] = _HOST.cmd(payload)
+    except Exception as e:
+        out["ok"] = False
+        out["error"] = "JOINT 下发失败：%s" % e
+        return jsonify(out)
+
+    out["applied"] = True
+    out["frame"] = payload
+    if not out["resp"].startswith("OK"):
+        out["note"] = "固件未回 OK，请检查链路（帧已发出）"
+    else:
+        out["note"] = "固件已回 OK；六路正走斜坡逼近目标，页面 1s 轮询会持续刷新实际值"
+
+    # 回读一次 STATE：只展示「当下瞬时值」，绝不冒充到位确认。
+    out["state_pulses"] = []
+    out["state_note"] = ""
+    try:
+        sresp = _HOST.cmd("STATE")
+        parts = sresp.split(",")
+        if len(parts) >= 9:
+            out["state_pulses"] = [int(t) for t in parts[3:9]]
+            out["state_note"] = "斜坡中的瞬时值，非最终到位；最终值看页面 1s 轮询"
+    except Exception:
+        out["state_note"] = "STATE 回读失败（不影响已下发的目标）"
+    return jsonify(out)
+
+
 @app.route("/api/detections")
 def api_detections():
     """把 detector_service 的 /detections 代理成同源接口。
@@ -1261,6 +1533,9 @@ def main():
                     help="鲲鹏阶段用外部 MJPEG 地址，如 http://板IP:8080/video")
     ap.add_argument("--detections-url", default="",
                     help="识别结果 JSON 地址；留空且给了 --video-url 时自动推导 /detections")
+    ap.add_argument("--ik-dir", default="~/kunpeng_vision", metavar="DIR",
+                    help="A 方案逆解模块目录（需含 arm_ik.py + arm_params.json）；"
+                         "默认 ~/kunpeng_vision，找不到只关掉「点选抓取」、不影响主链路")
     args = ap.parse_args()
 
     global _MODE, _WIFI_ADDR, _CAM, _VIDEO_URL, _DETECTIONS_URL, _HOST
@@ -1317,6 +1592,17 @@ def main():
     elif _VIDEO_URL.startswith("http") and _VIDEO_URL.endswith("/video"):
         _DETECTIONS_URL = _VIDEO_URL[:-len("/video")] + "/detections"
 
+    # ---- A 方案逆解（可选功能，失败只告警，绝不拖垮网页服务）----
+    # ① 用了什么语法：函数调用 + 模块级全局软引用（_IK 允许是 None）。
+    # ② 为什么这么设计：arm_ik.py / arm_params.json 不在板上最小上传集里，
+    #    硬 import 会让缺文件时整个 5000 起不来；这里「找不到就只关掉点选抓取」。
+    # ③ 不这么写会怎样：一个可选的抓取功能拖垮已跑通的 PING/MOVE/STATE/视频链路。
+    ik_ok = init_ik(args.ik_dir)
+    if ik_ok:
+        ik_desc = "已就绪（%s）" % os.path.expanduser(args.ik_dir or "~/kunpeng_vision")
+    else:
+        ik_desc = "未启用：%s" % _IK_ERROR
+
     print("=" * 56)
     print("机械臂网页遥控已启动")
     print("  通道：%s" % chan_desc)
@@ -1327,6 +1613,7 @@ def main():
         print("  视频：未接入（PC 加 --camera 0 ｜ 鲲鹏加 --video-url http://板IP:8080/video）")
     if _DETECTIONS_URL:
         print("  识别：%s" % _DETECTIONS_URL)
+    print("  逆解：%s" % ik_desc)
     if _MODE == "wifi_server":
         print("  提示：电脑先连 ESP 自建热点 并固定 IP 192.168.4.50；"
               "手机/电脑浏览器打开 http://<本机IP>:%d 即可控制" % args.port)
