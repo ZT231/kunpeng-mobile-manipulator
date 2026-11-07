@@ -599,6 +599,13 @@ PAGE = r"""
   .ok{background:#1d4a2e;color:#b6ffcf;border-color:#2c6b44;}
   .bad{background:#4a1d1d;color:#ffb8b8;border-color:#7a3030;}
   .g{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:8px;}
+  /* 标定参数：每个输入框上方挂一行常驻中文标签。为什么不用 placeholder 就算了——
+     页面启动时 /api/ik/config 会把数值回填进 value，placeholder 就再也不显示了，
+     只剩 5 个裸数字，根本看不出哪个是 span_x、哪个是 center_y。 */
+  .cf{display:flex;flex-direction:column;gap:4px;min-width:0;}
+  .cf label{font-size:11px;color:var(--muted);line-height:1.35;font-weight:400;}
+  .cf label b{color:var(--tx);font-weight:600;}
+  .cf input{width:100%;box-sizing:border-box;min-width:0;flex:none;}
   .vwrap{position:relative;aspect-ratio:4/3;background:#070b14;border:1px solid var(--line);border-radius:10px;overflow:hidden;display:flex;align-items:center;justify-content:center;}
   .vwrap img{width:100%;height:100%;object-fit:fill;display:block;}
   .vph{position:absolute;inset:0;display:flex;flex-direction:column;align-items:center;justify-content:center;gap:8px;color:var(--muted);font-size:13px;text-align:center;padding:20px;}
@@ -700,13 +707,32 @@ PAGE = r"""
       </div>
       <div id="ikOut" style="font-family:ui-monospace,Menlo,monospace;font-size:11px;line-height:1.7;color:#a9c6e8;margin-top:9px;white-space:pre-wrap">(未取点)</div>
       <details style="margin-top:8px">
-        <summary style="cursor:pointer;font-size:12px;color:var(--muted)">画面 → 桌面 标定参数（现场调，改完立即生效）</summary>
+        <summary style="cursor:pointer;font-size:12px;color:var(--muted)">画面 → 桌面 标定参数（现场调，改完点「保存参数」生效）</summary>
+        <div class="tip" style="margin-top:8px;line-height:1.6">
+          大白话：这 5 个数是给「点击画面取点」用的一把尺子 —— 告诉网页整幅画面对应桌面多宽多高、中心在哪、抓取高度多少；
+          点一下画面才能把像素换成厘米，再交给逆解算六路脉宽。属平面约束单目定位，<b>不是真 3D</b>。
+        </div>
         <div class="g" style="margin-top:8px">
-          <input type="text" id="ik_span_x"   placeholder="span_x 画面宽=多少 cm">
-          <input type="text" id="ik_span_y"   placeholder="span_y 画面高=多少 cm">
-          <input type="text" id="ik_center_x" placeholder="center_x 画面中心 x">
-          <input type="text" id="ik_center_y" placeholder="center_y 画面中心 y">
-          <input type="text" id="ik_z"        placeholder="z 抓取高度 cm">
+          <div class="cf">
+            <label for="ik_span_x"><b>span_x</b> · 画面宽 = 桌面宽 (cm)</label>
+            <input type="text" id="ik_span_x" placeholder="如 16" title="画面宽度对应工作台多少 cm；必须 > 0，太大则画面左右两侧超出臂展">
+          </div>
+          <div class="cf">
+            <label for="ik_span_y"><b>span_y</b> · 画面高 = 桌面高 (cm)</label>
+            <input type="text" id="ik_span_y" placeholder="如 12" title="画面高度对应工作台多少 cm；必须 > 0，4:3 画面约为 span_x 的 3/4">
+          </div>
+          <div class="cf">
+            <label for="ik_center_x"><b>center_x</b> · 画面中心桌面 x (cm)</label>
+            <input type="text" id="ik_center_x" placeholder="如 0" title="画面中心对应的工作台 x 坐标；相机正对底座时填 0，正值向右">
+          </div>
+          <div class="cf">
+            <label for="ik_center_y"><b>center_y</b> · 画面中心桌面 y (cm) · 正前方</label>
+            <input type="text" id="ik_center_y" placeholder="如 14" title="画面中心对应的工作台 y 坐标（臂的正前方距离）；太大会让画面上半超出 L1+L2=25.2cm 臂展">
+          </div>
+          <div class="cf">
+            <label for="ik_z"><b>z</b> · 抓取高度 (cm)</label>
+            <input type="text" id="ik_z" placeholder="如 2" title="抓取高度；逆解模块就绪后会被 arm_params.json 的 grab_height 覆盖">
+          </div>
         </div>
         <div class="row" style="margin-top:8px">
           <button class="sm" onclick="ikSaveCalib()">保存参数</button>
