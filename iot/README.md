@@ -180,3 +180,24 @@ A2. 在 `docker-compose.yml` 末尾加 Telegraf 服务，并新建 `telegraf/tel
   bucket = "telemetry"
 ```
 重跑 `./deploy.sh` + `docker compose up -d` 即可，Grafana 看板无需改动。
+
+---
+
+## 附：`telemetry_bridge.py` · README 三行法（面试复习用）
+
+> 阶段 1 新增的「真实遥测桥」。大白话：它把 5000 网页服务里**真实**的六路脉宽、
+> 识别帧号、检测数搬到 MQTT 上，顶替 `simulate_device.py` 造的假温湿电压。
+
+- **① 用了什么语法 / 技术栈**：`argparse` 管命令行参数、`urllib.request` 发 HTTP（GET / POST）、
+  `json` 解析与序列化、纯函数 `build_payload()` 与 `collect_once()` 分层、`try/except` 分层容错、
+  `paho.mqtt` **延迟导入**并兼容 2.x / 1.x 两种回调 API、`if __name__ == "__main__"` 入口。
+- **② 为什么这么设计**：拆成独立脚本，只「读」5000 已有的 `/api/config`、`/api/detections`、
+  `/api/state` 三个接口，**一行 `web_control.py` 都不改** —— 改主链路就要 scp + 重启 Flask，
+  重启会把 `_IK_MAP` 标定值清回默认、打断实机现场；独立脚本 Ctrl+C 就回滚干净。
+  paho 延迟导入是为了让 `--self-test` / `--dry-run` 在没装包的机器上也能跑（零装包先验）。
+  `mode` 从 `/api/config` **透传**而非硬编码（这块板实测是 `"serial"`，早期草稿写过 `"uart"`）。
+- **③ 不这么写会怎样**：① 若把三个接口的错误直接抛出去，5000 一抖动桥进程就死、遥测断流；
+  ② 若在顶层 `import paho`，本地自测和 dry-run 会因 `ModuleNotFoundError` 直接崩，就没法零装包先验；
+  ③ 若把 `/api/state` 按 1 秒轮询，会往串口多发一倍 STATE 帧、和页面轮询抢串口 —— 所以默认 5 秒，
+  并在注释里写明「这是全脚本唯一有副作用的地方」；④ 若 `pulses` 不是 6 路也照发，会把错数据
+  写进 InfluxDB，看板看起来有曲线其实是脏数据。
