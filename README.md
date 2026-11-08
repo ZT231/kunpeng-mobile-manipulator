@@ -1,18 +1,39 @@
 # 六自由度机械臂视觉抓取系统（STM32F407 + FreeRTOS）
 
-基于 STM32F407VET6 的六自由度机械臂平台，打通 **视觉识别 → 坐标解算 → 逆运动学 → 机械臂抓取** 全链路，并支持串口 / 蓝牙 / WiFi / RFID 四种控制通道共用同一套指令协议。
+基于 STM32F407VET6 的六自由度机械臂平台，配合 KunPeng Pro（openEuler）边缘端与网页控制台，
+打通 **视觉识别 → 平面坐标解算 → 逆运动学 → 串口下发 → 状态回读** 链路。
 
-> 固件：Keil MDK（CubeMX 生成框架 + 手写模块）｜ 上位机：Python + OpenCV
+> 固件：Keil MDK（CubeMX 生成框架 + 手写模块）｜ 边缘端 / 上位机：Python + OpenCV + Flask
+>
+> 🔴 **状态口径（2026-11-08 收口）**：本 README 混有「旧 STM32 单板项目能力」与「当前 Kunpeng 云-边-端工程已实证能力」两代内容。
+> 三档划分与**可直接用于简历的正文**，以 `docs/简历-具身智能项目条目.md` 为准：
+> ✅ 已实机实证 / 🔶 代码已有但未实机验证或未接入主链路 / 📋 纯规划占位。
+> 下文凡标 🔶 / 📋 的功能**不得写成已完成**。
 
 ---
 
 ## 主要功能
 
-- **视觉引导抓取**：USB 摄像头 HSV 颜色阈值 + 轮廓检测识别目标，四点 Homography 完成像素→毫米换算，平面几何逆运动学解算 6 路舵机脉宽；按目标形状自适应夹爪方向（沿边抓取），远目标自动前倾扩臂（上限 45°）。
-- **多通道控制**：串口（PC 上位机）/ 蓝牙（HC-05）/ WiFi（ESP-01S）/ RFID（RC522）四通道复用同一套 `$CMD*CK\r\n` 协议（XOR 校验），可分别独立演示。
+### ✅ 当前 Kunpeng 工程已实机实证
+
+- **串口闭环**：USART1（PA9/PA10，115200 8N1）自定义帧 `$<CMD>[,<ARG>...]*<CK>\r\n`（XOR 校验、2 位大写 HEX），
+  `PING` / `STATE` / `HOME` / `JOINT` 实机通过（`$PING*10` → `$OK,PONG*3E`；`STATE` 回读六路实际脉宽与源码初始位一致）。
+- **六路舵机安全执行**：PCA9685（I2C1 PB6/PB7，50Hz）驱动六路，逐轴软限位 clamp + 25µs/20ms 斜坡限速；
+  `main.h` / `web_control.py` / `docs/舵机标定记录.md` 三方数值同步。
+- **边缘视觉服务**：`detector_service.py` :8080 跑 YOLOv8n + MJPEG 推流 / `/detections` / `/health`；
+  B 方案抽帧推理 + C 方案 V4L2/MJPG 采集优化后，实测约 **26.6 FPS**（原 6.8 FPS）。
+- **网页控制台 + 点选抓取**：`web_control.py` :5000 内嵌单页，滑杆控六路、1s 状态回填、
+  点画面取点 → 平面约束单目定位 → `ArmIK` 解六路脉宽 → 软限位检查 → `JOINT` 下发 → `STATE` 回读；
+  标定参数常驻面板 + 浏览器本地预设（保存 / 切换 / 删除）。
+
+### 🔶 旧 STM32 单板项目已有，当前 Kunpeng 工程未重新实机复验
+
+> 旧版演示脚本与测试方法保留在 `docs/完整功能演示流程.md`、`docs/视觉识别测试清单.md`（历史归档，命令不可直接照跑）。
+
+- **视觉引导抓取（旧版）**：USB 摄像头 HSV 颜色阈值 + 轮廓检测识别目标，四点 Homography 完成像素→毫米换算，平面几何逆运动学解算 6 路舵机脉宽；按目标形状自适应夹爪方向（沿边抓取），远目标自动前倾扩臂（上限 45°）。
+- **多通道控制**：串口（PC 上位机）/ 蓝牙（HC-05）/ WiFi（ESP-01S）/ RFID（RC522）四通道复用同一套 `$CMD*CK\r\n` 协议（XOR 校验）。代码在 `Core/Src/bt.c`、`wifi.c`；RC522 当前未接芯片（`version 0xFF`）。
 - **模式状态机**：MANUAL（电位器手控）/ CMD（待命）/ RECORD（示教录制）/ PLAYBACK（回放）/ ESTOP（急停）五态；急停冻结输出，仅 RESUME 可解除。
 - **示教回放**：上位机 REC 采集轨迹，PLAY 一键回放。
-- **安全机制**：每关节独立软限位（写舵机前 clamp）、斜坡限速（25µs/20ms ≈ 112°/s）、急停冻结输出。
 
 ## 硬件平台
 
@@ -40,26 +61,33 @@
 - **协议帧格式**：`$<CMD>[,<ARG>...]*<CK>\r\n`，`CK` = CMD 字段（`$` 与 `*` 之间）所有字节的 XOR，2 位大写十六进制；响应 `$OK[,<数据>]` / `$ERR,<code>`。
 - **双缓冲应答**：活动槽 + 备用槽，临界区保护，保证连发命令的应答不丢失。
 
-## 云-边-端三层架构（本工程 = 三块板一套代码）
+## 云-边-端三层架构（规划终态 = 三块板一套代码；当前只落地了「端 + 边」）
 
-| 层 | 板子 | 跑什么 | 代码位置 |
-|---|---|---|---|
-| 端（执行） | **STM32F407VET6** | 6 路舵机 / 底盘电机 / 串口帧解析 / 运动学执行 / 急停与软限位 | `Core/` |
-| 边（大脑） | **KunPeng Pro** | YOLOv8 识别、逆解算脉宽、网页/APP 服务、IoT 网关 | `kunpeng/`（+ `iot/`） |
-| 端（入口） | **ESP32-S3** | 语音唤醒（WakeNet）+ ASR + Wi-Fi/BLE | `esp32/`（P2 阶段） |
+| 层 | 板子 | 跑什么 | 代码位置 | 当前状态 |
+|---|---|---|---|---|
+| 端（执行） | **STM32F407VET6** | 6 路舵机 / 串口帧解析 / 运动学执行 / 急停与软限位 | `Core/` | ✅ 已实机 |
+| 边（大脑） | **KunPeng Pro** | YOLOv8 识别、逆解算脉宽、网页控制台 | `kunpeng/` | ✅ 已实机 |
+| 边（IoT，规划） | KunPeng Pro | EMQX / eKuiper / InfluxDB / Grafana 网关 | `iot/` | 🔶 Docker 脚手架 + 模拟设备，未起容器、未接真实设备 |
+| 端（入口，规划） | **ESP32-S3** | 语音唤醒（WakeNet）+ ASR + Wi-Fi/BLE | `esp32/` | 📋 仅 README 占位，核心板+扩展板待焊 |
 
-主流程：**ESP32-S3 听语音 → 鲲鹏识别+决策算 6 路脉宽 → 串口发 `$JOINT` → STM32 驱动 PCA9685 → 舵机执行**。
-三方协议完全一致（STM32 固件 / Python `arm_host.py` / C++ 引擎），帧格式 `$<CMD>[,ARGS]*<CK>\r\n`，XOR 校验。
+**规划终态主流程**（📋 尚未打通）：ESP32-S3 听语音 → 鲲鹏识别+决策算 6 路脉宽 → 串口发 `$JOINT` → STM32 驱动 PCA9685 → 舵机执行。
+**当前已打通的主流程**（✅）：浏览器网页点选取点 → 鲲鹏 5000 平面映射 + `ArmIK` 逆解 → 串口 `$JOINT` → STM32 驱动 PCA9685 → `STATE` 回读。
+三方协议一致（STM32 固件 / Python `arm_host.py` / C++ 引擎），帧格式 `$<CMD>[,ARGS]*<CK>\r\n`，XOR 校验。
 
 当前进度：
 
 | 环节 | 状态 |
 |---|---|
-| STM32 固件（协议 + 舵机 + 示教 + 多通道） | ✅ 旧项目已跑通，可直接烧录 |
-| 鲲鹏 YOLOv8 识别 | ✅ 板上实测 7.0 FPS（`--imgsz 320`），常驻服务已封装 |
-| 鲲鹏网页遥控 | ✅ `kunpeng/web/web_control.py`，浏览器滑杆控 6 路 |
-| 手眼标定（眼在手） | 🔶 脚本已验证（FK 误差 0.000cm、合成解算闭环通过），待相机到货实标 |
-| ESP32-S3 语音 | 📋 P2，核心板+扩展板待焊 |
+| STM32 固件（协议 + 六路舵机 + 软限位 + 斜坡） | ✅ 实机通过：`$PING*10` → `$OK,PONG*3E`，`STATE` 回读六路脉宽 |
+| 鲲鹏 YOLOv8 识别 + MJPEG 推流 | ✅ 板上实测约 26.6 FPS（B 抽帧推理 + C V4L2/MJPG 采集优化后） |
+| 鲲鹏网页控制台 + 点选抓取 | ✅ 5000 单页：滑杆控 6 路、点选→IK→`JOINT`→`STATE`、标定参数常驻面板 + 本地预设 |
+| `iot/` IoT 网关五件套 | 🔶 Docker Compose + 模拟设备脚本已备，**未在板上起容器、未接真实设备** |
+| 手眼标定（眼在手） | 🔶 `handeye_calib.py` 自检通过（FK 误差 0.000cm），**未相机实标、未接入点选链路** |
+| 蓝牙 / WiFi / RFID 多通道、示教回放 | 🔶 旧项目源码已有，当前工程未重新实机复验（RC522 当前未接） |
+| ESP32-S3 语音 / ASR / WakeNet | 📋 P2，`esp32/` 仅 README，核心板+扩展板待焊 |
+| 双 STM32 分工、双相机 6D 位姿、LLM 规划、OTA、云端 IoT、数字孪生 | 📋 纯规划，**无代码** |
+
+> 状态口径与可直接投递的简历正文见 `docs/简历-具身智能项目条目.md`；写简历 / 面试时的红线见 `docs/排障记录-S3b.md`「本阶段诚实边界」。
 
 ## 目录结构
 
@@ -77,7 +105,7 @@ RoboticArm_Kunpeng/
 │   └── MDK-ARM/                 Keil 工程（Robotic arm vision.uvprojx）
 ├── kunpeng/                     ★鲲鹏 KunPeng Pro 边缘端（openEuler + Python）
 │   ├── vision/                          YOLOv8 识别链路
-│   │   ├── stage1_yolov8.py     识别主程序（双后端 + --imgsz 320 跑到 7FPS）
+│   │   ├── stage1_yolov8.py     旧版识别主程序（双后端 + --imgsz 320 约 7FPS）
 │   │   ├── detector_service.py  常驻 HTTP/JSON 识别服务（:8080/detections）
 │   │   ├── a_vision_demo.py     颜色追踪 / KCF 追踪演示
 │   │   └── deploy_stage1.sh     依赖与权重部署脚本
@@ -85,11 +113,11 @@ RoboticArm_Kunpeng/
 │   │   ├── arm_ik.py            逆/正运动学（ArmIK）
 │   │   ├── arm_params.json      舵机标定表
 │   │   ├── arm_host.py          串口发帧上位机（$JOINT/$MOVE/$STATE）
-│   │   └── handeye_calib.py     ★手眼标定（AX=XB，眼在手必备，本工程新增）
-│   ├── web/                     web_control.py 网页遥控（Flask + 滑杆 + 状态回填）
+│   │   └── handeye_calib.py     🔶 手眼标定（AX=XB）：自检通过，未实标、未接入点选链路
+│   ├── web/                     ✅ web_control.py 网页遥控（Flask + 滑杆 + 点选抓取）
 │   └── docs/                    stage1_README.md 识别部署说明、A档执行计划
-├── esp32/                       ★ESP32-S3 端（语音唤醒 + ASR，P2 阶段）
-├── iot/                         IoT 网关五件套（EMQX→eKuiper→InfluxDB→Grafana + 模拟设备）
+├── esp32/                       📋 ESP32-S3 端（语音唤醒 + ASR，P2）：仅 README 占位，板待焊
+├── iot/                         🔶 IoT 五件套（EMQX→eKuiper→InfluxDB→Grafana + 模拟设备）：未起容器
 ├── protocol_engine_cpp/         C++ 跨平台串口协议引擎（243 断言，三方协议金标准）
 └── docs/                        全部文档
     ├── 项目实施方案.md / 硬件清单.md / 低预算能力清单（功能边界）.md 等方案类
@@ -118,7 +146,7 @@ python3 kunpeng/web/web_control.py /dev/ttyUSB0 --baud 115200 --host 0.0.0.0 --p
 python3 kunpeng/vision/detector_service.py --source 0 --imgsz 320 --port 8080
 ```
 
-### 3. 眼在手手眼标定（相机装到臂末端后）
+### 3. 眼在手手眼标定（🔶 脚本自检通过，未相机实标、未接入点选链路；相机装到臂末端后再做）
 ```bash
 python3 kunpeng/robot/handeye_calib.py selftest               # 自检正运动学，无需相机
 python3 kunpeng/robot/handeye_calib.py intrinsics --camera 0  # 标定相机内参
@@ -209,10 +237,21 @@ python3 kunpeng/robot/handeye_calib.py solve --samples samples.json --out handey
 
 ## 演示要点（建议 15 分钟流程）
 
+### ✅ 当前 Kunpeng 工程（照这个演示，全部有实机证据）
+
+1. 架构讲解：端（STM32 + PCA9685 六路）/ 边（鲲鹏 8080 检测 + 5000 控制台）/ 统一 `$CMD*CK\r\n` 帧协议。
+2. 串口链路：浏览器点 PING / STATE / HOME，看终端 `$OK,PONG*3E` 与六路脉宽回填；滑杆单轴微调看软限位与斜坡限速。
+3. 视觉链路：8080 画面 LIVE / 帧率约 26.6 FPS / YOLO 检测框叠加，讲 B 抽帧推理 + C V4L2/MJPG 采集优化（6.8 → 26.6 FPS 的分层归因过程）。
+4. 点选抓取链路（重点）：回初始位等稳 → 勾选「允许点击画面取点」→ 点画面中心附近 →「① 试算（不动臂）」看 `(x,y)` / 六路脉宽 /「✓ 六路均在软限位内」→「② 确认下发」看 `OK` 与 `STATE` 瞬时值逼近。
+5. 诚实边界主动交代：这是**开环点选运动**，平面映射未做物理标定、无编码器反馈、无下降/闭合/抬起序列；相机装在臂末端，取点前必须回同一观察位。
+6. 标定参数面板：常驻 5 框 + 预设保存 / 点行切换 / 删除（浏览器本地）。
+
+### 🔶 旧 STM32 单板项目演示清单（当前工程未复验，勿照此演示）
+
 1. 系统架构讲解（三层架构 + 统一指令协议 + 多串口路由）
 2. PC 上位机控制：PING/STATE/HOME、单轴微调、示教 REC→PLAY 回放
 3. RFID 刷卡切换：钥匙扣刷入 MANUAL 电位器手控，卡片刷回 HOME/CMD
-4. 视觉自动抓取：识别 → 分步抓取 → 码放，展示沿边夹取与远目标前倾
+4. 颜色识别 + 分步抓取 → 码放，展示沿边夹取与远目标前倾（旧版 Homography 单应标定流程）
 5. 无线通道：蓝牙 APP / WiFi TCP 客户端发指令控制
 
 ## 仓库说明
