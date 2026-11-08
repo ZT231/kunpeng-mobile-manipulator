@@ -606,6 +606,14 @@ PAGE = r"""
   .cf label{font-size:11px;color:var(--muted);line-height:1.35;font-weight:400;}
   .cf label b{color:var(--tx);font-weight:600;}
   .cf input{width:100%;box-sizing:border-box;min-width:0;flex:none;}
+  /* 标定预设：整块常驻，不折叠。列表用滚动区限高，组多了也不把页面撑长。 */
+  .pbox{margin-top:10px;padding-top:9px;border-top:1px dashed var(--line);}
+  .pbox .ph{font-size:12px;color:var(--muted);}
+  .plist{max-height:168px;overflow-y:auto;margin-top:8px;}
+  .prow{display:flex;align-items:center;justify-content:space-between;gap:8px;padding:7px 9px;margin-bottom:6px;border:1px solid var(--line);border-radius:8px;cursor:pointer;}
+  .prow:hover{background:#1a2240;}
+  .prow b{font-size:12px;font-weight:500;}
+  .prow .pn{font-size:11px;color:#6f7aa0;margin-top:2px;}
   .vwrap{position:relative;aspect-ratio:4/3;background:#070b14;border:1px solid var(--line);border-radius:10px;overflow:hidden;display:flex;align-items:center;justify-content:center;}
   .vwrap img{width:100%;height:100%;object-fit:fill;display:block;}
   .vph{position:absolute;inset:0;display:flex;flex-direction:column;align-items:center;justify-content:center;gap:8px;color:var(--muted);font-size:13px;text-align:center;padding:20px;}
@@ -706,8 +714,8 @@ PAGE = r"""
         <button class="sm" onclick="ikClear()">清除取点</button>
       </div>
       <div id="ikOut" style="font-family:ui-monospace,Menlo,monospace;font-size:11px;line-height:1.7;color:#a9c6e8;margin-top:9px;white-space:pre-wrap">(未取点)</div>
-      <details style="margin-top:8px">
-        <summary style="cursor:pointer;font-size:12px;color:var(--muted)">画面 → 桌面 标定参数（现场调，改完点「保存参数」生效）</summary>
+      <div class="pbox">
+        <div class="ph">画面 → 桌面 标定参数（现场调，改完点「保存参数」生效）</div>
         <div class="tip" style="margin-top:8px;line-height:1.6">
           大白话：这 5 个数是给「点击画面取点」用的一把尺子 —— 告诉网页整幅画面对应桌面多宽多高、中心在哪、抓取高度多少；
           点一下画面才能把像素换成厘米，再交给逆解算六路脉宽。属平面约束单目定位，<b>不是真 3D</b>。
@@ -738,7 +746,13 @@ PAGE = r"""
           <button class="sm" onclick="ikSaveCalib()">保存参数</button>
           <span class="tip" id="ikCalibTip"></span>
         </div>
-      </details>
+        <div class="row" style="margin-top:10px">
+          <input type="text" id="ikPresetName" placeholder="给这组起个名字，如 观察位A" style="flex:1;min-width:120px">
+          <button class="sm" onclick="ikPresetSave()">存为预设</button>
+        </div>
+        <div class="ph" style="margin-top:9px">已保存的参数组（<span id="ikPresetCount">0</span>）· 点一行即切换生效，行尾可删除</div>
+        <div class="plist" id="ikPresetList"></div>
+      </div>
     </section>
 
   </div>
@@ -1238,6 +1252,121 @@ async function ikSaveCalib() {
     tag('ikCalibTip', '✗ ' + (r ? r.error : '请求失败'));
   }
 }
+
+// ---- 标定参数预设：人工保存 / 点一行切换 / 随时删除 ----
+// 存在浏览器 localStorage：刷新页面、重启 5000 服务都还在。
+// 注意 _IK_MAP 在 Flask 进程内存，重启后仍回默认 30/22.5/0/18/2，
+// 这时点一下已保存的预设即可一键恢复，不用手填 5 个数。
+var IK_PRESET_KEY = 'web_control_ik_presets_v1';
+var IK_KEYS = ['span_x', 'span_y', 'center_x', 'center_y', 'z'];
+
+function ikEscape(s) {
+  return String(s).replace(/[&<>"']/g, function (c) {
+    return { '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c];
+  });
+}
+
+function ikPresetLoad() {
+  try {
+    var arr = JSON.parse(localStorage.getItem(IK_PRESET_KEY) || '[]');
+    return Object.prototype.toString.call(arr) === '[object Array]' ? arr : [];
+  } catch (e) { return []; }
+}
+
+function ikPresetWrite(arr) {
+  try {
+    localStorage.setItem(IK_PRESET_KEY, JSON.stringify(arr));
+    return true;
+  } catch (e) {
+    tag('ikCalibTip', '✗ 浏览器存储不可用：' + e.message);
+    return false;
+  }
+}
+
+function ikReadFive() {
+  var body = {};
+  for (var i = 0; i < IK_KEYS.length; i++) {
+    var k = IK_KEYS[i];
+    var v = parseFloat(document.getElementById('ik_' + k).value);
+    if (!isFinite(v)) { tag('ikCalibTip', '✗ ' + k + ' 不是数字'); return null; }
+    body[k] = v;
+  }
+  return body;
+}
+
+function ikPresetRender() {
+  var arr = ikPresetLoad();
+  var box = document.getElementById('ikPresetList');
+  if (!box) return;
+  tag('ikPresetCount', arr.length);
+  if (!arr.length) {
+    box.innerHTML = '<div class="tip">还没有预设：填好上面 5 个数、起个名字，点「存为预设」。</div>';
+    return;
+  }
+  var html = '';
+  for (var i = 0; i < arr.length; i++) {
+    var m = arr[i].map || {};
+    var nums = [];
+    for (var j = 0; j < IK_KEYS.length; j++) { nums.push(m[IK_KEYS[j]]); }
+    html += '<div class="prow" onclick="ikPresetApply(' + i + ')">'
+          + '<div><b>' + ikEscape(arr[i].name) + '</b>'
+          + '<div class="pn">' + nums.join(' / ') + ' cm</div></div>'
+          + '<button class="sm" onclick="event.stopPropagation();ikPresetDelete(' + i + ')">删除</button>'
+          + '</div>';
+  }
+  box.innerHTML = html;
+}
+
+function ikPresetSave() {
+  var body = ikReadFive();
+  if (!body) return;
+  var name = (document.getElementById('ikPresetName').value || '').trim();
+  if (!name) { tag('ikCalibTip', '✗ 先给这组起个名字'); return; }
+  var arr = ikPresetLoad();
+  var hit = -1;
+  for (var i = 0; i < arr.length; i++) { if (arr[i].name === name) { hit = i; break; } }
+  var item = { name: name, map: body, ts: new Date().toLocaleString() };
+  if (hit >= 0) { arr[hit] = item; } else { arr.push(item); }
+  if (!ikPresetWrite(arr)) return;
+  document.getElementById('ikPresetName').value = '';
+  tag('ikCalibTip', hit >= 0 ? '✓ 已更新预设「' + name + '」' : '✓ 已保存预设「' + name + '」');
+  ikPresetRender();
+}
+
+async function ikPresetApply(idx) {
+  var arr = ikPresetLoad();
+  var item = arr[idx];
+  if (!item) return;
+  var body = {};
+  for (var i = 0; i < IK_KEYS.length; i++) {
+    var k = IK_KEYS[i];
+    var v = parseFloat(item.map[k]);
+    if (!isFinite(v)) { tag('ikCalibTip', '✗ 预设「' + item.name + '」数据损坏'); return; }
+    body[k] = v;
+    document.getElementById('ik_' + k).value = v;
+  }
+  var r = await post('/api/ik/calib', body);
+  if (r && r.ok) {
+    tag('ikCalibTip', '✓ 已切换到「' + item.name + '」并生效');
+    log('标定参数已切换为预设「' + item.name + '」：' + JSON.stringify(body));
+  } else {
+    tag('ikCalibTip', '✗ ' + (r ? r.error : '请求失败'));
+  }
+}
+
+function ikPresetDelete(idx) {
+  var arr = ikPresetLoad();
+  var item = arr[idx];
+  if (!item) return;
+  if (!confirm('删除预设「' + item.name + '」？ 只删浏览器里存的这一组，不影响当前已生效的参数。')) return;
+  arr.splice(idx, 1);
+  if (!ikPresetWrite(arr)) return;
+  tag('ikCalibTip', '✓ 已删除预设「' + item.name + '」');
+  ikPresetRender();
+}
+
+// script 位于 body 末尾，DOM 已就绪，这里直接渲染一次预设列表。
+ikPresetRender();
 
 // 取点开关：默认关闭，防止看画面时误触发运动
 document.getElementById('ikPickOn').addEventListener('change', function (e) {
