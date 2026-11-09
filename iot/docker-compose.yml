@@ -1,8 +1,21 @@
 # 移动操作机器人 · IoT 栈最小闭环
-# 架构: 模拟设备 --MQTT--> EMQX --(eKuiper 规则引擎)--> InfluxDB --Grafana 看板
-# 平台: KunPeng Pro (openEuler 22.03, aarch64) + Docker arm64 镜像
-# 所有镜像均为官方 multi-arch, 在鲲鹏上自动拉取 arm64 版本
-# 已核实: emqx:5.8.8(含arm64) / lfedge/ekuiper:2.1.0-full(含influx2插件) / influxdb:2.7 / grafana:11.3.0 均为有效 tag
+# 架构: 真实遥测桥 --MQTT--> EMQX --(eKuiper 规则引擎)--> InfluxDB --Grafana 看板
+# 平台: KunPeng Pro (openEuler 22.03, aarch64) + Docker 19.03.14 / docker-compose 1.22.0 (V1)
+#
+# 两个板上实测约束（2026-11-08 阶段 1.1 踩过，别删）:
+#   ① 必须显式写 version: "2.4"。V1 的 docker-compose 在没有 version 时按 v1 文件格式
+#      解析，连 services: 都不认；而 2.4 是同时支持 healthcheck 与
+#      depends_on: condition: service_healthy 的最后一版（v3 移除过 condition）。
+#   ② 四个服务都要 security_opt: [seccomp=unconfined]。本机 Docker 19.03.14 的默认
+#      seccomp profile 不含 clone3，新镜像里 glibc >= 2.34 的 pthread_create()
+#      改用 clone3(2) 会被 EPERM 拒，容器起来就 Exited (1)。阶段 1.1 的 EMQX
+#      首行日志 "Failed to create thread: Operation not permitted (1)" 已实证；
+#      其余三个镜像按同类风险预防性统一加上。
+#      正解是升 Docker >= 20.10.10 或自定义 profile 只放行 clone3；官方源只有
+#      19.03.14、引第三方源有依赖冲突，本地实验用 unconfined 是明确的安全取舍
+#      （等于撤掉该容器的系统调用过滤层），见 iot/README.md 第 0 节。
+
+version: "2.4"
 
 networks:
   iot:
@@ -20,15 +33,15 @@ services:
     image: emqx:5.8.8
     container_name: emqx
     restart: unless-stopped
+    security_opt:
+      - seccomp=unconfined
     ports:
       - "1883:1883"      # MQTT 设备/客户端接入
       - "18083:18083"    # EMQX Web 控制台 (admin / robotics123)
     environment:
-      # 固定 Dashboard 密码, 方便登录; 生产环境应改复杂
       EMQX_DASHBOARD__DEFAULT__PASSWORD: "robotics123"
       EMQX_NODE__NAME: "emqx@127.0.0.1"
     healthcheck:
-      # EMQX 5.x 官方推荐的容器健康检查命令
       test: ["CMD", "emqx", "ctl", "status"]
       interval: 10s
       timeout: 5s
@@ -42,10 +55,11 @@ services:
     image: lfedge/ekuiper:2.1.0-full
     container_name: ekuiper
     restart: unless-stopped
+    security_opt:
+      - seccomp=unconfined
     ports:
       - "9081:9081"      # eKuiper REST API
     environment:
-      # 让 eKuiper 的 MQTT source 连到同网络内的 emqx
       MQTT_SOURCE__DEFAULT__SERVER: "tcp://emqx:1883"
     depends_on:
       emqx:
@@ -59,10 +73,11 @@ services:
     image: influxdb:2.7
     container_name: influxdb
     restart: unless-stopped
+    security_opt:
+      - seccomp=unconfined
     ports:
-      - "8086:8086"      # InfluxDB HTTP API
+      - "8087:8086"      # InfluxDB HTTP API (宿主机 8086 被 DevKit nginx 占用, 见 README 第 4 节)
     environment:
-      # 首次启动自动初始化 (setup 模式), 之后忽略
       DOCKER_INFLUXDB_INIT_MODE: "setup"
       DOCKER_INFLUXDB_INIT_USERNAME: "admin"
       DOCKER_INFLUXDB_INIT_PASSWORD: "robotics123"
@@ -70,8 +85,6 @@ services:
       DOCKER_INFLUXDB_INIT_BUCKET: "telemetry"
       DOCKER_INFLUXDB_INIT_ADMIN_TOKEN: "robotics_admin_token_2026"
     healthcheck:
-      # InfluxDB 2.x 官方镜像未内置 HEALTHCHECK, 且大概率没装 curl;
-      # 用自带的 influx CLI 的 ping 子命令做健康检查 (已核实正确)
       test: ["CMD", "influx", "ping"]
       interval: 10s
       timeout: 5s
@@ -86,6 +99,8 @@ services:
     image: grafana/grafana:11.3.0
     container_name: grafana
     restart: unless-stopped
+    security_opt:
+      - seccomp=unconfined
     ports:
       - "3000:3000"      # Grafana Web (admin / robotics123)
     environment:
@@ -96,5 +111,4 @@ services:
     networks: [iot]
     volumes:
       - grafana-data:/var/lib/grafana
-      # 自动注入 InfluxDB 数据源, 打开即有, 无需手动配
       - ./grafana/provisioning:/etc/grafana/provisioning
