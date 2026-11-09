@@ -25,6 +25,10 @@
 - **网页控制台 + 点选抓取**：`web_control.py` :5000 内嵌单页，滑杆控六路、1s 状态回填、
   点画面取点 → 平面约束单目定位 → `ArmIK` 解六路脉宽 → 软限位检查 → `JOINT` 下发 → `STATE` 回读；
   标定参数常驻面板 + 浏览器本地预设（保存 / 切换 / 删除）。
+- **板内 IoT 可观测性闭环（1.2b）**：`iot/` 真实串口遥测 → MQTT → EMQX → eKuiper → InfluxDB → Grafana，
+  四容器板上跑通、Grafana 六路 `j1~j6` 曲线已出（16:07 `records_in=records_out=59` / `exceptions=0`）；
+  `deploy.sh` 动态重绑 firewalld trusted zone、`telemetry_bridge.py` 发布端拦 null 点；收口 `e6cd194`。
+  🔴 只叫「可观测性闭环」，不是云端 IoT、不增抓取能力。
 
 ### 🔶 旧 STM32 单板项目已有，当前 Kunpeng 工程未重新实机复验
 
@@ -67,8 +71,8 @@
 |---|---|---|---|---|
 | 端（执行） | **STM32F407VET6** | 6 路舵机 / 串口帧解析 / 运动学执行 / 急停与软限位 | `Core/` | ✅ 已实机 |
 | 边（大脑） | **KunPeng Pro** | YOLOv8 识别、逆解算脉宽、网页控制台 | `kunpeng/` | ✅ 已实机 |
-| 边（IoT，规划） | KunPeng Pro | EMQX / eKuiper / InfluxDB / Grafana 网关 | `iot/` | 🔶 Docker 脚手架 + 模拟设备，未起容器、未接真实设备 |
-| 端（入口，规划） | **ESP32-S3** | 语音唤醒（WakeNet）+ ASR + Wi-Fi/BLE | `esp32/` | 📋 仅 README 占位，核心板+扩展板待焊 |
+| 边（IoT 可观测性） | KunPeng Pro | 真实串口遥测 → MQTT → EMQX → eKuiper → InfluxDB → Grafana | `iot/` | ✅ 板内闭环已实证：16:07 `records_in=records_out=59` / `exceptions=0`、Grafana 六路 `j1~j6` 曲线；收口 `e6cd194`（🔴 只叫「可观测性闭环」，不是云端 IoT） |
+| 端（语音入口，规划） | **ESP32-S3** | 语音唤醒（WakeNet）+ ASR + Wi-Fi/BLE | `esp32/` | 📋 P2；✅ 成品开发板（CH343 / N16R8 / Type-C，已焊）+ INMP441 I2S 麦 + MAX98357A 功放 + 3W 喇叭**已可直接用**；自画核心板 / 扩展板仍待焊；WakeNet / ASR / 显示 / 封帧发送**无代码、未上板、未接主链路** |
 
 **规划终态主流程**（📋 尚未打通）：ESP32-S3 听语音 → 鲲鹏识别+决策算 6 路脉宽 → 串口发 `$JOINT` → STM32 驱动 PCA9685 → 舵机执行。
 **当前已打通的主流程**（✅）：浏览器网页点选取点 → 鲲鹏 5000 平面映射 + `ArmIK` 逆解 → 串口 `$JOINT` → STM32 驱动 PCA9685 → `STATE` 回读。
@@ -81,10 +85,11 @@
 | STM32 固件（协议 + 六路舵机 + 软限位 + 斜坡） | ✅ 实机通过：`$PING*10` → `$OK,PONG*3E`，`STATE` 回读六路脉宽 |
 | 鲲鹏 YOLOv8 识别 + MJPEG 推流 | ✅ 板上实测约 26.6 FPS（B 抽帧推理 + C V4L2/MJPG 采集优化后） |
 | 鲲鹏网页控制台 + 点选抓取 | ✅ 5000 单页：滑杆控 6 路、点选→IK→`JOINT`→`STATE`、标定参数常驻面板 + 本地预设 |
-| `iot/` IoT 网关五件套 | 🔶 Docker Compose + 模拟设备脚本已备，**未在板上起容器、未接真实设备** |
+| `iot/` 板内可观测性闭环 | ✅ 真实串口遥测 → MQTT → EMQX → eKuiper → InfluxDB → Grafana，四容器板上跑通、Grafana 六路曲线已出；收口 `e6cd194`（🔴 不是云端 IoT / 不增抓取能力） |
 | 手眼标定（眼在手） | 🔶 `handeye_calib.py` 自检通过（FK 误差 0.000cm），**未相机实标、未接入点选链路** |
 | 蓝牙 / WiFi / RFID 多通道、示教回放 | 🔶 旧项目源码已有，当前工程未重新实机复验（RC522 当前未接） |
-| ESP32-S3 语音 / ASR / WakeNet | 📋 P2，`esp32/` 仅 README，核心板+扩展板待焊 |
+| `kunpeng/llm/` 意图解析 + 离线文本入口网关 | 🔶 `intent_parser.py` + `text_gateway.py`，44 项 unittest 全绿；**只打印不下发**、未接真串口 / 未接云端大模型 / 未接主链路；`$ASR` 帧是建议草案 |
+| ESP32-S3 语音 / ASR / WakeNet | 📋 P2；成品开发板 + 麦/功放/喇叭已可直接用，自画核心板仍待焊；WakeNet / ASR / 语音→动作序列**无代码、未上板、未接主链路** |
 | 双 STM32 分工、双相机 6D 位姿、LLM 规划、OTA、云端 IoT、数字孪生 | 📋 纯规划，**无代码** |
 
 > 状态口径与可直接投递的简历正文见 `docs/简历-具身智能项目条目.md`；写简历 / 面试时的红线见 `docs/排障记录-S3b.md`「本阶段诚实边界」。
@@ -116,8 +121,8 @@ RoboticArm_Kunpeng/
 │   │   └── handeye_calib.py     🔶 手眼标定（AX=XB）：自检通过，未实标、未接入点选链路
 │   ├── web/                     ✅ web_control.py 网页遥控（Flask + 滑杆 + 点选抓取）
 │   └── docs/                    stage1_README.md 识别部署说明、A档执行计划
-├── esp32/                       📋 ESP32-S3 端（语音唤醒 + ASR，P2）：仅 README 占位，板待焊
-├── iot/                         🔶 IoT 五件套（EMQX→eKuiper→InfluxDB→Grafana + 模拟设备）：未起容器
+├── esp32/                       📋 ESP32-S3 端（语音入口，P2）：成品开发板已可直接用、软件未上板；口径见 esp32/README.md
+├── iot/                         ✅ 板内可观测性闭环（EMQX→eKuiper→InfluxDB→Grafana + 真实串口遥测）：已实证，收口 e6cd194
 ├── protocol_engine_cpp/         C++ 跨平台串口协议引擎（243 断言，三方协议金标准）
 └── docs/                        全部文档
     ├── 项目实施方案.md / 硬件清单.md / 低预算能力清单（功能边界）.md 等方案类

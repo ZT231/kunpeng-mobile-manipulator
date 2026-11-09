@@ -1,0 +1,22 @@
+# sdkconfig.defaults —— 「默认配置」
+#
+# 【概念】ESP-IDF 用 sdkconfig 记录上千个开关（Flash 多大、要不要 PSRAM、
+#        FreeRTOS 心跳多少…）。这份 defaults 是「第一次 build 时自动填进去的默认值」。
+# 【规范】idf.py build 第一次会由它生成工程根下的 sdkconfig；
+#        已经生成过 sdkconfig 之后再改本文件不会自动重来，
+#        要用 idf.py menuconfig 改，或删掉 sdkconfig 重新 build。
+# 【为什么】不写这份，成品板的 16MB Flash / 8MB PSRAM 会被当成默认小容量，
+#        后面 WakeNet / ESP-SR 模型根本放不进去。
+
+# 16MB Flash：成品开发板是 ESP32-S3-WROOM-1 N16R8
+CONFIG_ESPTOOLPY_FLASHSIZE_16MB=y
+
+# 8MB Octal PSRAM：离线唤醒模型要放得下，必须开。
+# ESP-IDF v5.x 统一用 CONFIG_SPIRAM*；
+# 如果你用的是 v4.4，把这三行换成 CONFIG_ESP32S3_SPIRAM_SUPPORT=y
+CONFIG_SPIRAM=y
+CONFIG_SPIRAM_MODE_OCT=y
+CONFIG_SPIRAM_SPEED_80M=y
+
+# FreeRTOS 心跳 1000Hz：让 vTaskDelay(1) 真的是 1ms，采音定时更准
+CONFIG_FREERTOS_HZ=1000
