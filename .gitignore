@@ -45,6 +45,17 @@ build_output.txt
 *.0000
 
 # ============================================================
+# 标定产物（每台机器/每次标定都不同，不进版本库）
+# 代码里已经有 gen_placeholder_calib.py 能随时重建占位文件，
+# 真机标定结果留在板上 ~/kunpeng_vision/ 即可。
+# ============================================================
+kunpeng/robot/handeye_X.json
+kunpeng/robot/camera_intrinsics.json
+kunpeng/robot/samples.json
+kunpeng/robot/intrinsics_imgs/
+kunpeng/robot/collect_imgs/
+
+# ============================================================
 # 编辑器 / 系统
 # ============================================================
 .vscode/

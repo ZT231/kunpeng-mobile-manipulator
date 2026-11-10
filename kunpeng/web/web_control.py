@@ -164,6 +164,64 @@ def solve_to_pulses(x, y):
 
 
 # ---------------------------------------------------------------------------
+# A+ 方案：眼在手定位（手眼矩阵 X 的真正消费者，可选功能）
+#
+# ① 用了什么语法：模块级可选 import（try/except ImportError）+ 全局配置字典
+#    + 惰性加载（第一次用到才读 JSON，避免启动时因文件缺失拖慢/拖垮服务）。
+# ② 为什么这么设计：A 方案的 pixel_to_table() 是「5 个手工常量 + 假设拍照姿态固定」
+#    的退化解，换任何姿态立刻失真。眼在手链路用「内参 K + 手眼矩阵 X + 当前关节角」
+#    算出真正的射线-平面交点，这才对得起「相机装在臂末端」的硬件事实。
+#    但它是新算路，必须能一键关掉回退到旧映射，否则一旦 X 是坏的，
+#    连原本能用的点选功能也一起废掉 —— 所以做成 --eye-in-hand 显式开启。
+# ③ 不这么写会怎样：默认开启 + X 是占位数据 = 页面给出看似精确、实则错的坐标，
+#    比明确报错更危险；而硬 import 会让缺 numpy 的板子连 5000 都起不来。
+# ---------------------------------------------------------------------------
+_EYE = None                # EyeInHandLocalizer 实例；None = 未启用
+_EYE_ERROR = ""            # 未启用原因，给页面看
+_EYE_INFO = {              # 给页面显示的元数据（是否占位、文件路径等）
+    "enabled": False,
+    "placeholder": False,
+    "flag": "",
+    "x_path": "",
+    "k_path": "",
+}
+_EYE_PLANE_Z = None        # 抓取平面高度 cm；None = 用 arm_params.json 的 grab_height
+
+
+def init_eye_in_hand(robot_dir, x_path, k_path, plane_z=None):
+    """尝试加载眼在手链路；失败只记原因、绝不抛异常拖垮网页服务。
+
+    大白话：给程序装上"会算 3D 的两只眼睛"，装不上就明确说装不上，别硬撑。
+    规范定义：惰性构造 EyeInHandLocalizer（含 CalibData + Kinematics），
+             失败降级不影响原有 pixel_to_table 通路。
+    """
+    global _EYE, _EYE_ERROR, _EYE_PLANE_Z
+    d = os.path.expanduser(robot_dir or "~/kunpeng_vision")
+    xp = os.path.expanduser(x_path or os.path.join(d, "handeye_X.json"))
+    kp = os.path.expanduser(k_path or os.path.join(d, "camera_intrinsics.json"))
+    _EYE_INFO.update(x_path=xp, k_path=kp)
+    try:
+        if d not in sys.path:
+            sys.path.insert(0, d)
+        from handeye_geometry import load_calib, Kinematics, EyeInHandLocalizer
+        cal = load_calib(xp, kp)
+        # 复用已经加载好的 ArmIK 实例，保证「脉宽->角度」用的是同一份标定表；
+        # 若逆解模块没就绪（_IK is None），Kinematics 会自己新建一个。
+        kin = Kinematics(os.path.join(d, "arm_params.json"), ik=_IK)
+        _EYE = EyeInHandLocalizer(cal, kin)
+        _EYE_ERROR = ""
+        _EYE_PLANE_Z = float(plane_z) if plane_z is not None else None
+        _EYE_INFO.update(enabled=True, placeholder=cal.placeholder,
+                         flag=cal.flag_text())
+        return True
+    except Exception as e:
+        _EYE = None
+        _EYE_ERROR = "眼在手链路未启用（%s）：%s" % (d, e)
+        _EYE_INFO.update(enabled=False, placeholder=False, flag="")
+        return False
+
+
+# ---------------------------------------------------------------------------
 # 协议层（与 arm_host.py 一致）
 # ---------------------------------------------------------------------------
 def compute_ck(payload: str) -> int:
@@ -1539,7 +1597,129 @@ def api_ik_config():
         error=_IK_ERROR,
         map=dict(_IK_MAP),
         ranges=PULSE_RANGES,
+        eye=dict(_EYE_INFO, error=_EYE_ERROR),
     )
+
+
+@app.route("/api/ik/eye")
+def api_ik_eye():
+    """给页面看眼在手链路状态：是否启用、用的哪两个文件、是否占位数据。
+
+    单独一个接口而不是塞进 /api/ik/config：眼在手是后加的独立算路，
+    页面可以只关心它、也可以在它异常时给出单独的提示，不互相牵连。
+    """
+    return jsonify(ok=True, eye=dict(_EYE_INFO, error=_EYE_ERROR),
+                   plane_z=(_EYE_PLANE_Z if _EYE_PLANE_Z is not None else _IK_MAP["z"]))
+
+
+@app.route("/api/ik/eye/solve", methods=["POST"])
+def api_ik_eye_solve():
+    """像素 + 当前关节角 -> 手眼链 -> 工作台 3D 点 -> IK -> 6 路脉宽。
+
+    与 /api/ik/solve 的区别（这是「A」相对「A 退化版」的核心升级）：
+        · 旧：x = center_x + (u/w-0.5)*span_x —— 5 个手工常量，隐含「拍照姿态固定」；
+        · 新：K 反投影出射线 → 用**当前 6 路实际脉宽**做 FK 得 T_base_end
+              → T_base_cam = T_base_end·X → 与 z=Z 平面求交。
+    因此臂换个姿态再点同一个像素，结果会跟着变 —— 这是对的，因为相机跟着动了。
+
+    可靠性说明：关节角必须来自真实串口 STATE。若串口没连，宁可直接报错，
+    也不拿初始位顶替 —— 那会算出"看起来对、其实差十几厘米"的坐标。
+    apply=True 时才下发 JOINT，且与旧接口一样先试算后确认。
+    """
+    if _EYE is None:
+        return jsonify(ok=False, error=_EYE_ERROR or "眼在手链路未启用（启动加 --eye-in-hand）")
+
+    data = request.get_json(force=True, silent=True) or {}
+    u = float(data.get("u", 0))
+    v = float(data.get("v", 0))
+
+    # 关节角来源：优先页面传来的 pulses（刚轮询到的），否则向串口要一次。
+    # 为什么不默认用 _IK_MAP 的常量：STATE 是唯一能反映"相机此刻在哪"的信息源。
+    pulses = data.get("pulses")
+    if not (isinstance(pulses, list) and len(pulses) == 6):
+        if _HOST is None:
+            return jsonify(ok=False,
+                           error="串口未连接，拿不到当前关节角：眼在手定位必须有真实脉宽"
+                                 "（先点页面「连接」，或等 1s 轮询拿到 STATE）")
+        try:
+            sresp = _HOST.cmd("STATE")
+            parts = sresp.split(",")
+            if len(parts) < 9:
+                return jsonify(ok=False, error="STATE 响应异常，取不到 6 路脉宽：%r" % sresp)
+            pulses = [int(t) for t in parts[3:9]]
+        except Exception as e:
+            return jsonify(ok=False, error="读取当前关节角失败：%s" % e)
+    else:
+        pulses = [int(p) for p in pulses]
+
+    plane_z = data.get("plane_z")
+    plane_z = float(plane_z) if plane_z is not None else _EYE_PLANE_Z
+
+    try:
+        est = _EYE.localize(u, v, pulses, plane_z=plane_z)
+    except ValueError as e:
+        # 目标在视野外 / 视线与桌面平行 / 深度离谱，都归成一句能看懂的话
+        return jsonify(ok=False, error=str(e), pulses=pulses)
+
+    x, y, z = est["x"], est["y"], est["z"]
+    # 用眼在手算出的 z 参与逆解，而不是 _IK_MAP["z"]：平面已由射线求交确定，
+    # 再套一个手工高度会自相矛盾。
+    try:
+        angles = _IK.solve(x, y, z=z, wrist=_IK_MAP["wrist"],
+                           claw=_IK_MAP["claw"], tilt=_IK_MAP["tilt"])
+        raw = _IK.to_pulses(angles)
+    except Exception as e:
+        return jsonify(ok=False, error="逆解失败：%s" % e,
+                       x=round(x, 2), y=round(y, 2), z=round(z, 2))
+
+    out_pulses, clamped = [], []
+    for i, p in enumerate(raw):
+        lo, hi, _ = PULSE_RANGES[i]
+        q = max(lo, min(hi, int(p)))
+        if q != int(p):
+            clamped.append(JOINT_NAMES[i])
+        out_pulses.append(q)
+
+    out = dict(
+        ok=True,
+        mode="eye_in_hand",
+        pixel=[u, v],
+        x=round(x, 2), y=round(y, 2), z=round(z, 2),
+        depth=round(est["depth"], 2),
+        pulses=out_pulses,
+        clamped=clamped,
+        source_pulses=pulses,
+        placeholder=est["placeholder"],
+        flag=est["flag"],
+        applied=False,
+        resp="",
+    )
+
+    if not data.get("apply"):
+        out["note"] = "仅试算，未下发任何串口命令"
+        if est["placeholder"]:
+            out["note"] += "；⚠ 标定数据为占位值，坐标不代表真实精度"
+        return jsonify(out)
+
+    if _HOST is None:
+        out["ok"] = False
+        out["error"] = "串口未连接：试算结果已保留，先点页面「连接」再下发"
+        return jsonify(out)
+
+    payload = "JOINT,%s" % ",".join(str(int(p)) for p in out_pulses)
+    try:
+        out["resp"] = _HOST.cmd(payload)
+    except Exception as e:
+        out["ok"] = False
+        out["error"] = "JOINT 下发失败：%s" % e
+        return jsonify(out)
+
+    out["applied"] = True
+    out["frame"] = payload
+    out["note"] = ("固件已回 OK；六路正走斜坡逼近目标"
+                   if out["resp"].startswith("OK")
+                   else "固件未回 OK，请检查链路（帧已发出）")
+    return jsonify(out)
 
 
 @app.route("/api/ik/calib", methods=["POST"])
@@ -1691,6 +1871,15 @@ def main():
     ap.add_argument("--ik-dir", default="~/kunpeng_vision", metavar="DIR",
                     help="A 方案逆解模块目录（需含 arm_ik.py + arm_params.json）；"
                          "默认 ~/kunpeng_vision，找不到只关掉「点选抓取」、不影响主链路")
+    ap.add_argument("--eye-in-hand", action="store_true",
+                    help="启用眼在手定位（需 handeye_X.json + camera_intrinsics.json）；"
+                         "默认关闭，保持旧的「画面→桌面」线性映射")
+    ap.add_argument("--handeye-X", default="", metavar="FILE",
+                    help="手眼矩阵文件，默认 <ik-dir>/handeye_X.json")
+    ap.add_argument("--intrinsics", default="", metavar="FILE",
+                    help="相机内参文件，默认 <ik-dir>/camera_intrinsics.json")
+    ap.add_argument("--plane-z", type=float, default=None, metavar="CM",
+                    help="抓取平面高度 cm；默认用 arm_params.json 的 grab_height")
     args = ap.parse_args()
 
     global _MODE, _WIFI_ADDR, _CAM, _VIDEO_URL, _DETECTIONS_URL, _HOST
@@ -1758,6 +1947,18 @@ def main():
     else:
         ik_desc = "未启用：%s" % _IK_ERROR
 
+    # ---- A+ 眼在手链路（必须显式 --eye-in-hand，默认不碰旧通路）----
+    # 依赖 _IK 先加载好：Kinematics 复用它做「脉宽->角度」，保证标定表只有一份。
+    if args.eye_in_hand:
+        eye_ok = init_eye_in_hand(args.ik_dir, args.handeye_X, args.intrinsics,
+                                  plane_z=args.plane_z)
+        if eye_ok:
+            eye_desc = "已启用%s" % ("（⚠ 占位数据）" if _EYE_INFO["placeholder"] else "（实测数据）")
+        else:
+            eye_desc = "未启用：%s" % _EYE_ERROR
+    else:
+        eye_desc = "未启用（加 --eye-in-hand 开启）"
+
     print("=" * 56)
     print("机械臂网页遥控已启动")
     print("  通道：%s" % chan_desc)
@@ -1769,6 +1970,7 @@ def main():
     if _DETECTIONS_URL:
         print("  识别：%s" % _DETECTIONS_URL)
     print("  逆解：%s" % ik_desc)
+    print("  眼在手：%s" % eye_desc)
     if _MODE == "wifi_server":
         print("  提示：电脑先连 ESP 自建热点 并固定 IP 192.168.4.50；"
               "手机/电脑浏览器打开 http://<本机IP>:%d 即可控制" % args.port)
