@@ -269,8 +269,102 @@ def _project_so3(M):
     return R
 
 
-def solve_handeye_axxb(R_g2b, t_g2b, R_t2c, t_t2c, verbose=True):
+# ---------------------------------------------------------------------------
+# 求解结果的有效性判定（三分类）
+# ---------------------------------------------------------------------------
+# 阈值不是拍脑袋，是从四组实测数据反推的（2026-11-10）：
+#   合成正常数据          ratio≈5e-16   resid≈1.5e-15 m   → OK
+#   单轴小角度（激励不足） ratio≈7e-1    resid≈3.4e-3  m   → WEAK
+#   人为破坏 1/3 样本      ratio≈5e-16   resid≈2.1e-1  m   → NO_SOLUTION
+#   实机坏数据             ratio≈9e-1    resid≈9.6e-1  m   → NO_SOLUTION
+# 关键发现：单轴退化的 ratio 也很大，但它的残差只有毫米级；真无解的残差是
+# 十几厘米。所以必须用两级残差门限，单靠一个数会把两者混为一谈。
+RATIO_WEAK = 1e-3       # 奇异值最小/次小超过它 ⇒ 零空间不止一维（激励不足）
+RESID_HARD = 0.02       # 残差 > 2cm：不可能是数值噪声，样本之间真的矛盾（无解）
+RESID_SOFT = 1e-3       # 零空间一维时的容忍上限（1mm），超过说明拟合不上
+T_NORM_SANE_M = 0.25    # 相机离末端原点的物理上限 25 cm，超过即不可信
+
+STATUS_OK = "OK"
+STATUS_WEAK = "WEAK_EXCITATION"
+STATUS_NO_SOLUTION = "NO_SOLUTION"
+_STATUS_NOTE = {
+    STATUS_OK: "✅ 正常：方程可解且解唯一",
+    STATUS_WEAK: "⚠️ 旋转激励不足：方程有解但不唯一，X 不可靠",
+    STATUS_NO_SOLUTION: "❌ 无解：样本之间自相矛盾，不存在满足全部方程的 X",
+}
+_STATUS_ADVICE = {
+    STATUS_OK: "",
+    STATUS_WEAK: "多摆几个「转轴不同、角度更大」的姿态重采（J1 与 J4 都要覆盖，别只绕一个轴）",
+    STATUS_NO_SOLUTION: "不是多摆几个姿态能救的：先查 J4 重力下垂、标定板是否被碰动、"
+                        "arm_params.json 的脉宽↔角度映射是否与实际相符",
+}
+
+
+def classify_handeye_solution(diag, t_m):
+    """把 AX=XB 的解分成「正常 / 激励不足 / 无解」三类，并给出是否可用。
+
+    为什么必须分三类（这是 2026-11-10 实机踩出来的）：
+      旧代码只有一个判据「奇异值最小/次小 > 1e-3 就警告激励不足」。
+      但实机那次 ratio=0.92、平移残差 0.96 m —— 那是**方程根本没有解**，
+      不是激励不足。两者的修法完全相反：前者要"多摆几个姿态"，
+      后者要"查数据为什么自相矛盾"。判错方向会让人白采好几轮。
+
+    概念（大白话）：
+      奇异值最小 ≈ 0 → 存在一个几乎不违反任何方程的答案；
+      残差也 ≈ 0    → 这个答案真的满足所有方程（有解）；
+      两个都小但不唯一 → 激励不足（解有一堆，随便挑一个都自洽）；
+      最小值不接近 0 → 没有任何答案能同时满足（无解）。
+
+    规范定义：
+      系数矩阵 K ∈ R^{9n×9}，零空间维数 = 9 − rank(K)。
+      σ_min ≈ 0 且 σ_2nd ≫ σ_min ⇒ dim ker = 1，解存在且唯一；
+      σ_min ≈ σ_2nd ≈ 0          ⇒ dim ker ≥ 2，解不唯一（激励不足）；
+      σ_min 不接近 0             ⇒ dim ker = 0，最小二乘残差显著为正（无解）。
+
+    判定顺序（不能交换，否则单轴退化会被误判成无解）：
+      ① 残差 > 2cm        → 无解（量级差太远，只能是数据矛盾）
+      ② 否则 ratio > 1e-3 → 激励不足
+      ③ 否则残差 > 1mm    → 无解（零空间唯一却拟合不上，也是矛盾）
+      ④ 其余              → 正常
+
+    返回 (status, valid, reasons)；valid=True 才允许写进 handeye_X.json。
+    """
+    reasons = []
+    ratio = float(diag.get("ratio", 0.0))
+    resid = float(diag.get("resid", 0.0))
+    t_norm = float(np.linalg.norm(np.asarray(t_m, dtype=float).reshape(3)))
+
+    if resid > RESID_HARD:
+        status = STATUS_NO_SOLUTION
+        reasons.append("平移方程残差 %.3e m 超过 %.0f cm 上限（方程无精确解）"
+                       % (resid, RESID_HARD * 100.0))
+    elif ratio > RATIO_WEAK:
+        status = STATUS_WEAK
+        reasons.append("奇异值最小/次小 = %.2e 大于阈值 %.1e（零空间不止一维，解不唯一）"
+                       % (ratio, RATIO_WEAK))
+    elif resid > RESID_SOFT:
+        status = STATUS_NO_SOLUTION
+        reasons.append("零空间虽为一维，但平移残差 %.3e m 超过 %.0e m（数据自相矛盾）"
+                       % (resid, RESID_SOFT))
+    else:
+        status = STATUS_OK
+
+    # 第二判据：物理合理性。数学上能解，也不代表这个 X 装得出来。
+    # 相机装在 J4 轴上，离末端原点最多十几厘米；25cm 那种一定是算歪了。
+    if t_norm > T_NORM_SANE_M:
+        reasons.append("平移模长 %.1f cm 超过物理上限 %.0f cm（相机不可能离末端这么远）"
+                       % (t_norm * 100.0, T_NORM_SANE_M * 100.0))
+
+    valid = (status == STATUS_OK) and (len(reasons) == 0)
+    return status, valid, reasons
+
+
+def solve_handeye_axxb(R_g2b, t_g2b, R_t2c, t_t2c, verbose=True, diag=None):
     """纯 numpy 解 AX=XB，返回 (R_cam2gripper, t_cam2gripper)。
+
+    参数 diag：可选 dict；传进来就顺手把求解质量指标填进去，供调用方判有效性。
+    （不改返回值，因为 selftest 里有好几处按 2 元组解包，改签名会全崩。）
+    diag 会得到：svals_min / svals_2nd / ratio / resid / pairs。
 
     概念（大白话）：
       相机固定在臂末端、标定板固定在环境里。不管臂怎么摆，
@@ -320,12 +414,20 @@ def solve_handeye_axxb(R_g2b, t_g2b, R_t2c, t_t2c, verbose=True):
     _, svals, Vt = np.linalg.svd(K, full_matrices=False)
     v = Vt[-1]                    # 最小奇异值对应的右奇异向量 = vec(R_X) 的方向
 
+    if diag is not None:
+        # 比值 = 最小/次小。它才是判断"零空间有几维"的关键，绝对值没有可比性
+        # （K 的行数随样本数变化，奇异值整体量级也跟着变）。
+        diag["pairs"] = len(K_rows)
+        diag["svals_min"] = float(svals[-1])
+        diag["svals_2nd"] = float(svals[-2])
+        diag["ratio"] = (float(svals[-1]) / float(svals[-2])) if svals[-2] > 0 else 0.0
+
     if verbose:
-        print("  AX=XB 姿态对 %d 组；奇异值最小/次小 = %.3e / %.3e"
-              % (len(K_rows), svals[-1], svals[-2]))
-        # 概念（大白话）：如果臂每次都只平移不转，方程就解不出唯一的 X（退化）。
-        if svals[-2] > 1e-9 and svals[-1] / svals[-2] > 1e-3:
-            print("  ⚠️ 旋转激励不足（姿态间相对旋转太小或转轴太单一），X 可能不可靠")
+        print("  AX=XB 姿态对 %d 组；奇异值最小/次小 = %.3e / %.3e（比值 %.2e）"
+              % (len(K_rows), svals[-1], svals[-2],
+                 (svals[-1] / svals[-2]) if svals[-2] > 0 else 0.0))
+        print("  比值判据：<1e-3 说明零空间恰好一维（有唯一解）；"
+              "≥1e-3 说明零空间不止一维或无解，末尾会给出三分类结论")
 
     def _solve_t(R):
         """给定 R_X，用 (R_A − I)·t_X = R_X·t_B − t_A 最小二乘解 t_X。"""
@@ -348,8 +450,15 @@ def solve_handeye_axxb(R_g2b, t_g2b, R_t2c, t_t2c, verbose=True):
         t, resid = _solve_t(R)
         candidates.append((resid, R, t))
     resid, R_best, t_best = min(candidates, key=lambda c: c[0])
+    if diag is not None:
+        diag["resid"] = float(resid)
     if verbose:
-        print("  选定候选解：平移方程残差 = %.3e" % resid)
+        print("  选定候选解：平移方程残差 = %.3e m"
+              "（>%.0f cm 必定无解；>%.0e m 且零空间唯一也是数据矛盾）"
+              % (resid, RESID_HARD * 100.0, RESID_SOFT))
+        if diag is not None:
+            status, valid, _ = classify_handeye_solution(diag, t_best.reshape(3))
+            print("  三分类：%s（valid=%s）" % (_STATUS_NOTE[status], valid))
     return R_best, t_best.reshape(3, 1)
 
 
@@ -473,6 +582,42 @@ def cmd_selftest(args=None):
         ok = ok and good4
         print("  rc=%d  键齐全=%s  X_matrix 4x4=%s  samples=%s  %s"
               % (rc, keys_ok, shape_ok, d.get("samples"), "✅" if good4 else "❌"))
+
+    # --- 5) 三分类的"无解"分支：故意造一份自相矛盾的样本 ---
+    # 为什么这条自检必须存在：cmd_solve 以前无论解得多离谱都照样写 handeye_X.json，
+    # 而 web_control.py 默认就会加载那个文件。一个"数学合法但物理错误"的 X
+    # 不会报任何错，只会让点选坐标悄悄偏十几厘米 —— 这是最危险的一类失败。
+    print("自检 5：无解样本必须被判 NO_SOLUTION 且不写正式文件名")
+    with tempfile.TemporaryDirectory() as td:
+        sp = os.path.join(td, "samples_bad.json")
+        op = os.path.join(td, "handeye_X.json")
+        bad = []
+        for i in range(len(Rg)):
+            tt = np.asarray(tc[i]).reshape(3).copy()
+            if i % 3 == 1:
+                tt[0] += 0.05      # 只破坏 1/3 的样本，方程就不再自洽了
+            bad.append({
+                "pulses": [1500] * 6,
+                "R_gripper2base": np.asarray(Rg[i]).tolist(),
+                "t_gripper2base": np.asarray(tg[i]).reshape(3).tolist(),
+                "R_target2cam": np.asarray(Rc[i]).tolist(),
+                "t_target2cam": tt.tolist(),
+            })
+        with open(sp, "w", encoding="utf-8") as f:
+            json.dump({"count": len(bad), "samples": bad, "square_m": 0.025}, f, indent=2)
+        rc5 = cmd_solve(argparse.Namespace(samples=sp, out=op))
+        rej = _rejected_path(op)
+        got = {}
+        if os.path.isfile(rej):
+            with open(rej, "r", encoding="utf-8") as f:
+                got = json.load(f)
+        good5 = (rc5 == 2 and got.get("valid") is False
+                 and got.get("status") == STATUS_NO_SOLUTION
+                 and not os.path.isfile(op))
+        ok = ok and good5
+        print("  rc=%d（期望 2）  status=%s  valid=%s  未写正式文件=%s  %s"
+              % (rc5, got.get("status"), got.get("valid"),
+                 not os.path.isfile(op), "✅" if good5 else "❌"))
 
     print("自检", "通过 ✅" if ok else "失败 ❌")
     return 0 if ok else 1
@@ -742,8 +887,24 @@ def cmd_collect(args):
     return 0
 
 
+def _rejected_path(out):
+    """把 handeye_X.json 映射成 handeye_X.rejected.json。
+
+    为什么不干脆写进原路径再标 valid:false：
+      web_control.py 的 --eye-in-hand 默认就读 handeye_X.json，而 load_calib
+      只会检查矩阵是否正交、行列式是否 1 —— 一个"数学合法但实际算歪"的 X
+      能顺利通过检查。于是网页点选会给出看着正常、实际错十几厘米的坐标。
+      失败时换个文件名，等于从物理上断开误用路径，比加个标志位可靠。
+    """
+    root, ext = os.path.splitext(out)
+    return root + ".rejected" + (ext or ".json")
+
+
 def cmd_solve(args):
-    """解 AX=XB 得相机相对末端的变换 X（纯 numpy，不需要 cv2.contrib）。"""
+    """解 AX=XB 得相机相对末端的变换 X（纯 numpy，不需要 cv2.contrib）。
+
+    返回值约定：0 = 解有效；1 = 跑不起来（样本不足等）；2 = 跑通了但结果判为无效。
+    """
     with open(args.samples, "r", encoding="utf-8") as f:
         data = json.load(f)
     samples = data["samples"]
@@ -757,22 +918,61 @@ def cmd_solve(args):
     t_t2c = [np.array(s["t_target2cam"], float).reshape(3, 1) for s in samples]
 
     print("解算 AX=XB（纯 numpy：vec+Kronecker+SVD 求旋转，最小二乘求平移）")
-    R_c2g, t_c2g = solve_handeye_axxb(R_g2b, t_g2b, R_t2c, t_t2c, verbose=True)
+    diag = {}
+    R_c2g, t_c2g = solve_handeye_axxb(R_g2b, t_g2b, R_t2c, t_t2c,
+                                      verbose=True, diag=diag)
     X = np.eye(4)
     X[:3, :3] = R_c2g
     X[:3, 3:] = t_c2g
     # 把 X 转成可读的"相机相对末端"平移(cm) + 欧拉角(度)，方便复核装法
     t_cm = (t_c2g.reshape(3) * 100.0).tolist()
     euler = _rot_to_euler_deg(R_c2g)
-    out = {"X_matrix": X.tolist(), "t_cam2gripper_cm": t_cm,
-           "rpy_cam2gripper_deg": euler, "samples": len(samples)}
-    with open(args.out, "w", encoding="utf-8") as f:
+
+    status, valid, reasons = classify_handeye_solution(diag, t_c2g.reshape(3))
+    out = {
+        "X_matrix": X.tolist(),
+        "t_cam2gripper_cm": t_cm,
+        "rpy_cam2gripper_deg": euler,
+        "samples": len(samples),
+        # 下面四项是 2026-11-10 新增的"结果自证"字段：读文件的人不用回头翻终端，
+        # 就知道这个 X 是怎么判出来的、为什么被判无效。
+        "valid": bool(valid),
+        "status": status,
+        "diagnostics": {
+            "svals_min": diag.get("svals_min"),
+            "svals_2nd": diag.get("svals_2nd"),
+            "svals_ratio": diag.get("ratio"),
+            "translation_residual_m": diag.get("resid"),
+            "pairs": diag.get("pairs"),
+            "t_norm_cm": float(np.linalg.norm(t_c2g.reshape(3)) * 100.0),
+        },
+        "reasons": reasons,
+    }
+    path = args.out if valid else _rejected_path(args.out)
+    with open(path, "w", encoding="utf-8") as f:
         json.dump(out, f, indent=2)
-    print("手眼标定完成，X(相机→末端) 已保存 %s" % args.out)
-    print("  平移 t = [%.2f, %.2f, %.2f] cm" % tuple(t_cm))
-    print("  欧拉角 rpy = [%.1f, %.1f, %.1f] 度（roll,pitch,yaw，相机系相对末端系）" % tuple(euler))
-    print("用法：抓取时 target_in_cam --X--> target_in_gripper，再经正/逆解算关节角。")
-    return 0
+
+    print("  平移 t = [%.2f, %.2f, %.2f] cm（模长 %.1f cm）"
+          % (t_cm[0], t_cm[1], t_cm[2], out["diagnostics"]["t_norm_cm"]))
+    print("  欧拉角 rpy = [%.1f, %.1f, %.1f] 度（roll,pitch,yaw，相机系相对末端系）"
+          % tuple(euler))
+    print("  三分类 = %s" % _STATUS_NOTE[status])
+
+    if valid:
+        print("手眼标定完成，X(相机→末端) 已保存 %s" % path)
+        print("用法：抓取时 target_in_cam --X--> target_in_gripper，再经正/逆解算关节角。")
+        return 0
+
+    print("")
+    print("❌ 本次结果判为不可用（valid=false）。已存到 %s 供复盘，未写入 %s。"
+          % (path, args.out))
+    for r in reasons:
+        print("   · %s" % r)
+    print("   建议：%s" % _STATUS_ADVICE[status])
+    if os.path.isfile(args.out):
+        print("   ⚠️ 已存在的 %s 未被改动（它是上一次的解，可能同样无效）。" % args.out)
+        print("      确认不用之后执行：mv %s %s" % (args.out, _rejected_path(args.out)))
+    return 2
 
 
 def _rot_to_euler_deg(R):

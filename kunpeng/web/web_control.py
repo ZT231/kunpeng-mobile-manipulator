@@ -250,6 +250,11 @@ class SerialHost:
         self.rlock = threading.Lock()
         self.rxq = []            # 后台线程解析出的完整应答行（FIFO）
         self._reader_alive = True
+        # 非空 = 这条链路已经不可用，原因写在这里。send/fire 会据此显式报错。
+        # 为什么必须有它：pyserial 不感知 USB 节点被删除，ser.is_open 仍返回 True、
+        # write() 也不报错，数据全进废弃的 fd。没有这个标记时，上层只能看到
+        # "命令发出去了、响应是空串"，会误判成 STM32 没应答（2026-11-10 实测踩到）。
+        self._dead_reason = ""
         self._reader = threading.Thread(target=self._rx_loop, daemon=True)
         self._reader.start()
         time.sleep(0.3)
@@ -265,7 +270,11 @@ class SerialHost:
         while self._reader_alive:
             try:
                 ch = self.ser.read(1)
-            except Exception:
+            except Exception as e:
+                # 只有"非主动关闭"的异常才算链路故障。close() 会先把 _reader_alive
+                # 置 False（此时 ser 可能已是 None），那种情况不该记成断开原因。
+                if self._reader_alive:
+                    self._dead_reason = "串口读取线程异常退出（%s）" % e
                 break
             if not ch:
                 continue
@@ -287,6 +296,7 @@ class SerialHost:
 
     def close(self):
         self._reader_alive = False
+        self._dead_reason = "串口已关闭"
         try:
             if self.ser and self.ser.is_open:
                 self.ser.close()
@@ -295,6 +305,9 @@ class SerialHost:
             self._reader = None
 
     def _write(self, payload):
+        # 链路已死就直接报错，别往废弃的 fd 里灌数据装成功 —— 详见 __init__ 里的注释。
+        if self._dead_reason:
+            raise RuntimeError("%s；请重新 POST /api/open 连串口" % self._dead_reason)
         if not self.ser or not self.ser.is_open:
             raise RuntimeError("串口已断开")
         self.ser.write(make_frame(payload))
@@ -307,6 +320,10 @@ class SerialHost:
             self._write(payload)
         deadline = time.time() + timeout
         while time.time() < deadline:
+            if self._dead_reason:
+                # 等待期间读线程死了（USB 热拔/复位）：立刻报错。
+                # 若继续等满 timeout，上层只会拿到空串，误判成"STM32 没应答"。
+                raise RuntimeError("%s；请重新 POST /api/open 连串口" % self._dead_reason)
             with self.rlock:
                 if self.rxq:
                     return self.rxq.pop(0)

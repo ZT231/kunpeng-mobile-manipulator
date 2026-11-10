@@ -182,6 +182,14 @@ def load_calib(X_path, K_path):
 
     if "X_matrix" not in dx:
         raise ValueError("%s 里没有 X_matrix 字段（应由 handeye_calib.py solve 生成）" % X_path)
+    # 2026-11-10 新增：solve 现在会给结果打 valid 标记。被判无效的 X 绝不能进链路 ——
+    # 它的矩阵本身是正交的，能骗过下面的矩阵合法性检查，但坐标会错十几厘米。
+    # 老文件没有这个字段（get 返回 None），按"未判定"放行，保持向后兼容。
+    if dx.get("valid") is False:
+        why = "；".join(dx.get("reasons") or []) or "未记录原因"
+        raise ValueError(
+            "%s 被判为无效解（status=%s）：%s。请重新采集并 solve，别拿它算坐标。"
+            % (X_path, dx.get("status", "UNKNOWN"), why))
     # 内参文件兼容两种写法：camera_matrix（handeye_calib intrinsics 的输出）
     # 与 mtx（部分 OpenCV 教程习惯），避免因为名字不同就读不进来。
     K_raw = dk.get("camera_matrix", dk.get("mtx", dk.get("K")))
