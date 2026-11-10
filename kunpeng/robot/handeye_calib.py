@@ -279,10 +279,33 @@ def _project_so3(M):
 #   实机坏数据             ratio≈9e-1    resid≈9.6e-1  m   → NO_SOLUTION
 # 关键发现：单轴退化的 ratio 也很大，但它的残差只有毫米级；真无解的残差是
 # 十几厘米。所以必须用两级残差门限，单靠一个数会把两者混为一谈。
-RATIO_WEAK = 1e-3       # 奇异值最小/次小超过它 ⇒ 零空间不止一维（激励不足）
+# ⚠ 这里的 resid 一律是「每行 RMS」，见 _solve_t 里的说明。
+#
+# 🔴 RATIO_WEAK 为什么从 1e-3 改成 0.3（2026-11-10 晚，仿真 + 实机双向验证）：
+#   ratio = σ_min/σ_2nd 里，σ_min 在**有噪声的实机数据上永远不是 0**——它的大小
+#   就等于噪声本身。所以 1e-3 实际测的不是"激励够不够"，而是"噪声小不小"。
+#   用真实 FK + 12 组姿态（J1 ±10°/J4 俯仰 18°）加 0.2° 舵机噪声做正演，
+#   σ_min/σ_2nd = 2e-2，但解出来的 |t| 误差只有 3 mm —— 好解会被 1e-3 判成激励不足。
+#   而真正单轴退化的合成数据 ratio = 0.73。两者相差一个数量级以上，取 0.3 正好分开：
+#     ratio < 0.3  → 最弱那一轴的激励至少是次弱轴的 1/3，解可用
+#     ratio ≥ 0.3  → 最弱轴几乎没被激励，t_X 在那个方向上不可信
+RATIO_WEAK = 0.3        # 奇异值最小/次小超过它 ⇒ 某个旋转方向几乎没被激励
+# 转轴张成度门限：σ_min/σ_max of [R_A−I]。0 表示所有姿态绕同一根轴转（完全退化）。
+# 取值依据（2026-11-10 用真实 FK 正演 + 独立噪声反解，见 selftest 第 6 组）：
+#   两轴姿态（J1 ±10° × J4 俯仰 18°）      axis_cond ≈ 0.49~0.70，且几乎不随噪声变化
+#   只动 J1 或只动 J4                       axis_cond = 0.02（0.3°噪声）~0.19（2°噪声）
+# 取 0.25：比"好姿态"低 2 倍以上，比"退化姿态"高一个数量级。
+AXIS_COND_MIN = 0.25
 RESID_HARD = 0.02       # 残差 > 2cm：不可能是数值噪声，样本之间真的矛盾（无解）
-RESID_SOFT = 1e-3       # 零空间一维时的容忍上限（1mm），超过说明拟合不上
+# 零空间一维（激励足够）时的残差上限。
+# 概念（大白话）：合成数据能做到 1e-15，但实机永远做不到——开环舵机的角度映射误差、
+# 连杆长度拿尺子量的误差、相机内参误差，任何一项都在毫米级。
+# 之前这里写 1mm，那是"数值噪声"的门限，不是"硬件"的门限：第一份干净的实机数据
+# 就会被误判成"无解"，然后让人去查根本不存在的硬件故障。
+# 1cm 是"这台臂上还能拿去抓东西"的边界；超过 1cm 说明模型或姿态有 1cm 级偏差。
+RESID_SOFT = 0.01
 T_NORM_SANE_M = 0.25    # 相机离末端原点的物理上限 25 cm，超过即不可信
+T_NORM_MIN_M = 0.02     # 下限 2 cm：相机不可能和夹爪尖重合，小于它基本是解跑飞了
 
 STATUS_OK = "OK"
 STATUS_WEAK = "WEAK_EXCITATION"
@@ -323,37 +346,50 @@ def classify_handeye_solution(diag, t_m):
 
     判定顺序（不能交换，否则单轴退化会被误判成无解）：
       ① 残差 > 2cm        → 无解（量级差太远，只能是数据矛盾）
-      ② 否则 ratio > 1e-3 → 激励不足
-      ③ 否则残差 > 1mm    → 无解（零空间唯一却拟合不上，也是矛盾）
+      ② 否则转轴张成度 < 0.02，或 ratio > 0.3 → 激励不足
+      ③ 否则残差 > 1cm    → 无解（零空间唯一却拟合不上，也是矛盾）
       ④ 其余              → 正常
 
     返回 (status, valid, reasons)；valid=True 才允许写进 handeye_X.json。
     """
     reasons = []
     ratio = float(diag.get("ratio", 0.0))
+    axis_cond = float(diag.get("axis_cond", 1.0))
     resid = float(diag.get("resid", 0.0))
     t_norm = float(np.linalg.norm(np.asarray(t_m, dtype=float).reshape(3)))
 
     if resid > RESID_HARD:
         status = STATUS_NO_SOLUTION
-        reasons.append("平移方程残差 %.3e m 超过 %.0f cm 上限（方程无精确解）"
+        reasons.append("平移方程残差 RMS %.3e m 超过 %.0f cm 上限（方程无精确解）"
                        % (resid, RESID_HARD * 100.0))
+    elif axis_cond < AXIS_COND_MIN:
+        status = STATUS_WEAK
+        reasons.append("转轴张成度 %.3f 低于 %.2f（所有姿态几乎绕同一根轴转，"
+                       "该轴方向上的 t_X 与 R_X 都不可定）" % (axis_cond, AXIS_COND_MIN))
     elif ratio > RATIO_WEAK:
         status = STATUS_WEAK
-        reasons.append("奇异值最小/次小 = %.2e 大于阈值 %.1e（零空间不止一维，解不唯一）"
+        reasons.append("奇异值最小/次小 = %.2e 大于阈值 %.1f（某个旋转方向几乎没被激励，解不唯一）"
                        % (ratio, RATIO_WEAK))
     elif resid > RESID_SOFT:
         status = STATUS_NO_SOLUTION
-        reasons.append("零空间虽为一维，但平移残差 %.3e m 超过 %.0e m（数据自相矛盾）"
+        reasons.append("零空间虽为一维，但平移残差 RMS %.3e m 超过 %.0e m（数据自相矛盾）"
                        % (resid, RESID_SOFT))
     else:
         status = STATUS_OK
 
     # 第二判据：物理合理性。数学上能解，也不代表这个 X 装得出来。
     # 相机装在 J4 轴上，离末端原点最多十几厘米；25cm 那种一定是算歪了。
+    # 下限同理：镜头不可能和夹爪尖重合，|t|<2cm 说明解跑飞了。
     if t_norm > T_NORM_SANE_M:
         reasons.append("平移模长 %.1f cm 超过物理上限 %.0f cm（相机不可能离末端这么远）"
                        % (t_norm * 100.0, T_NORM_SANE_M * 100.0))
+        if status == STATUS_OK:
+            status = STATUS_NO_SOLUTION
+    elif t_norm < T_NORM_MIN_M:
+        reasons.append("平移模长 %.1f cm 小于物理下限 %.0f cm（相机不可能贴在夹爪尖上）"
+                       % (t_norm * 100.0, T_NORM_MIN_M * 100.0))
+        if status == STATUS_OK:
+            status = STATUS_NO_SOLUTION
 
     valid = (status == STATUS_OK) and (len(reasons) == 0)
     return status, valid, reasons
@@ -422,15 +458,39 @@ def solve_handeye_axxb(R_g2b, t_g2b, R_t2c, t_t2c, verbose=True, diag=None):
         diag["svals_2nd"] = float(svals[-2])
         diag["ratio"] = (float(svals[-1]) / float(svals[-2])) if svals[-2] > 0 else 0.0
 
+    # ---- 第二判据：转轴张成的维数（真正管住"激励够不够"的那个数）----
+    # 概念（大白话）：每个 (R_A − I) 都"看不见"自己那根转轴——绕轴转不改变轴本身。
+    #   把所有姿态的 (R_A − I) 摞在一起，如果最小奇异值≈0，说明所有姿态都绕同一根轴转，
+    #   那 t_X 沿这根轴的分量、以及 R_X 绕这根轴的转角，都是任意的 —— 解不唯一。
+    #   只要有两根不平行的转轴，这个最小奇异值就明显大于 0。
+    # 规范定义：rank([R_A−I]) = 3 − dim(∩ ker(R_A−I)) = 3 − dim(公共转轴)。
+    #   所有转轴共线 ⇒ 秩 2，σ_min = 0；转轴张成 2 维以上 ⇒ 秩 3，σ_min > 0。
+    # 为什么不用上面那个 ratio：单轴退化时 9x9 的零空间仍然只有一维（解族是一条曲线，
+    #   每个点上的切向就是那个零空间向量），ratio 依旧是 1e-17，完全看不出退化。
+    A_stack = np.vstack([R_A - np.eye(3) for R_A, _, _ in motion_list])
+    s_ax = np.linalg.svd(A_stack, compute_uv=False)
+    axis_cond = float(s_ax[-1] / s_ax[0]) if s_ax[0] > 0 else 0.0
+    if diag is not None:
+        diag["axis_svals"] = [float(x) for x in s_ax]
+        diag["axis_cond"] = axis_cond
+
     if verbose:
         print("  AX=XB 姿态对 %d 组；奇异值最小/次小 = %.3e / %.3e（比值 %.2e）"
               % (len(K_rows), svals[-1], svals[-2],
                  (svals[-1] / svals[-2]) if svals[-2] > 0 else 0.0))
-        print("  比值判据：<1e-3 说明零空间恰好一维（有唯一解）；"
-              "≥1e-3 说明零空间不止一维或无解，末尾会给出三分类结论")
+        print("  比值判据：<%.1f 说明各个旋转方向都被激励到了（解唯一可信）；"
+              "≥%.1f 说明某个方向几乎没转，末尾会判激励不足" % (RATIO_WEAK, RATIO_WEAK))
+        print("  转轴判据：σ([R_A−I]) = %.3e / %.3e / %.3e（最小/最大 %.2e，需 ≥ %.2f）"
+              % (s_ax[0], s_ax[1], s_ax[2], axis_cond, AXIS_COND_MIN))
 
     def _solve_t(R):
-        """给定 R_X，用 (R_A − I)·t_X = R_X·t_B − t_A 最小二乘解 t_X。"""
+        """给定 R_X，用 (R_A − I)·t_X = R_X·t_B − t_A 最小二乘解 t_X。
+
+        残差取 **每行 RMS**（总范数 ÷ √行数），不是总范数：
+        总范数会随样本数按 √n 增长，12 组数据天然比 3 组"残差大"，
+        拿它跟固定门限比就是自欺欺人。RMS 才是"平均每条方程差几毫米"，
+        与样本数无关，可以直接跟 1cm / 2cm 的物理门限比。
+        """
         rows, rhs = [], []
         for R_A, t_A, t_B in motion_list:
             rows.append(R_A - np.eye(3))
@@ -438,7 +498,31 @@ def solve_handeye_axxb(R_g2b, t_g2b, R_t2c, t_t2c, verbose=True, diag=None):
         A_stack = np.vstack(rows)
         b_stack = np.concatenate(rhs)
         t, _, _, _ = np.linalg.lstsq(A_stack, b_stack, rcond=None)
-        return t, float(np.linalg.norm(A_stack @ t - b_stack))
+        rms = float(np.linalg.norm(A_stack @ t - b_stack)) / math.sqrt(max(1, b_stack.size))
+        return t, rms
+
+    def _solve_t_scaled(R):
+        """给定 R_X，联合解 (t_X, s)，s 是"棋盘格真实边长 / 我填的 --square"。
+
+        概念（大白话）：棋盘格格子多大是我拿尺子量的，量错 20% 很正常。
+        量错不会让方程无解，只会让相机侧那串平移整体放大同样倍数——
+        那就把这个倍数也当成一个未知数，和数据一起解出来。
+        规范定义：
+          (R_A − I)·t_X = s·(R_X·t_B) − t_A
+          ⇒ [ (R_A − I) , −R_X·t_B ] · [t_X; s] = −t_A
+        3n 行 4 列线性最小二乘；s 可辨识的前提是姿态有旋转多样性。
+        """
+        rows, rhs = [], []
+        for R_A, t_A, t_B in motion_list:
+            rows.append(np.hstack([R_A - np.eye(3), -(R @ t_B).reshape(3, 1)]))
+            rhs.append(-t_A)
+        A_stack = np.vstack(rows)
+        b_stack = np.concatenate(rhs)
+        sol, _, _, _ = np.linalg.lstsq(A_stack, b_stack, rcond=None)
+        t = sol[:3]
+        s = float(sol[3])
+        rms = float(np.linalg.norm(A_stack @ sol - b_stack)) / math.sqrt(max(1, b_stack.size))
+        return t, s, rms
 
     # SVD 零空间向量的符号是任意的（v 和 -v 都满足齐次旋转方程）。
     # 用"平移方程残差"挑符号：真解残差小，取反的解残差大。
@@ -450,10 +534,33 @@ def solve_handeye_axxb(R_g2b, t_g2b, R_t2c, t_t2c, verbose=True, diag=None):
         t, resid = _solve_t(R)
         candidates.append((resid, R, t))
     resid, R_best, t_best = min(candidates, key=lambda c: c[0])
+    resid_raw = resid
+    s_scale = 1.0
+
+    # ---- 尺度自校正：把"棋盘格边长量错了"当成一个未知量解出来 -------------
+    # 为什么需要这一步（2026-11-10 实机踩的）：`--square` 是我用尺子在屏幕上量的，
+    # 差 20%~30% 一点都不稀奇。但尺度错了不会报"无解"，只会让残差变成几厘米、
+    # 被三分类判成 NO_SOLUTION —— 然后人就跑去查根本不存在的硬件故障。
+    # 加了这个之后，solve 自己会打印"数据隐含的方格边长"，把尺子误差和真故障分开。
+    t_s, s_try, _ = _solve_t_scaled(R_best)
+    if 0.25 <= s_try <= 4.0:
+        s_scale = s_try
+        if abs(s_scale - 1.0) > 1e-12:
+            # 等价于"把相机侧平移换算成真实尺度"，然后按新尺度重解 t_X
+            for k, (R_A, t_A, t_B) in enumerate(motion_list):
+                motion_list[k] = (R_A, t_A, t_B * s_scale)
+            t_best, resid = _solve_t(R_best)
+        else:
+            t_best = t_s
+    if verbose:
+        print("  尺度自校正：s = %.4f（相机侧平移整体 × %.4f）；残差 RMS %.3e → %.3e m"
+              % (s_scale, s_scale, resid_raw, resid))
     if diag is not None:
         diag["resid"] = float(resid)
+        diag["resid_before_scale"] = float(resid_raw)
+        diag["scale"] = float(s_scale)
     if verbose:
-        print("  选定候选解：平移方程残差 = %.3e m"
+        print("  选定候选解：平移方程残差 RMS = %.3e m"
               "（>%.0f cm 必定无解；>%.0e m 且零空间唯一也是数据矛盾）"
               % (resid, RESID_HARD * 100.0, RESID_SOFT))
         if diag is not None:
@@ -619,6 +726,28 @@ def cmd_selftest(args=None):
               % (rc5, got.get("status"), got.get("valid"),
                  not os.path.isfile(op), "✅" if good5 else "❌"))
 
+    # --- 6) 三分类的"激励不足"分支：所有姿态只绕同一根轴转 ---
+    # 为什么单靠 ratio 抓不住这种数据：解族是一条曲线时，9x9 矩阵的零空间在每个
+    # 解点上都只有一维，ratio 依旧可能是 1e-17。必须看 [R_A − I] 的秩。
+    # 这条自检锁住 AXIS_COND_MIN 真的能把退化数据拦住——否则一个 45cm 的垃圾 X
+    # 会被判成 OK 然后悄悄写进 handeye_X.json。
+    print("自检 6：单轴退化样本必须判 WEAK_EXCITATION")
+    X6 = _pose_from_rt(np.eye(3), np.array([-0.114, 0.0, 0.0]))
+    B6 = _pose_from_rt(np.eye(3), np.array([0.0, 0.30, 0.0]))
+    Rg6, tg6, Rt6, tt6 = [], [], [], []
+    for a in (-10.0, -5.0, 0.0, 5.0, 10.0):
+        T6 = _pose_from_rt(_rz(math.radians(a))[:3, :3], np.array([0.0, 0.0, 0.20]))
+        Bc6 = _inv_pose(X6) @ _inv_pose(T6) @ B6          # 只有偏航，没有俯仰/滚转
+        Rg6.append(T6[:3, :3]); tg6.append(T6[:3, 3])
+        Rt6.append(Bc6[:3, :3]); tt6.append(Bc6[:3, 3])
+    diag6 = {}
+    R6, t6 = solve_handeye_axxb(Rg6, tg6, Rt6, tt6, verbose=False, diag=diag6)
+    st6, valid6, _ = classify_handeye_solution(diag6, t6.reshape(3))
+    good6 = (st6 == STATUS_WEAK and not valid6)
+    ok = ok and good6
+    print("  axis_cond=%.2e（<%.2f 即退化）  status=%s  valid=%s  %s"
+          % (diag6.get("axis_cond", 1.0), AXIS_COND_MIN, st6, valid6, "✅" if good6 else "❌"))
+
     print("自检", "通过 ✅" if ok else "失败 ❌")
     return 0 if ok else 1
 
@@ -654,7 +783,8 @@ def _reconcile_square(args, intr_doc):
                   % (args.square, recorded))
             print("  两者相差 %.1f%%，会让手眼平移 t_X 同比失真（旋转 R_X 不受影响）。"
                   % (abs(args.square - recorded) / recorded * 100.0))
-            print("  若非有意为之，请改回 %.4f 或重做内参标定。" % recorded)
+            print("  可以忽略：内参矩阵 K 与尺度无关，且 solve 会自校正尺度（打印 s 与隐含方格边长）。")
+            print("  想彻底消掉这条警告：把 camera_intrinsics.json 里的 square_m 改成实测值。")
     return args.square
 
 
@@ -929,11 +1059,19 @@ def cmd_solve(args):
     euler = _rot_to_euler_deg(R_c2g)
 
     status, valid, reasons = classify_handeye_solution(diag, t_c2g.reshape(3))
+    # 数据隐含的方格边长 = 采集时填的 --square × 自校正系数 s。
+    # 它比"我拿尺子量了多少"可信：这是从 12 组姿态互相约束里反推出来的。
+    square_used = data.get("square_m")
+    s_scale = float(diag.get("scale", 1.0) or 1.0)
+    square_implied = (float(square_used) * s_scale) if square_used else None
     out = {
         "X_matrix": X.tolist(),
         "t_cam2gripper_cm": t_cm,
         "rpy_cam2gripper_deg": euler,
         "samples": len(samples),
+        "square_used_m": square_used,
+        "square_implied_m": square_implied,
+        "scale": s_scale,
         # 下面四项是 2026-11-10 新增的"结果自证"字段：读文件的人不用回头翻终端，
         # 就知道这个 X 是怎么判出来的、为什么被判无效。
         "valid": bool(valid),
@@ -942,7 +1080,9 @@ def cmd_solve(args):
             "svals_min": diag.get("svals_min"),
             "svals_2nd": diag.get("svals_2nd"),
             "svals_ratio": diag.get("ratio"),
+            "axis_cond": diag.get("axis_cond"),
             "translation_residual_m": diag.get("resid"),
+            "translation_residual_before_scale_m": diag.get("resid_before_scale"),
             "pairs": diag.get("pairs"),
             "t_norm_cm": float(np.linalg.norm(t_c2g.reshape(3)) * 100.0),
         },
@@ -956,9 +1096,21 @@ def cmd_solve(args):
           % (t_cm[0], t_cm[1], t_cm[2], out["diagnostics"]["t_norm_cm"]))
     print("  欧拉角 rpy = [%.1f, %.1f, %.1f] 度（roll,pitch,yaw，相机系相对末端系）"
           % tuple(euler))
+    if square_implied is not None:
+        print("  尺度自校正：s = %.4f ⇒ 数据隐含方格边长 %.4f m（采集时填 %.4f m）"
+              % (s_scale, square_implied, float(square_used)))
+        if not valid:
+            print("     （解无效时这个 s 也是在拟合噪声，别拿它去改 --square）")
+        elif abs(s_scale - 1.0) > 0.05:
+            print("     ⚠ 两者差 %.0f%%：说明尺子量偏了，t 已按隐含值换算；"
+                  "下次 collect 直接写 --square %.4f 即可"
+                  % (abs(s_scale - 1.0) * 100.0, square_implied))
     print("  三分类 = %s" % _STATUS_NOTE[status])
 
     if valid:
+        if out["diagnostics"]["translation_residual_m"] > 3e-3:
+            print("   ⚠ 残差 %.1f mm：X 的位置误差与它同量级，抓取前建议先用视觉复核一次"
+                  % (out["diagnostics"]["translation_residual_m"] * 1000.0))
         print("手眼标定完成，X(相机→末端) 已保存 %s" % path)
         print("用法：抓取时 target_in_cam --X--> target_in_gripper，再经正/逆解算关节角。")
         return 0
