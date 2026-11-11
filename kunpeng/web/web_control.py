@@ -255,6 +255,11 @@ class SerialHost:
         # write() 也不报错，数据全进废弃的 fd。没有这个标记时，上层只能看到
         # "命令发出去了、响应是空串"，会误判成 STM32 没应答（2026-11-10 实测踩到）。
         self._dead_reason = ""
+        # 打开时记下「这个设备节点是谁」（inode + 创建时间）。为什么需要：CH341 被 USB
+        # 复位/重新枚举后 /dev/ttyUSB0 会被销毁重建，而旧 fd 依旧 is_open=True、write()
+        # 也不报错 —— 只有比对节点身份，才能识破「名字还叫 ttyUSB0、其实已经是另一个
+        # 设备」这种假活（2026-11-11 实测：命令全进黑洞，接口却回 ok:true / resp:""）。
+        self._dev_id = self._read_dev_id()
         self._reader = threading.Thread(target=self._rx_loop, daemon=True)
         self._reader.start()
         time.sleep(0.3)
@@ -264,9 +269,35 @@ class SerialHost:
         except Exception:
             pass
 
+    def _read_dev_id(self):
+        """取设备节点的身份 (st_dev, st_ino, st_ctime)。
+
+        不是设备文件 / 平台不支持（如 Windows 的 COM7）时返回 None，
+        表示「本平台不做这项检测」，调用方按 False 处理。
+        """
+        try:
+            st = os.stat(self.port)
+            return (st.st_dev, st.st_ino, int(st.st_ctime))
+        except OSError:
+            return None
+
+    def port_replaced(self):
+        """True = 现在的设备节点已经不是打开时那一个（被重枚举，或被拔掉）。
+
+        为什么要主动比对：USB 串口掉线后 read() 不抛异常，只会一直返回 b''（EOF 语义），
+        所以「读线程还活着」完全不代表「链路还活着」—— 必须看节点本身还是不是原来那个。
+        """
+        if self._dev_id is None:
+            return False          # 平台不支持检测（Windows COMx），不做判断
+        now = self._read_dev_id()
+        if now is None:
+            return True           # 节点消失 = 设备已被拔掉
+        return now != self._dev_id
+
     def _rx_loop(self):
         """后台不断收字节，按 \\r\\n 组装成行放入 rxq。"""
         line = bytearray()
+        last_check = time.time()   # 节点身份巡检时间戳（循环里每秒体检一次）
         while self._reader_alive:
             try:
                 ch = self.ser.read(1)
@@ -276,6 +307,14 @@ class SerialHost:
                 if self._reader_alive:
                     self._dead_reason = "串口读取线程异常退出（%s）" % e
                 break
+            # 每秒体检一次「节点还是不是打开时那一个」：USB 复位/拔插后 read() 只会永远
+            # 返回 b''（EOF 语义），不抛异常，光靠上面的 except 抓不到，链路会一直"假活"。
+            if time.time() - last_check >= 1.0:
+                last_check = time.time()
+                if self.port_replaced():
+                    self._dead_reason = ("串口设备节点已重建或消失（CH341 被 USB 复位/拔插？），"
+                                         "底层链路已失效")
+                    break
             if not ch:
                 continue
             if ch in (b"\r", b"\n"):
@@ -310,6 +349,12 @@ class SerialHost:
             raise RuntimeError("%s；请重新 POST /api/open 连串口" % self._dead_reason)
         if not self.ser or not self.ser.is_open:
             raise RuntimeError("串口已断开")
+        # 写之前再确认一次节点身份：读线程可能还没来得及体检（最多晚 1 秒），
+        # 这一句能保证「绝不把命令写进已经废弃的 fd」。
+        if self.port_replaced():
+            self._dead_reason = ("串口设备节点已重建或消失（CH341 被 USB 复位/拔插？），"
+                                 "底层链路已失效")
+            raise RuntimeError("%s；请重新 POST /api/open 连串口" % self._dead_reason)
         self.ser.write(make_frame(payload))
 
     def send(self, payload, timeout=0.6):
@@ -328,7 +373,11 @@ class SerialHost:
                 if self.rxq:
                     return self.rxq.pop(0)
             time.sleep(0.005)
-        return ""
+        # 超时不再返回空串：空串会被上层当成"STM32 没说话"而继续走成功分支，
+        # 这正是 2026-11-11「ok:true + resp:''」假成功的来源。分不清就干脆报错。
+        raise RuntimeError("应答超时：%d ms 内未收到任何字节（串口可能已掉线，或 STM32 未运行；"
+                           "先 POST /api/open 重连，仍空则查 12V/5V 供电与 CH341 杜邦线）"
+                           % int(timeout * 1000))
 
     def fire(self, payload):
         """只写不等应答：供 MOVE 拖动用，绝不阻塞。"""
@@ -412,7 +461,9 @@ class TcpHost:
                 if self.rxq:
                     return self.rxq.pop(0)
             time.sleep(0.005)
-        return ""
+        # 与 SerialHost.send 同一约定：超时抛异常，绝不返回空串（空串 = 假成功）。
+        raise RuntimeError("应答超时：%d ms 内未收到任何字节（设备可能已断开；"
+                           "WiFi/ESP 模式请检查 ESP 链路）" % int(timeout * 1000))
 
     def fire(self, payload):
         """只写不等应答：供 MOVE 拖动用，绝不阻塞。"""
@@ -517,7 +568,9 @@ class TcpServerHost:
                 if self.rxq:
                     return self.rxq.pop(0)
             time.sleep(0.005)
-        return ""
+        # 与 SerialHost.send 同一约定：超时抛异常，绝不返回空串（空串 = 假成功）。
+        raise RuntimeError("应答超时：%d ms 内未收到任何字节（设备可能已断开；"
+                           "WiFi/ESP 模式请检查 ESP 链路）" % int(timeout * 1000))
 
     def fire(self, payload):
         with self.wlock:
@@ -988,10 +1041,12 @@ function endDrag(i,el){
 }
 
 // 读实际脉宽回填界面（HOME/MOVE 后滑杆位置与实际一致）
+let lastPollErr='';   // 上次轮询失败的原因：只在「原因变了」时写日志，避免 1 秒一条刷屏
 async function syncPulses(){
   if(!connected) return;
   const r=await post('/api/state');
   if(r&&r.ok&&Array.isArray(r.pulses)&&r.pulses.length===6){
+    lastPollErr='';
     for(let i=0;i<6;i++){
       const s=document.getElementById('s'+i);
       if(!s) continue;
@@ -1001,6 +1056,10 @@ async function syncPulses(){
       s.value=String(r.pulses[i]);
       tag('v'+i, r.pulses[i]);
     }
+  } else if(r&&r.ok===false){
+    // 链路坏了必须让人看见：以前这里静默失败，界面 LED 还绿着、滑杆一动不动，
+    // 完全看不出是通信断了还是自己没点动。
+    if(r.error!==lastPollErr){ lastPollErr=r.error; log('✗ 状态轮询失败：'+r.error); }
   }
 }
 // 每 1s 轮询实际位置，保证界面始终跟真机一致
@@ -1524,11 +1583,23 @@ def api_open():
     port = data.get("port") or _HOST_STATE["port"]
     try:
         _HOST = SerialHost(port)
-        _HOST_STATE.update(connected=True, port=port, error="")
-        return jsonify(ok=True, port=port)
     except Exception as e:
         _HOST_STATE.update(connected=False, error=str(e))
         return jsonify(ok=False, error=str(e))
+
+    # 端口能打开 ≠ 链路可用：再 PING 一次，把「串口开了、但 STM32 一句话不说」
+    # 当场暴露出来。为什么仍回 ok=True：端口确实开了，报 ok:false 会被误读成
+    # 「要再连一次」，而真正该查的是供电与接线 —— 所以用 warning 字段说清楚。
+    ping = ""
+    warning = ""
+    try:
+        ping = _HOST.cmd("PING")
+    except Exception as e:
+        warning = str(e)
+    _HOST_STATE.update(connected=True, port=port, error=warning)
+    if warning:
+        return jsonify(ok=True, port=port, ping=ping, warning=warning)
+    return jsonify(ok=True, port=port, ping=ping)
 
 
 @app.route("/api/close", methods=["POST"])
@@ -1574,12 +1645,14 @@ def api_state():
     except Exception as e:
         return jsonify(ok=False, error=str(e))
     parts = resp.split(",")
-    pulses = []
+    # 必须显式校验长度：parts 不足 9 段时 Python 切片的 out-of-range 不会抛异常，
+    # 只会悄悄返回少于 6 路脉宽，页面拿到长度不对的数组就等于白问一次。
+    if len(parts) < 9:
+        return jsonify(ok=False, error="STATE 响应异常：%r（应形如 OK,S,C,p0..p5）" % resp)
     try:
-        for tok in parts[3:9]:
-            pulses.append(int(tok))
-    except (ValueError, IndexError):
-        return jsonify(ok=False, error="STATE 响应异常: %r" % resp)
+        pulses = [int(tok) for tok in parts[3:9]]
+    except ValueError:
+        return jsonify(ok=False, error="STATE 响应异常：%r（脉宽不是整数）" % resp)
     return jsonify(ok=True, pulses=pulses)
 
 
