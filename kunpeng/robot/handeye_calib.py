@@ -177,8 +177,17 @@ def fk_gripper2base(angles_deg):
         x += ec * math.cos(psi)
         y += ec * math.sin(psi)
 
-    # 姿态：基座偏航(Rz) + 腕俯仰(Ry)，工具指向即腕绝对角方向
-    R = (_rz(t1) @ _ry(t4))[:3, :3]
+    # 姿态：基座偏航(Rz) + 腕俯仰(Ry)，工具指向即腕绝对角方向。
+    #
+    # 🔴 这里必须是 -t4，不能是 +t4（11-10 实机残差 16.7mm 的根因）：
+    #   位置公式里 L3 的方向是 (cos t4, +sin t4)——θ4 变大时工具往前上方抬；
+    #   而 Ry(a) 把 X 轴映射成 (cos a, −sin a)，符号天生相反。
+    #   要想让"末端 X 轴"与 L3 连杆指向一致，a 只能取 −t4。
+    #   写成 +t4 的后果：末端姿态随 θ4 的反向转（镜像），
+    #   AX=XB 的旋转方程 R_A·R_X = R_X·R_B 永远对不上，
+    #   表现为"姿态全对、平移却差到 1.7cm"，且 P 在基座系里随 J4 移动 10cm。
+    #   概念（大白话）：位置说"往下俯 49°"，姿态却说"往上仰 49°"，两者自相矛盾。
+    R = (_rz(t1) @ _ry(-t4))[:3, :3]
     T = np.eye(4)
     T[:3, :3] = R
     T[0, 3], T[1, 3], T[2, 3] = x, y, z
@@ -639,6 +648,25 @@ def cmd_selftest(args=None):
         ok = ok and err < 0.05
         print("  角度%-22s -> 本FK(%.2f,%.2f,%.2f) ik(%.2f,%.2f,%.2f) 误差=%.3fcm %s"
               % (str(ang[:4]), fx, fy, fz, efx, efy, efz, err, "" if err < 0.05 else " ✗"))
+
+    # --- 1b) 姿态一致性：末端 X 轴必须与 L3 连杆指向重合 ---
+    # 为什么加这一组（11-10 实机踩的）：自检 1 只比位置，位置公式和姿态公式可以
+    # 各自"看着都对"却互相镜像。手眼标定吃的是姿态，镜像后无论怎么采都解不干净。
+    # L3 指向 = (cos t4·cos t1, cos t4·sin t1, sin t4)，与位置公式同源；
+    # 判据：末端 R 的第一列（即末端 X 轴）与它点积恒为 +1。
+    print("自检 1b：末端姿态 X 轴 vs L3 连杆指向（必须重合，点积=+1）")
+    for a1, a4 in ((0, -60), (0, 0), (0, 32), (0, 41), (0, 50), (30, 41), (-45, 20)):
+        ang = [float(a1), 0.0, -90.0, float(a4), 0.0, 0.0]
+        T = fk_gripper2base(ang)
+        t1 = math.radians(ang[0] + 90.0)
+        t4 = math.radians(ang[3] - 90.0)
+        d = np.array([math.cos(t4) * math.cos(t1),
+                      math.cos(t4) * math.sin(t1),
+                      math.sin(t4)])
+        dot = float(np.dot(T[:3, 0], d))
+        ok = ok and dot > 0.999
+        print("  θ1=%+5.0f θ4=%+6.1f°  X轴·L3指向 = %+.4f %s"
+              % (a1, a4, dot, "✅" if dot > 0.999 else "❌ 姿态镜像"))
 
     # --- 2) 合成数据还原 X：10 组、标准姿态 ---
     print("自检 2：纯 numpy AX=XB 合成数据还原（10 组，无噪声）")

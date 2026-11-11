@@ -285,11 +285,15 @@ class Kinematics:
             x += ec * math.cos(psi)
             y += ec * math.sin(psi)
 
-        # 姿态：先绕基座 Z 偏航，再绕腕 Y 俯仰（与 handeye_calib 的 _rz(t1)@_ry(t4) 一致）
+        # 姿态：先绕基座 Z 偏航，再绕腕 Y 俯仰。
+        # 🔴 俯仰角取 -t4（11-10 修）：位置公式里 L3 方向是 (cos t4, +sin t4)，
+        #   而 Ry(a)·(1,0,0) = (cos a, −sin a)，符号天生相反；要让末端 X 轴与
+        #   L3 指向一致只能取 -t4。写成 +t4 会让末端姿态随 θ4 反向转（镜像），
+        #   手眼标定解不干净（实机残差 16.7mm）。与 handeye_calib.fk_gripper2base 同步。
         c1, s1 = math.cos(t1), math.sin(t1)
         c4, s4 = math.cos(t4), math.sin(t4)
         Rz = np.array([[c1, -s1, 0], [s1, c1, 0], [0, 0, 1]], dtype=float)
-        Ry = np.array([[c4, 0, s4], [0, 1, 0], [-s4, 0, c4]], dtype=float)
+        Ry = np.array([[c4, 0, -s4], [0, 1, 0], [s4, 0, c4]], dtype=float)
         return pose_from_rt(Rz @ Ry, [x, y, z])
 
     def fk_pulses(self, pulses):
