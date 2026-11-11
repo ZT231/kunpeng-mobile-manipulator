@@ -86,7 +86,7 @@
 | 鲲鹏 YOLOv8 识别 + MJPEG 推流 | ✅ 板上实测约 26.6 FPS（B 抽帧推理 + C V4L2/MJPG 采集优化后） |
 | 鲲鹏网页控制台 + 点选抓取 | ✅ 5000 单页：滑杆控 6 路、点选→IK→`JOINT`→`STATE`、标定参数常驻面板 + 本地预设 |
 | `iot/` 板内可观测性闭环 | ✅ 真实串口遥测 → MQTT → EMQX → eKuiper → InfluxDB → Grafana，四容器板上跑通、Grafana 六路曲线已出；收口 `e6cd194`（🔴 不是云端 IoT / 不增抓取能力） |
-| 手眼标定（眼在手） | 🔶 `handeye_calib.py` 自检通过（FK 误差 0.000cm），**未相机实标、未接入点选链路** |
+| 手眼标定（眼在手，AX=XB） | ✅ **已实标**（12 组姿态）：`resid` 16.7mm→**1.60mm**、`axis_cond` 0.519、`|t|`=16.7cm≈L3、棋盘不动 P 极差 0.30/0.51/0.36cm。`s`=0.7549 已实测拆分（相机侧 9.5% + J1 map 伪折点 21%，🔶 已定位未修）。**A+ 眼在手点选链路代码已有（`--eye-in-hand`），🔶 未用实标 X 实机验证** |
 | 蓝牙 / WiFi / RFID 多通道、示教回放 | 🔶 旧项目源码已有，当前工程未重新实机复验（RC522 当前未接） |
 | `kunpeng/llm/` 意图解析 + 离线文本入口网关 | 🔶 `intent_parser.py` + `text_gateway.py`，44 项 unittest 全绿；**只打印不下发**、未接真串口 / 未接云端大模型 / 未接主链路；`$ASR` 帧是建议草案 |
 | ESP32-S3 语音 / ASR / WakeNet | 📋 P2；成品开发板 + 麦/功放/喇叭已可直接用，自画核心板仍待焊；WakeNet / ASR / 语音→动作序列**无代码、未上板、未接主链路** |
@@ -118,7 +118,10 @@ RoboticArm_Kunpeng/
 │   │   ├── arm_ik.py            逆/正运动学（ArmIK）
 │   │   ├── arm_params.json      舵机标定表
 │   │   ├── arm_host.py          串口发帧上位机（$JOINT/$MOVE/$STATE）
-│   │   └── handeye_calib.py     🔶 手眼标定（AX=XB）：自检通过，未实标、未接入点选链路
+│   │   ├── handeye_calib.py     ✅ 手眼标定（AX=XB）：已实标 resid 1.60mm；A+ 点选链路待实测
+│   │   ├── eye_check.py         🆕 眼在手点选自检：固定棋盘 + 换姿态，看算出的坐标重不重合
+│   │   ├── action_primitives.py 🆕 动作原语：pick/place/home，每步回读关节角确认到位（🔶 离线全绿，未真机跑）
+│   │   └── test_action_primitives.py 🆕 动作原语回归测试：假 Flask 模拟斜坡/拒收/卡死/未确认
 │   ├── web/                     ✅ web_control.py 网页遥控（Flask + 滑杆 + 点选抓取）
 │   └── docs/                    stage1_README.md 识别部署说明、A档执行计划
 ├── esp32/                       📋 ESP32-S3 端（语音入口，P2）：成品开发板已可直接用、软件未上板；口径见 esp32/README.md
@@ -147,18 +150,28 @@ pip3 install flask pyserial          # 板端已有 ultralytics / opencv / numpy
 # 网页遥控：手机/电脑浏览器打开 http://<板IP>:5000，滑杆控 6 路舵机
 python3 kunpeng/web/web_control.py /dev/ttyUSB0 --baud 115200 --host 0.0.0.0 --port 5000
 
+# 眼在手点选（A+ 方案）：用「内参 K + 实标手眼 X + 当前 STATE 脉宽」把像素反投影成 3D 点再逆解，
+# 换任何臂姿都能定位（A 方案 pixel_to_table 只对固定拍照姿态有效）
+python3 kunpeng/web/web_control.py /dev/serial/by-id/usb-1a86_USB_Serial-if00-port0 \
+        --host 0.0.0.0 --port 5000 --eye-in-hand
+
 # 常驻识别服务：HTTP :8080/detections
 python3 kunpeng/vision/detector_service.py --source 0 --imgsz 320 --port 8080
 ```
 
-### 3. 眼在手手眼标定（🔶 脚本自检通过，未相机实标、未接入点选链路；相机装到臂末端后再做）
+### 3. 眼在手标定（✅ 已实标：resid 1.60mm；A+ 点选链路待用实标 X 实机验证）
 ```bash
 python3 kunpeng/robot/handeye_calib.py selftest               # 自检正运动学，无需相机
-python3 kunpeng/robot/handeye_calib.py intrinsics --camera 0  # 标定相机内参
+python3 kunpeng/robot/handeye_calib.py intrinsics --camera 0  # 标定相机内参（640×480）
 python3 kunpeng/robot/handeye_calib.py collect --camera 0 --arm-serial /dev/ttyUSB0 \
-        --intrinsics camera_intrinsics.json --out samples.json
+        --intrinsics camera_intrinsics.json --square 0.0082 --out samples.json
 python3 kunpeng/robot/handeye_calib.py solve --samples samples.json --out handeye_X.json
 ```
+
+> 🔴 **改过正运动学就必须先用 `refk_samples.py` 重算样本**：`collect` 落盘的是**算好的 4×4 矩阵**，
+> `solve` 只读矩阵、不读 `pulses` ⇒ 直接重跑 `solve` 输出会**一字不变**（踩过：FK 姿态符号改完，`resid` 仍报 16.7mm）。
+> 正确顺序：`refk_samples.py samples.json --out samples_fkfix.json` → `solve --samples samples_fkfix.json`
+> （`refk` 幂等，会自检并打印「位置改动 0.0000cm」「X轴·L3 = +1.0000」）。
 
 > 旧「眼在外 + PC 上位机」版本（Homography 单应标定）已移除；其演示与测试方法保留在
 > `docs/完整功能演示流程.md`、`docs/视觉识别测试清单.md`（历史归档，命令不可直接照跑）。
