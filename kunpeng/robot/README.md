@@ -3,8 +3,10 @@
 > 状态（2026-11-11 17:00）：✅ **实标达成** —— `resid 1.60 mm`、`axis_cond 0.519`、
 > `|t| = 16.7 cm ≈ L3`、棋盘不动 P 极差 `0.30/0.51/0.36 cm`（修 FK 前是 4.65/10.52/5.06）。
 > 尺度 `s = 0.7549` 已拆成相机侧 9.5%（PnP 正常量级）+ 机器人侧 21%（J1 map 伪折点，已定位未修）。
-> 🔶 **A+ 点选链路**（`eye_check.py` 验）代码就绪、**未实机验证**；
-> 🆕 **动作原语层**（`action_primitives.py`）离线自检 8 组 + 假服务 4 用例全过，**未真机跑过**。
+> ✅ **A+ 点选链路**（`eye_check.py` 验）已实机：垂直 0.8mm、点选三档 0.42cm；
+> ✅ **动作原语层**（`action_primitives.py`）**11-16 实机跑通**：4 步 pick 空抓全到位；`--recipe` 示教回放 3 轮 **3/3** 抓起 3.8cm 瓶；
+> 🔶 **抓取流水线**（`pick_pipeline.py`）离线 9 用例全过、**上板 dry-run 全程走通**，但 `--yes` 真抓**未成功**（J6 走 1900 空夹 + `plan_move` 不扣重力补偿，见 §九）；
+> 🆕 **示教配方层**（`pick_recipes.json` + `--recipe`）**11-16 新增**：teach & playback，绕开 IK 缺补偿的问题。
 
 ## 文件分工
 
@@ -21,9 +23,15 @@
 | `eye_check.py` | 🆕 验 **A+ 点选链路**（`--eye-in-hand`）：找棋盘 → 取板心像素 → 打 `/api/ik/eye/solve` → 打印工作台坐标。**判据是「换姿态后坐标必须重合」**，这是唯一能戳破「算得出但算错」的物理不变量 |
 | `action_primitives.py` | 🆕 **动作原语层**：`pick` / `place` / `home`，每步发 JOINT 后**回读关节角确认到位**再走下一步；零第三方依赖，只调 Flask 的 `/api/cmd` 与 `/api/state` |
 | `test_action_primitives.py` | 🆕 动作原语层的回归测试：假 Flask 模拟斜坡 / 拒收 / 卡死 / 未确认四种脾气，**不需要真机也不动臂** |
+| `pick_pipeline.py` | 🆕 **抓取流水线（A 版本闭环）**：`/observe` → VLM 选编号 → bbox 底边两角反投影 → `/api/ik/eye/solve` → `pick`(+`place`)，五道闸门（占位标定 / 臂未停稳 / 框贴边 / 逆解越界 / 人手重叠），`--backend mock` 可在没有模型时演练 |
+| `test_pick_pipeline.py` | 🆕 流水线的端到端回归：起假 detector + 假 Flask，9 个用例，**每个拒绝用例都断言零条 JOINT** |
+| `pick_recipes.json` | 🆕 **示教配方库**：把实机上调好的 6 路脉宽存成「配方」，`--recipe <名字>` 一键回放；含夹爪开口标定（950=6.8cm / 1500≈3.8cm / 1900=空夹）与 J1 角脉宽换算（1°≈9.4µs） |
 | `arm_ik.py` | 逆解 + 正解 `forward()`；本模块用 `to_angles()` 把脉宽还原成物理角 |
 | `arm_host.py` | 旧版 `collect` 直连串口读 STATE 用；**本版 collect 不再 import 它**（板上留着无妨） |
 | `arm_params.json` | 脉宽↔角度物理标定表，**保留不动**；`handeye_geometry` 也读它，保证只有一份标定表 |
+| `voice_gateway.py` | 🆕 **鲲鹏侧语音入口网关（阶段 2 / B 项）**：TCP `:9000` 收 `$ASR,<文本>*<CK>` → 帧校验 → 急停快速通道 → `parse_intent` → **本地仲裁器白名单** → `/api/cmd` 下发；默认 **dry-run**，仅 `--apply` 真下发，只授权 `HOME / STOP / RESUME` 三个无参数命令字 |
+| `test_voice_gateway.py` | 🆕 网关回归考卷：XOR / 帧归一化 / 仲裁 / 急停 / dry-run / 下发失败容错 / 多线程锁，**38 项 unittest 全绿，不动臂不联网** |
+| `check_esp32_link.py` | 🆕 **ESP32 链路四层硬判据自动判定**（2026-11-15 宿舍无硬件时写）：喂串口 monitor / `/root/gw.log` / PC 侧 `nc` 输出三份文本，自动逐层打勾；只读日志、零第三方依赖、`--self-test` 5 组自证，**不抬档不动臂** |
 
 前 3 个必须放**同一目录**：`arm_params.json` 按 `__file__` 同目录加载，`collect` / `selftest` / `Kinematics` 都用 `sys.path.insert` 就地 import 同目录模块。
 
@@ -159,6 +167,55 @@
 > （正常斜坡 / 固件回 `ERR,1` / 某一路卡死 / 不加 `--yes`），四个用例都过才算完。
 > 「看着对」在这里没有意义 —— 第 3 步打印出来的 `✓ 到位` 曾经配着一个远没到位的 J6。
 
+### 八、抓取流水线（`pick_pipeline.py`，2026-11-11 新增，A 版本最小闭环）
+
+一句话到抓取的**中间件 + 总调度**，把已有四块拼成一条路：
+
+```
+detector /observe ──► VLM 只选编号 ──► bbox 底边两角 ──► /api/ik/eye/solve
+   (同帧图+bbox)        (vlm_decider)      (反投影到 z=0)      (像素→坐标+逆解)
+                                                                    │
+        action_primitives.pick / place ◄── 4(+4) 步 JOINT ◄──────────┘
+              (每步回读 /api/state 确认到位)
+```
+
+① **用了什么语法/技术**：`urllib.request.install_opener(ProxyHandler({}))` 强制直连；
+`dataclasses` 之外的 `Fatal` / `Rejected` **两级异常分类**（环境错 vs 这一刻不该动）；
+`localizer` / `http_json` 做成**可替换的函数对象**（自测注入假实现，不装 mock 库）；
+`argparse` 参数组；纯函数 `iou` / `bottom_corners` / `edge_guard` / `person_guard`；
+`math.hypot` 算两底角的 3D 跨度；返回码 0/1/10/11/12/13 各带明确语义。
+
+② **为什么这么设计**：
+- **VLM 只选编号、不出坐标**：VLM 的 grounding 误差 ±30~50 px，等于 2~4 cm；
+  YOLO 的 bbox 是像素级定位，几何模块负责把像素变成厘米。三者各干自己那一段，谁也不越界。
+- **取 bbox 底边两角、不取框中心**：单目只给一条射线，唯一的白捡约束是「物体在桌面上」。
+  底边 ≈ 接触线，两角 ≈ 底面轮廓左右切点，中点 = 底面中心；框中心在物体半腰的空中，
+  和 z=0 求交会带来 `tan(俯角)×高度` 的系统偏差。只取底边中点则会稳定偏近半个直径。
+- **每一步都做成显式闸门**：占位标定、臂还在动、框被画面裁掉、逆解越界（`clamped`）、
+  人手在旁边 —— 这五种情况都不会自己报错，只会"抓偏一点"，而抓偏没法用眼判断是哪一环。
+- **`--backend mock` 保留**：几何、闸门、动作序列能在没有模型时完整验一遍，
+  把「模型选得对不对」和「选对之后抓不抓得准」分开测。
+
+③ **不这么写会怎样**（四个真踩到的坑）：
+- **系统代理把本地请求吃了**：开发机开着 Clash，`HTTP_PROXY=127.0.0.1:7897`，
+  urllib 把「访问 127.0.0.1:5001」也交给代理 ⇒ `502 Bad Gateway`，
+  看起来像「Flask 没起」。必须 `install_opener(ProxyHandler({}))`，而且要**全局**装 ——
+  `action_primitives` / `vlm_decider` 内部也是 `urlopen`，只修一处等于没修。
+- **`action_primitives.BASE_URL` 是模块常量**：不加 `ap.BASE_URL = args.api`，
+  前面读状态/定位全成功，唯独发 JOINT 时连到 5000 端口去 ⇒ 现象是「最后一步突然连不上」。
+- **悬停点比抓取点更容易「够不到」**：腕在末端上方约 `L3=17 cm`，抬高末端 4 cm 等于抬高腕 4 cm，
+  `grab_z=2 + hover=4` 时腕高 `14.9 cm`，水平可达半径只剩 `sqrt(25.2² − 14.9²) ≈ 20.3 cm`。
+  远超这个数的目标会在**接近点**就抛 `ValueError`，而不是在抓取点。
+- **`STATE` 返回的是 `current_pulse`（斜坡当前值），不是目标值**（`arm_control.c` 的
+  `Arm_GetCurrent()`）。这既是好事（`wait_arrive` 能真的看到进度），也是陷阱：
+  **拍帧时臂还在斜坡上走，拿这组脉宽算 FK 就是错的**（相机位置和画面不在同一瞬间）。
+  `wait_still()` 连续两次读数一致才放行，就是为了堵这个洞。
+
+> 🔴 判据：`test_pick_pipeline.py` 起**两个假 HTTP 服务**（假 detector + 假 Flask），
+> 9 个用例覆盖「正常抓 / 带放置 / 人手重叠 / 贴边 / 逆解越界 / 占位标定 / 非 pick / 空场景 / dry-run」，
+> 每个拒绝用例都断言 **`/api/cmd` 收到 0 条命令**。
+> 拒绝执行却偷偷发了几条 JOINT，是这个文件最需要防的事故。
+
 ## 概念（大白话 + 规范定义）
 
 - **AX=XB**：相机装在臂末端、标定板固定在环境里，两次摆姿的等式相除消掉常量，得 `A·X = X·B`，解出相机相对末端的固定变换 X。
@@ -183,6 +240,60 @@
   规范定义：以名义几何参数构造的标定元数据替身，附 `placeholder:true` 标记，使下游可在无实测数据时完成接口联调，**不得用于精度评估**。
 
 ## 用法
+
+### 九、任务前提透明化 + 失败自证（`eye_check.py`，2026-11-14）
+
+① **用了什么语法/技术**：模块级常量元组 `_POSE_C` + `%` 拼出的可粘贴 curl 串 `_POSE_C_HINT`；
+`describe_pose()` 复用 `arm_ik.ArmIK.to_angles/forward` 做 FK；`_save_look()` 在检测失败时把
+`frame` 落盘成 `look.jpg`（给了 `--save` 就存成 `<名字>.look.jpg`）；`try/except` 让「arm_ik 不在」
+时只降级提示而不中断主流程。
+② **为什么这么设计**：踩过太多次「跑了半天不知道当前是什么姿态、棋盘该摆哪」——开场只打印
+6 个脉宽数字，人根本看不懂；一旦报「等 8 秒没找到棋盘格」，也分不清是棋盘在画面外还是屏幕没亮。
+所以：**任何结论前先自报前提**（当前爪尖位置 + 夹爪前倾 + plane-z + 实际脉宽），失败时再附上
+「C 姿态」的可粘贴命令和一张当时的画面，把排查从「猜」变成「看」。
+③ **不这么写会怎样**：同一块棋盘换个臂姿就得到 0.9cm 互差、失败又只给一句不疼不痒的提示，
+每次都从零手算「这姿态相机朝哪」；更糟的是把 FK 的**相对位姿**误当成真实半径读出（实测 C 姿态
+FK 给 1.8~2.4cm，真值 26cm）—— 所以输出标签特意写成「相对位姿」，并在 docstring 里写死「绝对半径不可信」。
+
+### 十、三条入场闸门：把「靠人记」改成「脚本强制」（`eye_check.py`，2026-11-14）
+
+① **用了什么语法/技术**：`argparse` 的 `action="store_true"` 开关 `--allow-any-pose`；
+`zip()` + `max()` 逐轴比脉宽（容差 ±3µs，给 PCA9685 量化留余量）；把 `args.plane_z` 从 `None`
+改成显式 `0.0` 后再恒写进 `payload`；启动命令加 `python3 -u`（unbuffered stdout）。
+② **为什么这么设计**：11-14 一天里连踩四个同类坑，全是「人忘了」而不是算法错 ——
+`--hover` 真下发后臂停新姿态，不回 C 就再跑必然「等 8 秒没找到棋盘」（栽 3 次）；
+连跑 7 次 y 极差 2.66cm；`--plane-z` 不给就吃服务端 `grab_height=2.0` ⇒ 水平偏 `0.87×2≈1.74cm`，
+而成功行还打印「--plane-z 0.0」误导；`nohup` 重定向后中文横幅卡在 stdout 缓冲区 ⇒ 误判启动失败。
+⇒ 三道闸门：**平面**（桌面默认 0，服务端默认无权参与）、**姿态**（非 C 姿态直接 `return 2`
+并附可粘贴回位 curl）、**收尾**（hover 成功后打印回位提示）。日志缓冲用 `-u` 在启动侧根治，不动源码。
+③ **不这么写会怎样**：这四条都**不会报错**，只会给出「看起来正常但差 1~3cm 的坐标」或
+「找不到棋盘」，是最难查的一类静默失效。以前靠 README 写「记得加 `--plane-z 0` / 记得回 C 姿态」，
+实测还是会漏；现在漏了脚本直接拒绝跑，并给出能粘贴的 curl，把排查从「事后自证」提前到「入场拦截」。
+> 唯一后门 `--allow-any-pose`（换姿互差实验要用）：默认关闭，放行时打印醒目警告。
+> 刻意**不改**的两处：服务端 `grab_height=2.0` 语义（网页点选取的是抓握高度，不是桌面基准）、
+> 网页点选只做径向修正不扣 `TIP_BIAS`（改 API 出口会污染定位链）—— 这两条是**已知边界**，不是隐患。
+
+### 十一、模块 E：鲲鹏侧语音入口网关（`voice_gateway.py` + `test_voice_gateway.py`，B 项 / 阶段 2，2026-11-14）
+
+① **用了什么语法/技术**：`sys.path.insert` 跨目录复用 `../llm/` 的 `parse_intent` / `parse_frame` / `xor_checksum` / `build_frame`；
+`enum.Enum` 把仲裁判决锁成 `ALLOW / NOOP / REJECT` 三种、`@dataclasses.dataclass` 装 `ArbiterVerdict`（`set_estop` 用 `None/True/False` 三态，让仲裁器保持**纯函数**）；
+`socketserver.ThreadingTCPServer` + `StreamRequestHandler`（`daemon_threads=True` / `allow_reuse_address=True`）、`threading.Lock` 保护跨连接急停标志；
+`urllib.request` 调 `/api/cmd`；`argparse` 的 `action="append"` 一次喂多帧；纯函数 `normalize_frame()` 还原 shell 字面量 `\r\n`；`print(..., flush=True)` 治块缓冲。
+
+② **为什么这么设计**：
+- **不改 `web_control.py`、不直连串口**：5000 是已实机验收的主链路（眼在手全链、14 次重复性、三条闸门都在它上面），串口由它独占，第二个进程再开串口会抢帧（标定链踩过）；本文件是**独立进程**，只通过 HTTP 调它已有的 `/api/cmd`，主链路一行不碰，**删掉即完整回滚**。
+- **只授权 `HOME / STOP / RESUME` 三个固件原生命令字**（`Core/Src/uart_protocol.c:428-451`，均回 `OK`）：它们**不带任何数值参数** ⇒ 从根上不需要软限位裁剪 / `to_pulses()` 反解 / `SAG_DZ` 净空折算，把项目里「静默夹紧」「算错符号」这些坑变成**结构上不可能**。`PICK / PLACE / MOVE_LEFT / MOVE_RIGHT` 一律 `ERR,3`、`LOOK` 为 NOOP，落实「LLM / 意图层只**提议**、本地仲裁器才**授权**」（`docs/机械臂小车+语音-可行性与落地路线.md` 第六节快慢双通道）。
+- **默认 dry-run，`--apply` 才真下发**：把「会不会动臂」从「靠人记」变成显式开关，与 `eye_check.py` 三条入场闸门同一思路。
+- **急停最优先**：文本匹配放在 `parse_intent()` 之前，不等一个可能返回 `unknown` 的翻译员；`$ESTOP*CK` / `$RESUME*CK` 走 `special_text()` 快速通道，否则会被 `parse_frame()` 判 `NOT_ASR` 丢掉。
+- 规范定义：本模块是**协议适配层（Gateway / Anti-Corruption Layer）+ 本地仲裁器（Local Arbiter）**，隔离外部语音协议与内部执行链路；互斥量保护共享可变状态避免竞态条件。
+
+③ **不这么写会怎样**：
+- 按路线图原写法直接下发 `$JOINT,...` ⇒ 一步踩进脉宽越界、`to_pulses()` 符号、软限位静默夹紧、下垂净空折算四个雷区（阶段 2 判据已据此订正，见 `docs/排障记录-语音网关.md` 第 5 条）。
+- 把归一化塞进 `text_gateway.parse_frame()` ⇒ 牵动它 18 项既有单测，且底层纯函数不该替调用方猜格式；shell 单引号里的 `\r\n` 是 4 个普通字符，好帧会被判 `bad_ck_len`（本次真踩到）。
+- 多线程 TCP 下急停标志不上锁 ⇒ A 刚判完「没急停」、B 紧接着发急停会漏判；`nohup` 重定向时 `print` 不 `flush` ⇒ 日志看不见（11-14 启动事故同源）。
+- 只看 `/api/cmd` 的 `ok:true` 不看 `resp` ⇒ 把「帧写进串口」当成「固件执行成功」（`action_primitives.send_joint()` 同一套口径）；Flask 没起时不兜异常 ⇒ 客户端连接直接断、收不到任何应答。
+> ✅ 档位（2026-11-14 16:40 抬）：**阶段 2 网关链路已上板实机验证**（38 项本机单测 + 四层硬判据全绿，详见 F 节与 `docs/上板验收-语音网关阶段2.md`）；🔴 **语音入口整体仍 🔶**：ESP32 整机 `idf.py build` 已通过但未烧录 / 未联调，`source` 恒 `mock`，没接云端大模型 / ASR / ESP32。
+> ✅ **11-14 16:40 已上板 `--apply` 跑完该硬判据，四层证据齐 ⇒ 阶段 2 网关链路抬 ✅**（原始输出与记录表 → `docs/上板验收-语音网关阶段2.md` 第五节）。🔴 但仍不许写成「语音控制已实现 / 语音→动作闭环」—— 那只证明「网关 → Flask → 固件 → 臂」链路通，与语音识别无关。
 
 ### A. 无硬件打通链路（本轮已完成，PC 上就能跑）
 
@@ -349,9 +460,28 @@ python3 handeye_calib.py solve --samples samples_fkfix.json --out handeye_X.json
 ### C. 在网页上用眼在手定位
 
 【板 · openEuler 终端】（重启 5000 才生效；`--eye-in-hand` 不加则完全走旧通路）
+
+🔴 **必须用绝对路径启动**。`~` 下曾留着一份 11-08 的老 `web_control.py`（81775B），
+`cd ~ && python3 web_control.py` 会跑它 ⇒ `unrecognized arguments: --eye-in-hand`，
+而 `scp` 更新的却是 `~/kunpeng_vision/` 那份，两份同时被 `pkill -f` 杀掉，极难察觉。
 ```
-pkill -f web_control.py; sleep 1; cd ~ && nohup python3 web_control.py --host 0.0.0.0 --port 5000 --ik-dir ~/kunpeng_vision --eye-in-hand --video-url http://10.160.120.1:8080/video --detections-url http://127.0.0.1:8080/detections > ~/web.log 2>&1 &
+pkill -f web_control.py; sleep 1; nohup python3 -u /root/kunpeng_vision/web_control.py --host 0.0.0.0 --port 5000 --ik-dir /root/kunpeng_vision --eye-in-hand --video-url http://10.160.120.1:8080/video --detections-url http://127.0.0.1:8080/detections > /root/web.log 2>&1 &
 ```
+判版本只认**字节数 + `grep -c`**：`web_control.py` 新版 `--eye-in-hand` 出现 5 次、
+`eye_check.py` 新版 `--radial-fix` 出现 5 次。
+
+⚠️ 想让 `eye_check.py`（命令行自检）也能用，还得多两个参数，否则自检会直接拒跑：
+- 页面 URL 是 `http://板IP:5000/video` ⇒ Flask 里得有 `--video-url`；
+- `eye_check` 第一步就 `GET /api/ik/eye`，**摄像头/参数错不打紧，但 `--eye-in-hand` 必须有**。
+
+所以「跑物理验收」用的启动命令是这一条（串口自动探测，不用写 `/dev/ttyUSB0`）：
+```
+pkill -f web_control.py; sleep 1; nohup python3 -u /root/kunpeng_vision/web_control.py --host 0.0.0.0 --port 5000 --ik-dir /root/kunpeng_vision --eye-in-hand > /root/web.log 2>&1 &
+```
+🔴 **两个「不带」 / 一个「必带」**：
+- **不带 `--radial-fix`**：代码里 `_EYE_RADIAL_K` 默认已是 `1.091`，命令行写了反而会覆盖默认值，以后改默认还要同步两处。想关掉对比用**客户端** `eye_check.py --radial-fix 0`（和服务端不是一回事）。
+- **`-u` 必带**：`nohup … > 文件` 时 Python stdout 变**块缓冲**，启动横幅「[串口]… / 逆解：已就绪 / 眼在手：已启用」会卡在内存里不落盘，只有 Werkzeug 英文横幅（走 stderr）立刻可见 ⇒ `grep` 中文空会误以为启动失败（11-14 实测踩过）。`-u` = unbuffered，根治。
+判活最可靠的是 `curl -s http://127.0.0.1:5000/api/ik/eye` 看 `"enabled":true`，不是看日志横幅；串口是否真连看 `POST /api/state` 能否回 `ok:true` + 6 路真实脉宽 —— 该接口**没有兜底值**，`_HOST` 为空会直接 `ok:false`，所以 `ok:true` 就等于「STATE 真回读」。
 
 【PC · 浏览器】打开 `http://10.160.120.1:5000`，先点「连接」，勾选取点，点画面 → 调
 `POST /api/ik/eye/solve`（页面尚未加按钮，暂用下面命令验证）：
@@ -361,6 +491,121 @@ curl -s -X POST http://10.160.120.1:5000/api/ik/eye/solve -H "Content-Type: appl
 
 期望返回里出现 `"mode": "eye_in_hand"`、`"x"/"y"/"z"`、`"depth"`、`"placeholder": true`。
 **占位数据下 `placeholder` 必须为 `true`** —— 看到 `false` 才说明用上了实测标定。
+
+### D. 一句话抓取（`pick_pipeline.py`，A 版本；先 dry-run 再 --yes）
+
+前置三件：① Flask 带 `--eye-in-hand` 起好；② `detector_service.py` 在跑（8080）；③ 串口已 open。
+
+【板 · openEuler 终端】（`cd ~/kunpeng_vision`）
+```
+python3 pick_pipeline.py --self-test
+```
+```
+python3 pick_pipeline.py --instruction "把杯子抓起来" --dry-run
+```
+```
+python3 pick_pipeline.py --instruction "把杯子抓起来" --yes
+```
+```
+python3 pick_pipeline.py --instruction "把杯子抓起来" --yes --place-x 6 --place-y 20
+```
+
+- `--backend mock`（默认）：**不调模型**，按类名关键词挑目标 —— 用来先验证「几何 + 闸门 + 动作序列」这一半。
+  换成真模型：`--backend vlm --model qwen2.5vl:3b --base-url http://<PC 的 IP>:11434/v1`。
+- `--dry-run` 与 `--yes` 必须二选一，**两个都不给会直接退出**（防止"以为跑了其实没跑"和"以为没跑其实动了"）。
+- 返回码：`0` 完成 / `1` 环境没准备好 / `10` 决策不是 pick（或画面空）/ `11` 安全拒绝 /
+  `12` 逆解不可达 / `13` 计划被软限位裁剪 / `2` 执行超时 / `4` 通信失败。
+- 若抓偏了，先看它打印的**底面中心 (x, y)**：拿卷尺量一下真实位置，
+  偏差方向一致 ⇒ 多半是 `plane_z` 或桌面基准；偏差随姿态变 ⇒ 回去看手眼 X。
+
+### E. 语音入口网关本机演练（`voice_gateway.py`，零硬件 / 零第三方依赖）
+
+> 前置：想跑 `--apply` 真下发，必须先按 C 节把 Flask 带 `--eye-in-hand` 起好、串口已 open。
+> 🔴 默认 **dry-run**，臂绝不会动；只有显式 `--apply` 才真发。
+
+【PC · PowerShell 或 板 · openEuler 终端】（`cd` 到 `kunpeng/robot` 后执行，一条一条粘）
+```
+python3 -B voice_gateway.py --self-test
+python3 -B voice_gateway.py --make-frame "回初始位"
+python3 -B voice_gateway.py --text "回初始位" --text "看看桌面" --text "把红块抓起来"
+python3 -B voice_gateway.py --text "急停" --text "回初始位" --text "恢复" --text "回初始位"
+python3 -B -m unittest test_voice_gateway -v
+```
+- 期望：`SELF_TEST PASS`；`--make-frame` 给 `'$ASR,回初始位*61\r\n'`（复制粘贴用）；
+  多句链路依次回 `$OK,HOME` / `$OK,LOOK_NOOP` / `$ERR,3`；
+  急停链路 `$OK,ESTOP` → `$ERR,3`（冻结）→ `$OK,RESUMED` → `$OK,HOME`；
+  unittest **38 项全绿**、末尾附 `SELF_TEST PASS`。
+- **起 TCP server**（默认 `127.0.0.1:9000`，只本机可连；`ThreadingTCPServer` 每连接一线程）：
+```
+python3 -B voice_gateway.py
+```
+  另开终端造一条带正确 CK 的帧再喂（先用 `--make-frame` 拿 CK）：
+```
+python3 -B voice_gateway.py --make-frame "回初始位"
+echo -ne '$ASR,回初始位*61\r\n' | nc 127.0.0.1 9000
+```
+- 🔴 **要 ESP32 连进来 / 要真动臂**，两个开关都要显式给：
+```
+python3 -B voice_gateway.py --apply --host 0.0.0.0
+```
+  `--apply` 时若 Flask 没起，`send_cmd()` 抛 `RuntimeError`，网关回 `$ERR,4*5D\r\n` 且不崩（已单测覆盖）。
+- 非 ASR 急停快速通道：`$ESTOP*CK\r\n` / `$RESUME*CK\r\n` 同样有效（CK 仍由 `parse_frame` 校验）。
+- 错误码沿用项目统一语义：`ERR,1` 帧错 / `ERR,2` 未识别 / `ERR,3` 仲裁拒绝 / `ERR,4` 下发失败。
+
+### F. 上板验收：阶段 2 硬判据（`docs/上板验收-语音网关阶段2.md`，2026-11-14）
+
+> ✅ **2026-11-14 16:40 已在板端跑完全部硬判据并回报，四层证据齐 ⇒ 阶段 2 网关链路抬 ✅**（记录表见规程第五节）。
+> 下面 ①②③ 是这套验收方法本身的三行法；🔴 抬的只是「网关链路」，**语音入口整体仍 🔶**（ESP32 整机 build 已通过、未烧录 / 未联调）。
+> **实机结果摘要**：八进制 `$ASR,回初始位*61` → `$OK,HOME*27` → `/api/state` 由 C 姿态变初始位 → 日志 `sent:true` → **用户肉眼确认臂动**；`PICK`→`$ERR,3`、急停四帧全对、`解除急停`→`$OK,RESUMED*75`。
+
+① **用了什么语法/技术**：`printf` 八进制字节转义 `\345\233\236…`（POSIX 通用、绕开 SecureCRT 中文编码）+ `socket.create_connection()` 一行兜底（不依赖 `nc`）+ 精确 CK 速查表（由 `build_frame()` / `xor_checksum()` 实算）+ **四层证据链**（应答帧 / 网关日志 `sent:true` / `/api/state` 脉宽 / 肉眼）；板端命令一律单行、PC 侧 PowerShell 分两行（PS5.1 无 `&&`）。
+
+② **为什么这么设计**：三个前提都是**已实测或已踩过**的 —— 板端 `~/kunpeng_vision/` 是**平铺目录**，而 `voice_gateway.py` 要 `import ../llm/`（本机 `python -c` 复现过 `ModuleNotFoundError`，先 import 网关才正常）⇒ 必须镜像 `llm/` + `robot/` 两层；`intent_parser.py:92` 的 HOME 词表**只有中文**（`$ASR,home*63` 实测回 `$ERR,2*5B`）⇒ 帧里必须带中文或用 UTF-8 八进制字节；`/api/cmd` 的 `ok:true` 只＝串口写进去了 ⇒ 硬判据不能只看 `$OK,HOME`，必须回读 `/api/state`，看脉宽从 C 姿态 `1636,1470,2177,1106,1450,1567` 变成初始位 `1580,1900,2400,700,1450,1500`。
+
+③ **不这么写会怎样**：把网关直接丢进板端根目录 ⇒ 起不来；用 `echo` 手打中文且终端非 UTF-8 ⇒ 好帧一律 `ERR,1`，会误判成「网关坏了」；只看应答帧就宣布通过 ⇒ 把「帧写进串口」当成「臂真的动了」，这正是本项目反复强调的**静默失效**；验收完把 `--apply` 进程留着 ⇒ 一个会动臂的端口一直开着。
+
+**排障见 `docs/排障记录-语音网关.md`（8 条，含第 8 条板端两个非失败误判点）；单行可粘贴命令清单 + 已填写的验收记录表见 `docs/上板验收-语音网关阶段2.md`。**
+
+### G. 11-14 代码审查加固：locale 无关输出 + 急停/恢复词表消歧（`voice_gateway.py`）
+
+> 🔴 只改 `voice_gateway.py` + `test_voice_gateway.py`，**没碰** `web_control.py` / `uart_protocol.c` / `intent_parser.py` / `text_gateway.py` / 任何 `.ioc`；当时档位仍 🔶 未上板，**16:40 实机验收后阶段 2 已抬 ✅**（见 F 节）。
+
+① **用了什么语法/技术**：`sys.stdout.reconfigure(encoding="utf-8", errors="backslashreplace")` 就地改输出编码（Python 3.7+；老版本 / 被 IDE、unittest 包装过的 stdout 没有该方法，用 `try/except (AttributeError, ValueError, OSError)` 跳过）+ `str.encode("ascii", "backslashreplace")` 把非 ASCII 转成 `\uXXXX` 转义 + 所有 `print` 收口到一个 `_emit(text, newline=True)` 输出函数 + `subprocess` 强制 `PYTHONIOENCODING=ascii` 起真进程做端到端回归；词表侧抽 `_match_resume()` / `_match_estop()` 两个纯函数，用「恢复词优先排除」消除短词表子串歧义。
+
+② **为什么这么设计**：两处都是**本机 UTF-8 测不出、上板 `LANG=C` 才炸**的问题 ——
+a) 启动横幅中文 `print` 抛 `UnicodeEncodeError` ⇒ **服务直接退出**；`--self-test` 先打 `SELF_TEST PASS` 再因中文 JSON 抛异常 ⇒ rc=1，验收规程 1.3 唯一的结构自检会误判失败；handler 里日志 `print` 写在 `_write(reply)` **之前** ⇒ 异常一抛**应答帧被吞掉**，客户端 `recv` 得空字节。
+b) `EMERGENCY_WORDS` 含裸词「急停」，而 `RESUME_WORDS` 里的「解除急停」是它的超集字符串 ⇒ 喊「解除」反而再急停一次（`payload='STOP'`）；且 `arbitrate()` 与 `special_text()` 各自实现匹配，小写 `stop` / `resume` 行为不一致。
+⇒ 输出做成 locale 无关、应答**先于**日志发出；匹配抽成共用纯函数、显式消歧。
+
+③ **不这么写会怎样**：只在本机跑原有 32 项单测 / TCP 四步链路全绿就交付 ⇒ 板上第一行中文横幅就崩、验收从第一步卡住；只改编码不改顺序 ⇒ 日志异常仍会吞掉应答，客户端永远收不到 `$OK,HOME` 却查不出原因；只补一个词表特判 ⇒ 两层行为继续分叉，将来接真模型时「解除急停」又变成急停。**急停优先级语义不变** —— 它由 `estop_active` 冻结闸门保证，词表顺序只决定「这一帧归类为急停还是恢复」。
+
+**回归证据**：`PYTHONIOENCODING=ascii` 下 `--self-test` rc=0、`--make-frame` 出 `*61`、真 TCP server 能起且中文帧回 `$OK,HOME*27\r\n`；`test_voice_gateway.py` **38 项全绿**；`text_gateway.py` / `intent_parser.py` 自检 rc=0。详见 `docs/排障记录-语音网关.md` 第 6、7 条。
+
+### H. 11-15 宿舍无硬件：四层硬判据自动判定（`check_esp32_link.py`）
+
+> 🔴 背景：11-15 用户仍在宿舍、硬件都在教室。②③（ESP32 真发帧、ESP-SR）都被硬件卡死，
+> 所以先消除**明天到教室最容易翻车的环节** —— 在几百行串口日志里靠人眼找 4 条证据。
+> 本模块**只读日志、不改工程、不发串口、不动臂**，`esp32/` 与语音入口整体档位仍 🔶。
+
+① **用了什么语法/技术**：纯标准库 `argparse`（命令行）/ `pathlib`（读文件）/ `re`（找 IP 与 send 字节数）/
+`json`（逐行解析网关日志）+ 4 个纯函数 `check_layerN()` + `evaluate()` 把三份文本变成 4 个 `(bool, 说明)`；
+`--self-test` 内置 5 组假日志自证脚本本身；`_emit()` 用 `backslashreplace` 做 locale 无关输出（复用 G 节踩过的 `LANG=C` 坑）。
+
+② **为什么这么设计**：判据写成纯函数、读文件单独隔离 ⇒ 零硬件也能验证脚本自己没写错；
+四个否决项全部来自已踩过的坑 —— `$ERR,2*5B`（发成 `mic_ok` / `home`，词表只认中文）、
+`$ASR,mic_ok*50`（烧了旧副本 / 没重新 build）、`apply=true`（网关误开 `--apply`，会真动臂）、
+第 4 层从**外部主机**探活（证明不是 `127.0.0.1` 自连、不是 `--host 0.0.0.0` 漏了）。
+
+③ **不这么写会怎样**：人眼翻日志最容易把「帧写进去了」当成「链路通了」、把 `$ERR,2` 看成 `$OK`、
+或没发现网关被开成 `--apply`；这三类误判会让「编译通过 / 看着像通」被错当成实机验收去抬档，
+正是本项目反复强调的**静默失效**。所以脚本输出末尾固定打印「判定通过 ≠ 抬档」。
+
+**用法**：`python3 check_esp32_link.py --self-test`（零硬件）；明天把串口 monitor / `/root/gw.log` / B4 `nc`
+输出存成三个文本再跑 `--uart-log ... --gw-log ... --probe-out ...`，见 `docs/明日回教室-ESP32照跑清单.md` 第五节。
+🔴 `--probe-text '$OK,ESTOP*75'` 里的 `$` 必须用**单引号**包住，否则会被 shell 当成变量展开。
+
+**本机验证**：`SELF_TEST PASS cases=5 failed=0`、CLI 全绿 `RESULT: PASS=4 FAIL=0`、
+旧固件用例正确 rc=1、`PYTHONIOENCODING=ascii` 下 rc=0，合计 `VERIFY PASS=8 FAIL=0`。
 
 ## 诚实边界
 
@@ -373,12 +618,113 @@ curl -s -X POST http://10.160.120.1:5000/api/ik/eye/solve -H "Content-Type: appl
   现在 `solve` 自带尺度自校正，可以把这个变量摘掉后再判一次。
 - ❌ **不能用「棋盘离相机多远」去反推 `--square`**：相机装在 J4 支架上、镜头离 J4 轴心约 5~6 cm，
   所以 `|t|` 天生比「按腕点位置算出来的距离」小一截。这个坑踩过一次，判据只能靠尺子。
-- ❌ 仍不能写：「眼在手闭环 / 视觉伺服 / 边看边抓 / 自动抓取 / 实时跟踪」—— 当前只有**单帧单点**定位，无跟踪、无闭环伺服、无抓取动作序列。
+- ❌ 仍不能写：「眼在手闭环 / 视觉伺服 / 边看边抓 / 实时跟踪 / 自动抓取」—— 当前只有**单帧单点**定位，
+  无跟踪、无闭环伺服。抓取序列（`action_primitives` / `pick_pipeline`）**有代码、离线测试全过、未上板跑过**，
+  所以最多写「实现了抓取动作序列与安全闸门，离线回归 16 项全过」，不能说「已实现自动抓取」。
 - 本机验证只证明**数学与接线正确**；合成数据 `~1e-15 cm` 是机器精度，实机含噪声误差会大得多。
 - `rpy_cam2gripper_deg` 在绕 Y=180° 附近有多种等价表示（`[0,180,0]` 与 `[180,0,180]` 描述同一旋转），
   这是 ZYX 欧拉角在奇异点附近的固有不唯一性，**看 `X_matrix` 才是唯一真相**。
+- ✅ **`voice_gateway.py`（B 项 / 阶段 2）网关链路 11-14 16:40 已上板 `--apply` 实机验证**（38 项本机单测 + 四层硬判据全绿，记录见 `docs/上板验收-语音网关阶段2.md`）；🔴 **语音入口整体仍 🔶**：未与 ESP32 联调、帧草案未对齐、`esp32/` 骨架整机 build 已通过、未烧录。
+  `source` 恒 `mock`，没接云端大模型 / ASR / ESP32；`$ASR,<文本>*<CK>` 是 `llm/text_gateway.py` 的**建议草案、未与 ESP32 实机对齐**。
+  ✅ 能写「搭建鲲鹏侧收帧网关与本地仲裁器，38 项单元测试通过、默认 dry-run 不下发；11-14 上板 `--apply` 用假帧驱动机械臂回初始位、`PICK` 被拒、急停可冻结」；
+  ❌ 不能写「语音控制已实现 / 语音→动作闭环 / 已接 ESP32 / 自然语言控制机械臂」。
+  路线图阶段 2 硬判据「喂假帧 ⇒ 机械臂真的动」**已于 11-14 16:40 上板 `--apply` 实跑通过**。
+- 🔴 急停只在**网关层**冻结后续下发并转发 `STOP` 给固件；仍是开环、无位置反馈，**不是**功能安全认证意义上的急停。
+
+### 九、示教配方层（`pick_recipes.json` + `--recipe`，2026-11-16 新增）
+
+**背景（必须记住，否则会反复踩）**：11-16 真抓失败，4 步全报「✓ 到位」却**碰都没碰到瓶子**。根因两条，都在**执行侧**：
+
+- `plan_move()` 走裸 `ik.solve()`，**不扣** `TIP_BIAS_XY=(0.10,−0.95)` 也不扣 `SAG_DZ=−3.88cm` ⇒ 实际爪尖比指令**低 3.88cm、近 0.95cm**；
+- `JAW_CLOSE` 原本是 **1900 ＝ 空夹到底**，抓 3.8cm 物体时爪指在空中合死 —— 臂到位了，但夹的是空气。
+
+**① 用了什么语法**
+
+- `json` 读配置 + `os.path.dirname(os.path.abspath(__file__))` 定位同目录文件（不受当前工作目录影响）；
+- 复用已有 `Step` / `Plan` dataclass 与 `run_plan()`，回读确认、超时、通信异常**一行都不重写**；
+- `jaw_for_width()` 两个实测点线性插值，`int(round(...))` 后交给 `clip_pulses()` 兜软限位。
+
+**② 为什么这么设计**
+
+- 开环臂没有位置反馈，逆解又缺姿态相关的重力补偿 ⇒ **「算出来的姿态」和「人调出来的姿态」差 169~749 µs**。人眼一调就准，那就把人的调法存下来回放 —— 这正是工业标准 **teach & playback（示教-再现）**，比每次重算可靠。
+- 复用 `run_plan()` 而不是另写一套下发逻辑：**判据只能有一份**，否则「什么算到位」会出现两个互相矛盾的版本。
+- `--j1-offset` 单独抽出来：示教工位固定，但视觉算出的方位角会变，**只让 J1 跟着变、其余姿态复用** —— 这样视觉仍然真实参与，不是摆设。
+
+**③ 不这么写会出什么问题**
+
+- 把示教值硬编码进 `plan_pick()` ⇒ 换物体、换位置就得改源码；
+- 另写一套「发命令 + sleep」的回放 ⇒ 丢掉回读确认，臂半路卡住照样走下一步；
+- 继续用 `JAW_CLOSE=1900` ⇒ 抓任何 <7cm 的物体都是空夹，且舵机长时间堵转发热。
+
+**用法**
+
+```bash
+python3 action_primitives.py --list-recipes                        # 列出配方与夹爪标定
+python3 action_primitives.py --dry-run recipe bottle_38mm          # 只打印 7 步，不发命令
+python3 action_primitives.py --yes recipe bottle_38mm              # 真回放（抓 + 放回）
+python3 action_primitives.py --yes --j1-offset 20 recipe bottle_38mm   # J1 偏 +20µs
+```
+
+**验证边界（别越线）**
+
+- `bottle_38mm` 是 **11-16 实机 3/3**（3.8cm 喷雾瓶、单一工位、`J4=1850` 顶软限位）；来源是**人工示教 + 手发 JOINT**，**不是** `pick_pipeline` 自动链路；
+- 样本仅 3 次 ⇒ **不代表成功率**，也不能外推到别的物体 / 位置；
+- `--j1-offset` 的**符号尚未实机确认**，先用 ±20 µs 小步试方向，别一次给几十。
+
+---
+
+### 十、电流引导的分步合爪（`grip`，2026-11-16 新增）
+
+**用了什么**：`read_current_ma()`（多读取中位数 + 三种非数值回包分别报错）、
+`grip_until_contact()`（粗 40 µs / 细 15 µs 两段步进，两级电流判据）、
+CLI 子命令 `grip`（`--from/--max/--hold/--rise`，照样受 `--dry-run` / `--yes` 管）。
+
+**为什么这么设计**：J6 是位置控制的舵机，它**不知道自己夹没夹到东西**——原来靠
+写死 `1550`（185 µs/cm 从两点外推），换个体积不同的物体就得重新试。改成「边合边看
+电流」之后，判据来自被夹物体本身的阻力，不用再猜脉宽。但实测发现「刚碰上」的信号
+只有 +49 mA、跟 ±25 mA 毛刺同量级，而「夹得住」是 +90 mA 以上，所以做成
+**弱判据只记候选点、强判据才真停爪**；两者都没出现则判「夹空」并**拒绝抬臂**。
+
+**不这么写会出什么问题**：① 单阈值判停会停在 1510（开口约 4.2 cm，夹不住 3.8 cm 瓶）；
+② 夹空时若一路合到底，会顶到机械限位、舵机堵转发热（`GRIP_MAX_JAW=1700` 就是为此设的闸）；
+③ 把 `CUR,NA`（ADC 没配起来）当成 0 mA，会把「没接上」误判成「已经夹住」。
+
+```bash
+# 前提：臂已在抓取位、物体在爪间、J6 张到 950
+python3 action_primitives.py --dry-run grip     # 只读基线电流，不动臂
+python3 action_primitives.py --yes grip         # 真合爪，打印停住的 J6
+# 注意：--dry-run / --yes 这类全局参数必须写在子命令**前面**
+```
+
+⚠️ **边界**：这是 `action_primitives` 层的「接触即停」，**不是力控**；`pick_pipeline`
+自动链路**尚未接入**，仍 🔶。实测标定只针对 3.8 cm 喷雾瓶一组；`--max 1700` 只能夹
+≥2.7 cm 的物体（更小的要调大，但要留意空夹堵转）。
+
+`--lift N`：夹住后顺手把 J2 抬 N µs（`+60` ≈ 示教悬停增量 1279→1339），省掉
+「读数 → 手敲 JOINT」这一步；不加 `--lift` 时，工具会直接打印**数字已填好**的
+抬起 / 放回命令。放回故意拆成「先降回抓取位（仍夹紧）→ 再张爪」两步——一次到位会在
+半空松爪，物体要掉一段。🔴 之所以让程序生成命令：19:1x 在聊天里给过带 `<占位符>`
+的命令，用户照贴 ⇒ 中文字节进 payload ⇒ Flask 回 `'ascii' codec can't encode`。
+
+**接进自动链路**：`pick_pipeline.py --dynamic-grip` 会让 `run_plan` 在「合爪」那一步
+改调 `grip_until_contact()`，并把后续「保持夹紧」的步骤同步成实际夹持值（张爪步骤不动）。
+判为夹空时**不抬臂**、返回码 **7**。🔴 但它只解决「夹多紧」，**不解决「伸到哪」**——
+`pick_pipeline` 的臂姿仍来自 IK（tilt≈41，下降步 `J2=1509/1532、J4=955/1103`），而人工
+示教验证过的抓取姿态是 `J2=1279、J4=1850`（tilt≈96），两者差 250~750 µs。
+
+**C 方案 `--recipe <名字>`（11-16 新增）**：J1 用视觉、J2~J5 用示教。
+`ArmIK.j1_pulse_for_xy()` 只用方位角算 J1——工作台原点在 J1 轴心上，所以 J1 与臂伸多远、
+倾角多少、够不够得到**无关**，也不需要 `solve()` 成功（solve 常因 J2~J4 越界失败，那跟 J1 没关系）。
+实测三点校验：`(−5.26,25.0)→1691`（与当初示教一致）、`(−4.19,23.65)→1674`（IK 给 1673）、
+`(0,25.0)→1580`（正好是初始位的 J1）。⚠️ 只修 J1 意味着**径向距离仍锁死在示教工位**，
+物体离得太远/太近只能靠夹爪开口余量吃下来，跑前要目视确认爪指真的包住了物体。
+
+---
 
 ## 排障记录
+
+- 语音入口网关（B 项 / 阶段 2）另见 **`docs/排障记录-语音网关.md`（8 条）**：字面量 `\r\n`、非 ASR 急停帧、`--apply` 下发失败、多线程急停锁、「下发 `$JOINT`」的设计取舍订正，以及 11-14 代码审查新增的**第 6 条（板端 `LANG=C` 服务起不来 / `--self-test` rc=1 / 日志吞应答）**、**第 7 条（「解除急停」被反向误判成急停）**、**第 8 条（板端实机验收两个「看着像故障」的非失败误判点，全程零故障）**。
+- 底盘统一帧（A 项）另见 `car/排障记录.md`（4 条）。
 
 见 `docs/排障记录-手眼标定.md`（现 12 条，本日新增第 6 条「solve 报激励不足实为无解」、
 第 7 条「USB 掉线后读线程静默死亡」、第 8 条「残差用总范数 + 棋盘格尺度 → 好数据被判无解」、

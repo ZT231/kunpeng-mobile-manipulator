@@ -16,8 +16,12 @@
 用法：
   python web_control.py COM7 --baud 115200          # 经 PC 串口控制
   python web_control.py COM7 --camera 0             # PC 阶段：顺便开本地摄像头出 MJPEG 画面
-  python web_control.py /dev/ttyUSB0 --video-url http://127.0.0.1:8080/video
+  python web_control.py --video-url http://127.0.0.1:8080/video
                                                     # 鲲鹏阶段：画面来自 detector_service.py
+                                                    # 不写串口号 = 自动探测（by-id 优先，
+                                                    # ttyUSB0/1 互换都不影响），启动即连接
+  python web_control.py /dev/ttyUSB0 --video-url http://127.0.0.1:8080/video
+                                                    # 也可以显式指定端口（编号变了就得改）
   python web_control.py --wifi 192.168.4.1:9000     # 经 WiFi TCP 控制（ESP 自建热点）
   python web_control.py --host 0.0.0.0 --port 5000  # 让手机通过同一 WiFi 访问
 
@@ -27,6 +31,8 @@ PING/MOVE/STATE 完全独立。所以页面怎么改都不会影响已经跑通�
 注意（2026-11-04 适配鲲鹏项目）：本项目 STM32 执行端经串口直连鲲鹏（默认 serial 模式即可，
 端口传 /dev/ttyXXX，如 /dev/ttyUSB0 或板载 UART）；旧项目的 ESP-01S WiFi 模式在本项目由
 ESP32-S3 替代（语音+联网），此处 wifi / tcp-server 模式仅作旧项目兼容保留，新项目请走 serial。
+2026-11-12 起：串口号可整段省略 —— 自动探测 /dev/serial/by-id/usb-1a86_*（CH341 稳定别名），
+所以 CH341 被 USB 复位、编号在 ttyUSB0/ttyUSB1 之间来回翻都不影响，启动时也会自动连接。
 脉宽范围已对齐固件 main.h 的软限位（J6 上限 2000，为另行收窄的安全限位；
 物理实测闭合端点 2100 仍记在 arm_params.json / docs/舵机标定记录.md 第六节，两者不是一回事）。
 """
@@ -34,6 +40,7 @@ ESP32-S3 替代（语音+联网），此处 wifi / tcp-server 模式仅作旧项
 import argparse
 import json
 import logging
+import math
 import os
 import socket
 import sys
@@ -187,6 +194,40 @@ _EYE_INFO = {              # 给页面显示的元数据（是否占位、文件
 }
 _EYE_PLANE_Z = None        # 抓取平面高度 cm；None = 用 arm_params.json 的 grab_height
 
+# 定位径向系统偏差修正系数（2026-11-13 实测标定，只用于「眼在手」这条链）。
+#
+# 大白话：localize 用 FK 算「相机此刻在哪」，可 FK 是一套理想角度 —— 实际舵机被
+#   自身和前臂的重量压下去一点点（C 姿态实测 J2 约 6.5°）。相机骑在腕上
+#   （手眼矩阵 X 的平移 |t|≈16.7cm ≈ L3），这一压会被放大成「棋盘坐标系统性算近」。
+# 规范说：光轴偏 δ 时，射线与 z=常数平面的交点位移 ≈ depth·tanδ/sinα
+#   （α = 视线与平面夹角），沿视线方向、随深度增大 —— 所以"沿径向按比例缩放"
+#   是一阶正确的修正形式，方位角不受影响。
+# 实测依据（两个基准点，取值随棋盘真值变，务必看清）：
+#   · 2026-11-12：定位 25.72cm，钢尺 28.70cm ⇒ k=1.116（旧棋盘位置）；
+#   · 2026-11-14：定位 27.54cm，钢尺 30.04cm（x=−1.64/y=30.0 那次）
+#     ⇒ k=30.04/27.54=1.091。当天改用 1.091 后，同姿态五连拍的
+#     纵向误差稳定在 0.30cm，而 1.116 会系统性多推约 0.7cm ⇒ 取 1.091 为默认。
+# ⚠️ 这是**单点经验系数**，不是标定出来的真值：改相机安装角、重标手眼 X、
+#   换棋盘远近、或把 --tilt 换出 41° 附近，都必须重测。请求可用 radial_fix
+#   覆盖（给 0 关闭），启动可用 --radial-fix 覆盖。
+# ⚠️ 只修径向，**不修横向**：2026-11-14 实测定性，横向另有约 1.4cm 的
+#   稳定系统误差（方位角偏 −2.7°），属手眼 X 旋转 / J1 map 比例，别拿 k 去凑。
+_EYE_RADIAL_K = 1.091
+
+
+def _radial_fix_xy(x, y, k):
+    """把工作台坐标沿径向按系数 k 缩放，方位角保持不变。
+
+    只改半径、不改方向：偏差来自「光轴俯仰角错了 δ」，射线沿自身方向前后滑，
+    横向（方位角）几乎不动。所以径向缩放是"照着物理原因开的药"，
+    而不是随手在 x/y 上各乘一个数。
+    """
+    r = math.hypot(x, y)
+    if r < 1e-9 or abs(k - 1.0) < 1e-9:
+        return x, y
+    return x * k, y * k
+
+
 
 def init_eye_in_hand(robot_dir, x_path, k_path, plane_z=None):
     """尝试加载眼在手链路；失败只记原因、绝不抛异常拖垮网页服务。
@@ -239,6 +280,81 @@ def make_frame(payload: str) -> bytes:
 # ---------------------------------------------------------------------------
 # 串口封装（后台读取线程，MOVE 只写不等，避免拖动时被应答阻塞卡顿）
 # ---------------------------------------------------------------------------
+# 单行字节上限。正常协议帧最长约 40 字节（"OK,S,C,1636,1470,..."），512 宽松到
+# 不可能误伤；设上限只为防「噪声里一直没有换行符」时 line 无界增长吃内存。
+_RX_LINE_MAX = 512
+
+
+# ---------------------------------------------------------------------------
+# 串口自动探测：让「这次枚举成 ttyUSB0、下次成 ttyUSB1」不再影响任何命令
+# ---------------------------------------------------------------------------
+# ① 用了什么语法：模块级常量 + 只读探测函数（os.listdir / open 读 sysfs）。
+# ② 为什么这么设计：CH341 每次被 USB 复位都会重新枚举，内核分给它的 ttyUSB 编号
+#    可能从 0 变成 1（本项目实测来回翻过）。但 /dev/serial/by-id/ 下的名字是按
+#    芯片里的厂商串生成的，编号怎么变它都指向同一台设备 —— 所以优先用 by-id；
+#    by-id 不存在时再退一步，按 USB 身份 1a86:7523 从 /sys 里把 CH341 认出来。
+# ③ 不这么写会怎样：每换一次编号，所有 curl / 脚本里写死的 /dev/ttyUSB0 全失效，
+#    现象是「串口打不开」或「命令发出去没反应」，每次都得先 ls 一遍再改命令。
+SERIAL_AUTO = "auto"
+_BY_ID_DIR = "/dev/serial/by-id"
+_SYS_TTY_DIR = "/sys/class/tty"
+_CH341_VID = "1a86"
+_CH341_PID = "7523"
+
+
+def detect_serial_port():
+    """返回当前可用的串口路径；一个都找不到时返回 ""。
+
+    Linux：① /dev/serial/by-id/usb-1a86*（稳定别名，首选）
+           ② /sys 里 idVendor:idProduct = 1a86:7523 的 ttyUSBn
+           ③ 兜底：任意一个 ttyUSBn
+    Windows：serial.tools.list_ports 里 VID:PID 匹配 CH341 的 COMx
+    """
+    if os.name == "nt":
+        try:
+            from serial.tools import list_ports
+        except Exception:
+            return ""
+        others = []
+        for info in list_ports.comports():
+            if info.vid == 0x1A86 and info.pid == 0x7523:
+                return info.device
+            if info.device:
+                others.append(info.device)
+        return others[0] if others else ""
+
+    # ① 稳定别名。名字形如 usb-1a86_USB_Serial-if00-port0
+    try:
+        for name in sorted(os.listdir(_BY_ID_DIR)):
+            if name.startswith("usb-" + _CH341_VID):
+                return os.path.join(_BY_ID_DIR, name)
+    except OSError:
+        pass
+
+    # ② 按 VID:PID 认设备。/sys/class/tty/ttyUSBn/device 指向 usb interface，
+    #    往上一级（..）才是 usb device 目录，idVendor / idProduct 在那里。
+    try:
+        names = sorted(n for n in os.listdir(_SYS_TTY_DIR) if n.startswith("ttyUSB"))
+    except OSError:
+        names = []
+    fallback = ""
+    for name in names:
+        dev_dir = os.path.join(_SYS_TTY_DIR, name, "device", "..")
+        vid = pid = ""
+        try:
+            with open(dev_dir + "/idVendor") as f:
+                vid = f.read().strip().lower()
+            with open(dev_dir + "/idProduct") as f:
+                pid = f.read().strip().lower()
+        except OSError:
+            pass
+        if vid == _CH341_VID and pid == _CH341_PID:
+            return "/dev/" + name
+        if not fallback:
+            fallback = "/dev/" + name
+    return fallback
+
+
 class SerialHost:
     def __init__(self, port, baud=115200):
         self.port = port
@@ -317,6 +433,17 @@ class SerialHost:
                     break
             if not ch:
                 continue
+            # ① 帧头重同步：一见到 "$" 就把之前攒下的残渣整个丢掉，从这一帧重新起算。
+            # 为什么需要：printf 重定向到 huart1，与协议共用同一条链路，一旦混进一段
+            # 没有换行符的裸文本（噪声、被截断的提示语），它就会和下一帧粘成一行；
+            # 而下面要求「整行以 $ 开头」，于是那一帧被整条丢弃，上层只能看到
+            # "600 ms 内未收到任何字节"。2026-11-12 实测：PING 正常、紧随其后的
+            # STATE 偶发超时，原样重发即恢复 —— 就是这一帧被吃掉。
+            # 安全性：协议里 "$" 只作帧头，载荷字符集是 A-Z/0-9/逗号/负号/点/冒号，
+            # 不含 "$"，所以「见到 $ 就重来」不会切坏正常帧。
+            if ch == b"$":
+                line = bytearray(ch)
+                continue
             if ch in (b"\r", b"\n"):
                 if line:
                     s = bytes(line).decode("ascii", errors="replace").strip()
@@ -330,6 +457,11 @@ class SerialHost:
                         with self.rlock:
                             self.rxq.append(s)
                     line = bytearray()
+                continue
+            # ② 超长行一定不是协议帧：直接丢掉、等下一个 "$" 重新同步。
+            # 不加这条，噪声持续没有换行符时 line 会一路涨下去（无界）。
+            if len(line) >= _RX_LINE_MAX:
+                line = bytearray()
                 continue
             line += ch
 
@@ -598,6 +730,38 @@ _HOST = None
 _HOST_STATE = {"connected": False, "port": "", "error": ""}
 _MODE = "serial"          # "serial" / "wifi" / "wifi_server"
 _WIFI_ADDR = ""
+
+
+def auto_reconnect():
+    """串口链路已经死掉时，按自动探测重连一次；真的重连了才返回 True。
+
+    为什么允许「自动」：CH341 被 USB 复位后 ttyUSB 编号会变，旧 fd 只会静默返回
+    b''。设备全场只有一台，重连的目标没有任何歧义，让人再手打一次端口号毫无意义。
+    为什么必须限定条件：只有「根本没连」或「读线程已判定链路失效（_dead_reason）」
+    才重连。普通 600ms 应答超时可能只是 STM32 正在跑斜坡，乱重连会把命令打断。
+    """
+    global _HOST
+    if _MODE != "serial":
+        return False                      # WiFi 通道没有「节点重建」这回事
+    if _HOST is not None:
+        if not getattr(_HOST, "_dead_reason", ""):
+            return False
+        try:
+            _HOST.close()
+        except Exception:
+            pass
+        _HOST = None
+    port = detect_serial_port()
+    if not port:
+        return False
+    try:
+        _HOST = SerialHost(port)
+    except Exception as e:
+        _HOST_STATE.update(connected=False, error=str(e))
+        return False
+    _HOST_STATE.update(connected=True, port=port, error="")
+    return True
+
 
 # 视频链路的全局配置（与串口链路完全隔离，改这些不会影响控制）
 _CAM = None               # 本地摄像头推流器（仅 --camera 时创建）
@@ -1580,7 +1744,15 @@ def api_open():
             _HOST_STATE.update(connected=False, error=str(e))
             return jsonify(ok=False, error=str(e))
     data = request.get_json(force=True, silent=True) or {}
-    port = data.get("port") or _HOST_STATE["port"]
+    port = (data.get("port") or "").strip()
+    # 不传 port（或传 "auto"）= 让服务自己找：优先 by-id 稳定别名，其次 1a86:7523。
+    # 为什么不沿用 _HOST_STATE 里的旧端口名：编号一变（ttyUSB0<->1）那个名字就废了，
+    # 沿用只会得到「无法打开串口」这种看不出真因的错误。
+    if port in ("", SERIAL_AUTO):
+        port = detect_serial_port() or _HOST_STATE["port"]
+    if not port:
+        _HOST_STATE.update(connected=False, error="没有找到任何串口")
+        return jsonify(ok=False, error="没有找到任何串口：先确认 CH341 已插入（ls /dev/ttyUSB*）")
     try:
         _HOST = SerialHost(port)
     except Exception as e:
@@ -1623,15 +1795,28 @@ def api_cmd():
     if not payload:
         return jsonify(ok=False, error="空命令")
     if _HOST is None:
-        return jsonify(ok=False, error="未连接")
-    try:
+        auto_reconnect()                  # 没连就先自动连一次（端口自动探测，无需端口名）
+    if _HOST is None:
+        return jsonify(ok=False, error="未连接：没找到串口（先确认 CH341 已插入）")
+    is_move = payload.upper().startswith("MOVE")
+
+    def _send_once():
         # MOVE 下位机不回应答，走 fire 只写不等待，保证拖动实时跟手
-        if payload.upper().startswith("MOVE"):
+        if is_move:
             _HOST.fire(payload)
-            return jsonify(ok=True, resp="")
-        resp = _HOST.cmd(payload)
-        return jsonify(ok=True, resp=resp)
+            return ""
+        return _HOST.cmd(payload)
+
+    try:
+        return jsonify(ok=True, resp=_send_once())
     except Exception as e:
+        # 链路已被判失效（CH341 重新枚举、ttyUSB 编号互换）时，自动重连一次再重发。
+        # 只有 _dead_reason 已置位才会真重连：普通 600ms 应答超时不会触发重发。
+        if auto_reconnect():
+            try:
+                return jsonify(ok=True, resp=_send_once(), reconnected=True)
+            except Exception as e2:
+                return jsonify(ok=False, error=str(e2))
         return jsonify(ok=False, error=str(e))
 
 
@@ -1639,11 +1824,18 @@ def api_cmd():
 def api_state():
     global _HOST
     if _HOST is None:
-        return jsonify(ok=False, error="未连接")
+        auto_reconnect()
+    if _HOST is None:
+        return jsonify(ok=False, error="未连接：没找到串口（先确认 CH341 已插入）")
     try:
         resp = _HOST.cmd("STATE")
     except Exception as e:
-        return jsonify(ok=False, error=str(e))
+        if not auto_reconnect():
+            return jsonify(ok=False, error=str(e))
+        try:
+            resp = _HOST.cmd("STATE")
+        except Exception as e2:
+            return jsonify(ok=False, error=str(e2))
     parts = resp.split(",")
     # 必须显式校验长度：parts 不足 9 段时 Python 切片的 out-of-range 不会抛异常，
     # 只会悄悄返回少于 6 路脉宽，页面拿到长度不对的数组就等于白问一次。
@@ -1751,16 +1943,51 @@ def api_ik_eye_solve():
         # 目标在视野外 / 视线与桌面平行 / 深度离谱，都归成一句能看懂的话
         return jsonify(ok=False, error=str(e), pulses=pulses)
 
-    x, y, z = est["x"], est["y"], est["z"]
+    x_raw, y_raw, z = est["x"], est["y"], est["z"]
+
+    # ---- 径向系统偏差修正：把「算近的那 3cm」按比例补出去 ----
+    # 为什么放在这里、而不是改 handeye_geometry.localize：
+    #   localize 是标定链的一环（refk_samples / AX=XB 都用它），往里塞经验系数会
+    #   把 X 污染得不明不白；放在 API 出口，所有消费者（网页点选 / eye_check /
+    #   pick_pipeline）一起受益，而且随时能用 radial_fix=0 关掉对比。
+    # 只改半径不改方位角，理由见 _radial_fix_xy 的注释。
+    try:
+        _k = data.get("radial_fix")
+        _k = float(_k) if _k is not None else _EYE_RADIAL_K
+    except (TypeError, ValueError):
+        _k = _EYE_RADIAL_K
+    x, y = _radial_fix_xy(x_raw, y_raw, _k)
+    radial_shift = math.hypot(x, y) - math.hypot(x_raw, y_raw)
+
     # 用眼在手算出的 z 参与逆解，而不是 _IK_MAP["z"]：平面已由射线求交确定，
     # 再套一个手工高度会自相矛盾。
+    #
+    # tilt：夹爪前倾角。0=垂直向下；>0 时腕关节不必退到爪尖正上方 L3 处，
+    # 所以可达半径会明显变大（tilt=5° 约 +1.5cm，tilt=20° 约 +6cm）。
+    #
+    # 🔴 单一真相源（11-16 改）：默认**从当前真实脉宽反算**，不再用 _IK_MAP["tilt"]（恒 0）。
+    # 为什么：tilt 是「当前姿态的固有属性」，不是可自由挑的参数 —— 相机骑在腕上，
+    # 拍照那一刻的倾角决定相机位姿，抓取必须用同一个倾角。用常量 0 会在 C 姿态(41°) 下
+    # 让 r_w 少扣 L3·sin41°≈11cm，d 虚高十几厘米，把明明够得着的目标误判成
+    # 「超出可达范围」（11-16 实测：报 d=26.7，实际 d≈14.8）。
+    # 优先级：请求显式给 tilt > 从 pulses 反算 > （无 IK 时）不进来。
+    _tilt_req = data.get("tilt")
+    if _tilt_req is not None:
+        try:
+            tilt = float(_tilt_req)
+        except (TypeError, ValueError):
+            tilt = _IK.tilt_from_pulses(pulses)
+    else:
+        tilt = _IK.tilt_from_pulses(pulses)
     try:
         angles = _IK.solve(x, y, z=z, wrist=_IK_MAP["wrist"],
-                           claw=_IK_MAP["claw"], tilt=_IK_MAP["tilt"])
+                           claw=_IK_MAP["claw"], tilt=tilt)
         raw = _IK.to_pulses(angles)
     except Exception as e:
-        return jsonify(ok=False, error="逆解失败：%s" % e,
-                       x=round(x, 2), y=round(y, 2), z=round(z, 2))
+        return jsonify(ok=False, error="逆解失败：%s" % e, tilt=tilt,
+                       x=round(x, 2), y=round(y, 2), z=round(z, 2),
+                       x_raw=round(x_raw, 2), y_raw=round(y_raw, 2),
+                       radial_k=round(_k, 4), radial_shift=round(radial_shift, 2))
 
     out_pulses, clamped = [], []
     for i, p in enumerate(raw):
@@ -1775,6 +2002,9 @@ def api_ik_eye_solve():
         mode="eye_in_hand",
         pixel=[u, v],
         x=round(x, 2), y=round(y, 2), z=round(z, 2),
+        x_raw=round(x_raw, 2), y_raw=round(y_raw, 2),
+        radial_k=round(_k, 4), radial_shift=round(radial_shift, 2),
+        tilt=round(tilt, 2),
         depth=round(est["depth"], 2),
         pulses=out_pulses,
         clamped=clamped,
@@ -1787,6 +2017,9 @@ def api_ik_eye_solve():
 
     if not data.get("apply"):
         out["note"] = "仅试算，未下发任何串口命令"
+        if abs(_k - 1.0) > 1e-9:
+            out["note"] += ("；已做径向修正 ×%.3f（%.2f→%.2f cm）"
+                            % (_k, math.hypot(x_raw, y_raw), math.hypot(x, y)))
         if est["placeholder"]:
             out["note"] += "；⚠ 标定数据为占位值，坐标不代表真实精度"
         return jsonify(out)
@@ -1944,6 +2177,10 @@ def video_feed():
 
 
 def main():
+    # global 必须放在函数最前面：下面的 --radial-fix help 要读 _EYE_RADIAL_K 的当前值，
+    # 而「用到了才声明 global」在 Python 里是 SyntaxError（used prior to global declaration）。
+    global _MODE, _WIFI_ADDR, _CAM, _VIDEO_URL, _DETECTIONS_URL, _HOST, _EYE_RADIAL_K
+
     ap = argparse.ArgumentParser()
     ap.add_argument("serial", nargs="?", default=None, help="STM32 串口号，如 COM7")
     ap.add_argument("--baud", type=int, default=115200)
@@ -1970,9 +2207,13 @@ def main():
                     help="相机内参文件，默认 <ik-dir>/camera_intrinsics.json")
     ap.add_argument("--plane-z", type=float, default=None, metavar="CM",
                     help="抓取平面高度 cm；默认用 arm_params.json 的 grab_height")
+    ap.add_argument("--radial-fix", type=float, default=None, metavar="K",
+                    help="眼在手定位的径向修正系数：默认 %.3f（实测值）；给 1.0 关闭；"
+                         "换相机安装/重标手眼 X 后必须重测" % _EYE_RADIAL_K)
     args = ap.parse_args()
 
-    global _MODE, _WIFI_ADDR, _CAM, _VIDEO_URL, _DETECTIONS_URL, _HOST
+    if args.radial_fix is not None:
+        _EYE_RADIAL_K = float(args.radial_fix)
 
     if args.tcp_server is not None:
         _MODE = "wifi_server"
@@ -1998,10 +2239,24 @@ def main():
         chan_desc = "WiFi TCP %s" % _WIFI_ADDR
     else:
         _MODE = "serial"
-        port = args.serial or "COM7"
+        # 串口号：命令行给了就用；没给（或写 auto）就自动探测，优先 by-id 稳定别名。
+        port = args.serial
+        if not port or port == SERIAL_AUTO:
+            port = detect_serial_port() or "COM7"
         _HOST_STATE["port"] = port
         _HOST_STATE["baud"] = args.baud
         chan_desc = "串口 %s @ %d baud" % (port, args.baud)
+        # 启动即连接。以前这里只记下端口名字、并不真正 open，必须手工 POST /api/open，
+        # 忘了就一路「600ms 内未收到任何字节」，很容易被误判成硬件故障（实测踩过）。
+        try:
+            _HOST = SerialHost(port)
+            ping = _HOST.cmd("PING")
+            _HOST_STATE.update(connected=True, error="")
+            print("  [串口] 已连接 %s，PING -> %s" % (port, ping))
+        except Exception as e:
+            _HOST_STATE.update(connected=False, error=str(e))
+            print("  [警告] 启动时打开串口失败：%s" % e)
+            print("         可稍后在页面点「连接」，或 POST /api/open（不传 port 即自动探测）")
 
     # ---- 视频链路（和串口控制链路完全独立，怎么改都不影响 PING/MOVE/STATE）----
     # 优先级：外部 --video-url > 本地 --camera；都不给 = 页面显示占位卡。

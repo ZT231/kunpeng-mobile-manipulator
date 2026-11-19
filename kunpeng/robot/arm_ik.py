@@ -22,6 +22,39 @@ import os
 
 JOINTS = ["J1", "J2", "J3", "J4", "J5", "J6"]
 
+# ---------------------------------------------------------------------------
+# 末端重力偏置（2026-11-12 在 C 姿态实测，方位角 96°）
+#
+# 物理含义：**爪尖实际落点 = forward() 算出来的点 + TIP_BIAS**。
+#   e = (dx, dy, dz) = (+0.10, −0.95, −3.88) cm
+# 来源：开环舵机扛不住重力 —— C 姿态下 J2 少走 6.5°、J3 再少走 2.2°
+#   （实测依据：肘水平投影 12mm = 106·sin6.5°；爪尖离桌 2.0cm，
+#     FK 说应是 5.88cm）。末端于是被拽得「离底座近 0.95cm、低 3.88cm」。
+#
+# 用法：想让爪尖真打到 (x, y)，就让 IK 瞄 (x − dx, y − dy)。
+#   ↑ 只在**下达执行指令**的地方扣，例如 eye_check.py --hover。
+#
+# 🔴 三条硬约束，违反了会静默变准/变不准：
+#   ① **绝不能用在标定链路上**（refk_samples.py / handeye_calib.py / solve）。
+#      标定用的是 FK 与世界系的关系，X 里吸收的正是「未补偿的那版 sag」；
+#      在 FK 里偷偷加偏置会让 X 变成物理上错的矩阵。
+#   ② **只在 C 姿态这一族有效**：sag 是姿态相关的（实测 A→B 抬 J2 给 125%、
+#      B→C 反向给 25%），换个姿态这个数就变了，别外推。
+#   ③ **只补水平、不补 z**：tilt 固定时抬高指令 z 会让 J3/J4 一起大幅变动
+#      （−39/−51µs 起），e 又跟着失真。所以 z 只用来**提示净空**：
+#      实际爪尖高度 ≈ 指令 z + SAG_DZ。
+# ---------------------------------------------------------------------------
+TIP_BIAS_XY = (0.10, -0.95)   # cm，工作台系；J1 变化 ±15° 内影响 <2mm（偏置几乎纯径向）
+SAG_DZ = -3.88                # cm，仅用于净空提示，不做指令补偿
+
+# 上面这组数的「有效原点」：C 姿态、腕到 J1 轴水平距离 14.97cm 时测的。
+# 开环舵机的下垂 ∝ 力矩臂（≈ 腕到 J1 轴的水平距离），臂伸远/收近它都会变：
+#   C 姿态 r_w=14.97 ⇒ 3.88cm；外推到 r_w≈20.2（爪尖伸到 31cm）⇒ 约 5.2cm。
+# 所以这两个数只给 eye_check 做**风险提示**用：臂离原点远时，
+# 常数 SAG_DZ 算出的净空会偏乐观（实测 5.0−5.2 < 0，爪子已经压到台面）。
+BIAS_POSE_PULSES = (1636, 1470, 2177)   # C 姿态 J1/J2/J3 脉宽
+BIAS_ARM_R = 14.97                      # cm，C 姿态下腕到 J1 轴的水平距离
+
 
 def _interp(points, x):
     """points: [(x0,y0),...] 升序，线性插值，越界夹紧到两端。"""
@@ -168,10 +201,18 @@ class ArmIK:
         return pulses
 
     def to_angles(self, pulses):
-        """6 路脉宽(us) -> 6 关节角度(度)（to_pulses 的逆，标定/调试用）。
+        """6 路脉宽(us) -> 6 个「舵机相对角」(度)。标定 / FK / 调试用。
 
-        有 map 时按 [pulse, deg] 表反插值，无 map 时退回线性映射。
-        返回的角度与 to_pulses 输入同语义（J3=相对大臂，J4=相对小臂）。"""
+        ⚠️ **它不是 to_pulses 的逆**（11-16 订正，此处原文档写错）：
+          · 本函数返回的是**舵机相对角**：J3 相对大臂、J4 相对小臂
+            （舵机 0° 基准是相对前一级连杆，量角时前级处于标定零位）；
+          · `to_pulses` 的输入是 **solve() 的绝对角**，内部才做 J3/J4 的相对化换算。
+        ⇒ `to_pulses(to_angles(p)) != p`（J4 会明显错位）。
+        要真正做 to_pulses 的逆，用 `pulses_to_solve_angles()`。
+
+        下游现状（都是对的，勿改）：handeye_calib / handeye_geometry / eye_check
+        都把它当「相对角」用（直接喂 FK），没有谁误当绝对角。
+        """
         angles = []
         for name, p in zip(JOINTS, pulses):
             j = self.joints[name]
@@ -183,6 +224,78 @@ class ArmIK:
                 ratio = max(0.0, min(1.0, ratio))
                 angles.append(j["deg_min"] + ratio * (j["deg_max"] - j["deg_min"]))
         return angles
+
+    def pulses_to_solve_angles(self, pulses):
+        """6 路脉宽(us) -> solve() 输入语义的**绝对角**（这才是 to_pulses 的真逆）。
+
+        与 to_angles 的唯一区别：把 J3/J4 从「舵机相对角」还原成 solve() 要的绝对角，
+        因此满足 `to_pulses(pulses_to_solve_angles(p)) ≈ p`
+        （残差只来自 map 分段线性插值与脉宽取整，量级 ≤1µs）。
+
+        推导（把 to_pulses 的 J3/J4 换算反过来）：
+            J3:  deg_J3 = θ3_abs − θ2          ⇒ θ3_abs = deg_J3 + θ2
+            J4:  deg_J4 = −180 − θ3_abs + tilt ⇒ tilt   = deg_J4 + 180 + θ3_abs
+
+        用途：需要「脉宽 → 绝对角 → 再算回去」的场合（自检、离线复算、报告）。
+        需要「当前夹爪前倾角」时直接用 `tilt_from_pulses()`，它就是这个的第 4 项。
+        """
+        a = self.to_angles(pulses)
+        th2, th3_rel, th4_rel = a[1], a[2], a[3]
+        th3_abs = th3_rel + th2
+        tilt = th4_rel + 180.0 + th3_abs
+        return [a[0], th2, th3_abs, tilt, a[4], a[5]]
+
+    def j1_pulse_for_xy(self, x, y, az_bias_deg=0.0):
+        """工作台坐标 (x, y) → (J1 脉宽, J1 角度, 方位角)。
+
+        🔴 为什么 J1 能单独算：工作台原点就在 J1 轴心上，J1 只跟**方位角**
+        `atan2(y, x)` 有关，与臂伸多远、倾角多少、够不够得到都无关。
+        所以「视觉定 J1 + 示教定 J2~J5」这条路里，J1 不需要 solve() 成功
+        就能给出——而 solve() 恰恰常因为 J2~J4 越界失败，那跟 J1 无关。
+
+        方位角约定：x=横向、y=J1 正前方（+y 即 90°），J1 角度 = 方位角 − 90°。
+        实测校验：示教工位 (−5.26, 25.0) → 1691（与 IK 的 J1 一致）；
+                 (−4.19, 23.65) → 1674（IK 给 1673，差 1µs）。
+
+        az_bias_deg：方位角补偿（度）。视觉方位角有一个**已知的固定偏小**
+        （MEMORY 记 −2.7°；11-16 20:0x 用尺子复测为 −2.98°，两次吻合）。
+        这个偏差只影响 J1，与距离无关，所以放在这里做一次性补偿；
+        ⚠️ 默认 0，**不静默改**——要用就显式传（pick_pipeline 的 --az-bias）。
+        """
+        if abs(x) < 1e-9 and abs(y) < 1e-9:
+            raise ValueError("目标在 J1 轴心正上方，方位角无定义")
+        az = math.degrees(math.atan2(y, x)) + float(az_bias_deg)
+        deg = az - 90.0
+        j = self.joints["J1"]
+        if "map" in j:
+            pulse = _interp(_map_deg_to_pulse(j), deg)
+        else:
+            ratio = (deg - j["deg_min"]) / (j["deg_max"] - j["deg_min"])
+            ratio = max(0.0, min(1.0, ratio))
+            pulse = j["pulse_min"] + ratio * (j["pulse_max"] - j["pulse_min"])
+        return int(round(pulse)), deg, az
+
+    def tilt_from_pulses(self, pulses):
+        """从当前六路脉宽反算夹爪前倾角 tilt(度)。
+
+        为什么需要这个方法（而不是让人手工传一个常量）：
+          tilt 是「当前姿态的固有属性」，不是可以自由挑的参数。眼在手相机骑在腕上，
+          拍照那一刻的 tilt 决定了相机位姿；抓取时必须用同一个 tilt，否则爪尖朝向
+          变了、落点会偏。把它写成 _IK_MAP 里的手工常量（默认 0），在 C 姿态
+          (tilt=41°) 下会让 solve 里的 r_w 少扣 L3·sin(41°)≈11cm，d 虚高十几厘米，
+          于是把「明明够得着」的目标判成「超出可达范围」。
+
+        推导（to_pulses 的逆，注意语义）：
+          to_pulses 对 J4 映射的是 deg_J4 = -180 - θ3_abs + tilt，
+          而 to_angles 返回的 J3/J4 是**相对角**（相对前一级连杆）：
+              a[2] = θ3_abs - θ2  ⇒  θ3_abs = a[2] + a[1]
+          ⇒ tilt = a[3] + 180 + θ3_abs = a[3] + 180 + a[2] + a[1]
+
+        实测校验：C 姿态 [1636,1470,2177,1106,1450,1567] ⇒ 41.00°（与 eye_check
+        打印的「前倾 41°」、J4=1106 一致）。
+        """
+        # 复用 pulses_to_solve_angles，公式只写一处，避免两处实现日后漂移
+        return self.pulses_to_solve_angles(pulses)[3]
 
 
 if __name__ == "__main__":

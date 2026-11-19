@@ -74,6 +74,7 @@
 """
 
 import argparse
+import base64
 import json
 import threading
 import time
@@ -369,6 +370,25 @@ class Detector:
         with self._lock:
             return self._jpeg_frame_id, self._jpeg
 
+    def get_observe(self):
+        """线程安全地取「一帧画面 + 与它同一帧的检测结果」，供 VLM 决策层用。
+
+        大白话：把「照片」和「照片上框出来的物体列表」一次打包拿出去，
+                保证两者是同一瞬间的、不会张冠李戴。
+
+        规范定义：在**同一把锁的同一个临界区**内读取 `_jpeg` 与 `_latest`，
+        保证观测（observation）的原子性。
+
+        🔴 为什么不分别调 get_jpeg() 和 get_latest()：
+           两次调用之间工作线程可能已经换帧 ⇒ 模型看到的是第 N 帧的画面，
+           拿到的却是第 N+1 帧的 bbox。VLM 按编号选完，我们用那个 bbox 去
+           算 3D 坐标，就会**抓到旧位置上**（典型竞态条件）。
+           这个 bug 不会报错、只会偶尔抓偏，是最难查的那类。
+        """
+        with self._lock:
+            latest = dict(self._latest)          # 浅拷贝：别再被工作线程改到
+            return latest, self._jpeg
+
     def stop(self):
         """发停止信号并等待线程结束。"""
         self._running.clear()
@@ -402,6 +422,18 @@ def make_handler(detector):
         def do_GET(self):
             if self.path.startswith("/detections"):
                 self._send_json(detector.get_latest())
+            elif self.path.startswith("/observe"):
+                # 给 VLM 决策层用的「一次拿全」接口：画面 + 同帧检测结果。
+                # 为什么不让调用方分别取 /video 和 /detections：
+                # 两帧对不上会让模型选了编号、我们却拿旧 bbox 去算坐标（见 get_observe 注释）。
+                # 为什么用 base64 塞进 JSON 而不是返回二进制：
+                # 决策层的 HTTP 客户端只需要处理一种响应格式，且帧号与图像天然同步。
+                latest, jpg = detector.get_observe()
+                out = dict(latest)
+                out["image_b64"] = (base64.b64encode(jpg).decode("ascii")
+                                    if jpg else None)
+                out["image_fmt"] = "jpeg" if jpg else None
+                self._send_json(out)
             elif self.path == "/health":
                 self._send_json({"status": "ok", "frame_id": detector.get_latest()["frame_id"]})
             elif self.path == "/video":
