@@ -1,4 +1,4 @@
-#include "uart_protocol.h"
+﻿#include "uart_protocol.h"
 #include "arm_control.h"
 #include "teach.h"
 #include "acs712.h"
@@ -28,7 +28,8 @@ extern osMutexId_t arm_lock;
  * 响应格式：
  *   $OK[,<数据>]*XX\r\n
  *   $ERR,<code>*XX\r\n
- *     错误码：2=校验失败 3=格式/参数错误 4=当前状态禁止
+ *     错误码（阶段 2 定版，与底盘 car_frame.c 统一）：
+ *       1=帧/校验错误  2=未知命令  3=参数错误  4=状态禁止  5=设备故障(FAULT)
  */
 
 #define PROTO_BUF_SIZE   64U
@@ -278,6 +279,18 @@ static int parse_uint(const char **pp, uint32_t *val)
 
 /* ---------- 命令处理 ---------- */
 
+/*
+ * 冻结态（急停/故障）对应的错误码。
+ * 大白话：机器不许动有两种情况——按了暂停（急停）和坏了（故障），
+ *         回不同的码，上位机才知道该发 RESUME 还是 CLEARFAULT。
+ * 规范：阶段 2 表 10b 定版——ERR,4=状态禁止(ESTOP)、ERR,5=设备故障(FAULT)。
+ * 非冻结态返回 NULL；调用方只在冻结态下调用本函数。
+ */
+static const char *frozen_err_code(void)
+{
+    return (Arm_GetState() == ARM_STATE_FAULT) ? "ERR,5" : "ERR,4";
+}
+
 static void cmd_ping(void)
 {
     proto_send_frame("OK,PONG");
@@ -287,22 +300,32 @@ static void cmd_state(void)
 {
     char payload[PROTO_TX_SIZE];
     char state_ch;
-
     switch (Arm_GetState())
     {
         case ARM_STATE_MANUAL:   state_ch = 'M'; break;
         case ARM_STATE_CMD:      state_ch = 'C'; break;
         case ARM_STATE_RECORD:   state_ch = 'R'; break;
         case ARM_STATE_PLAYBACK: state_ch = 'P'; break;
-        default:                 state_ch = 'E'; break; /* ESTOP */
+        case ARM_STATE_ESTOP:    state_ch = 'E'; break;
+        case ARM_STATE_FAULT:    state_ch = 'F'; break;
+        default:                 state_ch = 'E'; break;
     }
 
+    /*
+     * STATE 响应格式（阶段 1 追加 fault 字段）：
+     *   OK,S,<state>,<p0>,<p1>,<p2>,<p3>,<p4>,<p5>,<fault>
+     * fault 是末尾追加的故障码（0 = 无故障）。
+     * 🔴 为什么追加到末尾而不是插进中间：上位机 arm_host.py / web_control.py
+     *   都是按 parts[2] 取状态、parts[3:9] 取 6 路脉宽（精确切片）。追加到末尾
+     *   不改变既有字段位置，老解析器完全不受影响——协议演进向后兼容。
+     */
     (void)snprintf(payload, sizeof(payload),
-                   "OK,S,%c,%u,%u,%u,%u,%u,%u",
+                   "OK,S,%c,%u,%u,%u,%u,%u,%u,%u",
                    state_ch,
                    (unsigned)Arm_GetCurrent(0), (unsigned)Arm_GetCurrent(1),
                    (unsigned)Arm_GetCurrent(2), (unsigned)Arm_GetCurrent(3),
-                   (unsigned)Arm_GetCurrent(4), (unsigned)Arm_GetCurrent(5));
+                   (unsigned)Arm_GetCurrent(4), (unsigned)Arm_GetCurrent(5),
+                   (unsigned)Arm_GetFault());
     proto_send_frame(payload);
 }
 
@@ -326,7 +349,7 @@ static void cmd_move(const char *arg)
     }
     else
     {
-        proto_send_frame("ERR,4"); /* 急停等状态禁止 */
+        proto_send_frame(frozen_err_code()); /* 冻结态：ESTOP→4 / FAULT→5 */
     }
 }
 
@@ -352,13 +375,13 @@ static void cmd_joint(const char *arg)
     }
     else
     {
-        proto_send_frame("ERR,4");
+        proto_send_frame(frozen_err_code()); /* 冻结态：ESTOP→4 / FAULT→5 */
     }
 }
 
 static void cmd_rec(void)
 {
-    if (Arm_GetState() == ARM_STATE_ESTOP) { proto_send_frame("ERR,4"); return; }
+    if (Arm_IsFrozen()) { proto_send_frame(frozen_err_code()); return; }
     Teach_StartRecord();
     proto_send_frame("OK");
 }
@@ -367,7 +390,7 @@ static void cmd_recend(void)
 {
     char payload[PROTO_TX_SIZE];
 
-    if (Arm_GetState() == ARM_STATE_ESTOP) { proto_send_frame("ERR,4"); return; }
+    if (Arm_IsFrozen()) { proto_send_frame(frozen_err_code()); return; }
     Teach_StopRecord();
     (void)snprintf(payload, sizeof(payload), "OK,%u", (unsigned)Teach_GetPointCount());
     proto_send_frame(payload);
@@ -375,7 +398,7 @@ static void cmd_recend(void)
 
 static void cmd_play(void)
 {
-    if (Arm_GetState() == ARM_STATE_ESTOP) { proto_send_frame("ERR,4"); return; }
+    if (Arm_IsFrozen()) { proto_send_frame(frozen_err_code()); return; }
     if (Teach_GetPointCount() == 0U) { proto_send_frame("ERR,3"); return; } /* 无轨迹 */
     Teach_StartPlayback();
     proto_send_frame("OK");
@@ -468,6 +491,30 @@ static void cmd_curz(void)
     proto_send_frame(buf);
 }
 
+/**
+  * @brief  $FAULT —— 查询当前故障码。
+  * @note   回 $FAULT,<code>*CK（code=0 无故障，>0 为故障原因）。
+  *         和 STATE 里末尾那个 fault 字段是同一个值，这里给一条独立命令，
+  *         方便上位机在 FAULT 态下（STATE 已冻结、仍需查原因）单独问。
+  */
+static void cmd_fault(void)
+{
+    char buf[16];
+    (void)snprintf(buf, sizeof(buf), "FAULT,%u", (unsigned)Arm_GetFault());
+    proto_send_frame(buf);
+}
+
+/**
+  * @brief  $CLEARFAULT —— 清除故障锁存，回 HOME 保持。
+  * @note   仅 FAULT 态生效，回 $OK；非 FAULT 态也回 $OK（幂等，多调无害）。
+  *         与 $RESUME 严格区分：故障必须显式清除，不能拿解急停混过去。
+  */
+static void cmd_clearfault(void)
+{
+    Arm_ClearFault();
+    proto_send_frame("OK");
+}
+
 /* 分发：frame_buf 中为去除 '$' 的完整命令串（"*" 已被截断为 '\0'） */
 static void proto_dispatch(void)
 {
@@ -490,7 +537,7 @@ static void proto_dispatch(void)
     }
     else if (strcmp(cmd, "HOME") == 0)
     {
-        if (Arm_GetState() == ARM_STATE_ESTOP) { proto_send_frame("ERR,4"); return; }
+        if (Arm_IsFrozen()) { proto_send_frame(frozen_err_code()); return; }
         Arm_CommandHome();
         proto_send_frame("OK");
     }
@@ -501,12 +548,15 @@ static void proto_dispatch(void)
     }
     else if (strcmp(cmd, "RESUME") == 0)
     {
+        /* FAULT 态不能用 RESUME 解除，必须走 CLEARFAULT，回 ERR,5（设备故障）。
+         * 否则会「回 OK 但实际不动作」——静默失效，上位机会误以为已恢复。 */
+        if (Arm_GetState() == ARM_STATE_FAULT) { proto_send_frame("ERR,5"); return; }
         Arm_CommandResume();
         proto_send_frame("OK");
     }
     else if (strcmp(cmd, "MANUAL") == 0)
     {
-        if (Arm_GetState() == ARM_STATE_ESTOP) { proto_send_frame("ERR,4"); return; }
+        if (Arm_IsFrozen()) { proto_send_frame(frozen_err_code()); return; }
         Arm_CommandManual();
         proto_send_frame("OK");
     }
@@ -525,6 +575,14 @@ static void proto_dispatch(void)
     else if (strcmp(cmd, "CURZ") == 0)
     {
         cmd_curz();
+    }
+    else if (strcmp(cmd, "FAULT") == 0)
+    {
+        cmd_fault();
+    }
+    else if (strcmp(cmd, "CLEARFAULT") == 0)
+    {
+        cmd_clearfault();
     }
     else if (strcmp(cmd, "REC") == 0)
     {
@@ -552,7 +610,7 @@ static void proto_dispatch(void)
     }
     else
     {
-        proto_send_frame("ERR,1"); /* 未知命令 */
+        proto_send_frame("ERR,2"); /* 未知命令（阶段2定版：2=未知命令） */
     }
 }
 
@@ -590,7 +648,7 @@ static void proto_parse_frame(void)
 
     if (rx_ck != calc_ck)
     {
-        proto_send_frame("ERR,2");
+        proto_send_frame("ERR,1"); /* 阶段2定版：1=帧/校验错误 */
         return;
     }
 

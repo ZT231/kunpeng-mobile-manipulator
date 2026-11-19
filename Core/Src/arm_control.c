@@ -1,4 +1,4 @@
-#include "arm_control.h"
+﻿#include "arm_control.h"
 #include "pca9685.h"
 #include "i2c.h"
 
@@ -32,6 +32,27 @@ static uint16_t home_pulse[ARM_CHANNEL_COUNT];
 
 /* 当前状态机状态，上电/复位后停在 HOME 保持（指令态），电位器不接管 */
 static Arm_State_t arm_state = ARM_STATE_CMD;
+
+/* 故障码锁存（新增）。0 = 无故障。
+ * 与 arm_state == ARM_STATE_FAULT 配套：进 FAULT 时写入原因码，
+ * CLEARFAULT 时清零。为什么独立存一份而不是复用状态机：
+ * 状态机只回答「现在停不停」，故障码回答「为什么停」——查询 $FAULT 时
+ * 需要后者，而状态机那 6 个枚举里塞不下多种故障原因。 */
+static uint8_t fault_code = 0U;
+
+/*
+ * 判断当前是否处于「冻结输出」状态（急停 或 故障）。
+ *
+ * 为什么单独抽成一个函数而不是各处写两遍 == 判断：
+ * 急停和故障在「不许动」这件事上行为完全一致（都冻结 PWM），
+ * 区别只在「能不能被 RESUME 解除」。若在 Arm_Update / SetTarget / 各 Command
+ * 里各自写 `== ESTOP || == FAULT`，将来再加一个冻结态就得改 N 处，
+ * 漏一处就是「急停不住」的安全漏洞。收敛成这一个函数，冻结态只在这里定义。
+ */
+static uint8_t state_is_frozen(void)
+{
+    return (arm_state == ARM_STATE_ESTOP || arm_state == ARM_STATE_FAULT) ? 1U : 0U;
+}
 
 /* ================== 平滑过渡参数（只改"怎么走"，不改"走到哪"）==================
  *
@@ -169,8 +190,8 @@ void Arm_Update(void)
 {
     uint8_t i;
 
-    /* 急停：冻结，不更新输出 */
-    if (arm_state == ARM_STATE_ESTOP) return;
+    /* 急停/故障：冻结，不更新输出 */
+    if (state_is_frozen()) return;
 
     for (i = 0U; i < ARM_CHANNEL_COUNT; i++)
     {
@@ -208,7 +229,7 @@ void Arm_Update(void)
 uint8_t Arm_SetJointTarget(uint8_t ch, uint16_t pulse_us)
 {
     if (ch >= ARM_CHANNEL_COUNT) return 0U;
-    if (arm_state == ARM_STATE_ESTOP) return 0U;
+    if (state_is_frozen()) return 0U;
 
     target_pulse[ch] = clamp_pulse(ch, pulse_us);
     arm_state = ARM_STATE_CMD;
@@ -220,7 +241,7 @@ uint8_t Arm_SetAllTargets(const uint16_t pulse6[ARM_CHANNEL_COUNT])
     uint8_t i;
 
     if (pulse6 == NULL) return 0U;
-    if (arm_state == ARM_STATE_ESTOP) return 0U;
+    if (state_is_frozen()) return 0U;
 
     for (i = 0U; i < ARM_CHANNEL_COUNT; i++)
     {
@@ -234,7 +255,7 @@ void Arm_CommandHome(void)
 {
     uint8_t i;
 
-    if (arm_state == ARM_STATE_ESTOP) return;
+    if (state_is_frozen()) return;
 
     for (i = 0U; i < ARM_CHANNEL_COUNT; i++)
     {
@@ -245,6 +266,10 @@ void Arm_CommandHome(void)
 
 void Arm_CommandStop(void)
 {
+    /* 故障锁存态下，急停命令不再覆盖 FAULT：故障必须显式 CLEARFAULT 解除。
+     * 否则 STOP 会把 arm_state 冲成 ESTOP、fault_code 却残留着，之后 RESUME
+     * 解除急停后 STATE 末尾 fault 字段仍非 0，上位机会误判「还有故障」。 */
+    if (arm_state == ARM_STATE_FAULT) return;
     arm_state = ARM_STATE_ESTOP;
 }
 
@@ -266,20 +291,20 @@ void Arm_CommandResume(void)
 
 void Arm_CommandManual(void)
 {
-    /* 急停态禁止切手动：仅 RESUME 可解除急停，防止急停瞬间被电位器接管乱动 */
-    if (arm_state == ARM_STATE_ESTOP) return;
+    /* 急停/故障态禁止切手动：仅 RESUME/CLEARFAULT 可解除，防止异常瞬间被电位器接管乱动 */
+    if (state_is_frozen()) return;
     arm_state = ARM_STATE_MANUAL;
 }
 
 void Arm_CommandRecord(void)
 {
-    if (arm_state == ARM_STATE_ESTOP) return;
+    if (state_is_frozen()) return;
     arm_state = ARM_STATE_RECORD;
 }
 
 void Arm_CommandPlay(void)
 {
-    if (arm_state == ARM_STATE_ESTOP) return;
+    if (state_is_frozen()) return;
     arm_state = ARM_STATE_PLAYBACK;
 }
 
@@ -299,6 +324,49 @@ void Arm_SetPlaybackTargets(const uint16_t pulse6[ARM_CHANNEL_COUNT])
 Arm_State_t Arm_GetState(void)
 {
     return arm_state;
+}
+
+uint8_t Arm_IsFrozen(void)
+{
+    return state_is_frozen();
+}
+
+/*
+ * 报告故障：记录故障码并进入 FAULT 态（冻结输出）。
+ * 被 safety 模块的过流检测、以及将来可能的其它硬件异常调用。
+ * 为什么这里直接改状态而不走锁：调用方（SafetyTask）与 ServoTask/ProtocolTask
+ * 通过 arm_lock 互斥，本函数被调用时已经持锁，故内部不再重复加锁。
+ */
+void Arm_ReportFault(uint8_t code)
+{
+    fault_code = code;
+    arm_state = ARM_STATE_FAULT;
+}
+
+/*
+ * 清除故障：从 FAULT 态恢复，清故障码并回 HOME 保持（指令态）。
+ * 仅 FAULT 态生效；其它状态调用是空操作（幂等，多调无害）。
+ * 对应协议层的 $CLEARFAULT 命令 —— 与 $RESUME 解急停严格分开：
+ * 故障必须显式清除，不能用解急停混过去。
+ */
+void Arm_ClearFault(void)
+{
+    uint8_t i;
+
+    if (arm_state != ARM_STATE_FAULT) return;
+
+    fault_code = 0U;
+    for (i = 0U; i < ARM_CHANNEL_COUNT; i++)
+    {
+        target_pulse[i] = home_pulse[i];
+    }
+    arm_state = ARM_STATE_CMD;
+}
+
+/* 查询故障码（0 = 无故障）。协议层 $FAULT 命令用它回故障原因。 */
+uint8_t Arm_GetFault(void)
+{
+    return fault_code;
 }
 
 uint16_t Arm_GetCurrent(uint8_t ch)

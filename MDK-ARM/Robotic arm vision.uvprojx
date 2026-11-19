@@ -444,6 +444,11 @@
               <FilePath>..\Core\Src\uart_protocol.c</FilePath>
             </File>
             <File>
+              <FileName>safety.c</FileName>
+              <FileType>1</FileType>
+              <FilePath>..\Core\Src\safety.c</FilePath>
+            </File>
+            <File>
               <FileName>bt.c</FileName>
               <FileType>1</FileType>
               <FilePath>..\Core\Src\bt.c</FilePath>

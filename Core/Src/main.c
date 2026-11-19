@@ -1,4 +1,4 @@
-/* USER CODE BEGIN Header */
+﻿/* USER CODE BEGIN Header */
 /**
   ******************************************************************************
   * @file           : main.c
@@ -140,7 +140,7 @@ int main(void)
   Teach_Init();
 
   printf("Robot arm ready. Hold HOME (idle, wait CMD).\r\n");
-  printf("Protocol: $CMD*ck\\r\\n (PING/STATE/HOME/STOP/RESUME/MANUAL/MOVE/JOINT/REC/RECEND/PLAY/TNUM/CLEAR)\r\n");
+  printf("Protocol: $CMD*ck\\r\\n (PING/STATE/HOME/STOP/RESUME/MANUAL/MOVE/JOINT/REC/RECEND/PLAY/TNUM/CLEAR/FAULT/CLEARFAULT)\r\n");
 
   /* 注：此后交由 FreeRTOS 调度器接管。
    * 原 20ms 舵机任务 / 5ms 协议任务 / 3000ms 打印任务 见 freertos.c。 */

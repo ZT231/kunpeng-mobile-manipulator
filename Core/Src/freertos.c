@@ -1,4 +1,4 @@
-/* USER CODE BEGIN Header */
+﻿/* USER CODE BEGIN Header */
 /**
   ******************************************************************************
   * File Name          : freertos.c
@@ -33,6 +33,7 @@
 #include "wifi.h"
 #include "teach.h"
 #include "rfid.h"
+#include "safety.h"
 #include <stdio.h>
 #include <string.h>
 
@@ -108,6 +109,17 @@ const osThreadAttr_t PrintTask_attributes = {
   .stack_size = 512 * 4,
   .priority = (osPriority_t) osPriorityLow,
 };
+
+/* 安全监控任务（阶段 1 新增）：独立低优先级任务，每 200ms 调 Safety_Tick。
+ * 为什么要独立、且优先级最低：Safety_Tick 里的 ACS712_Read_mA 会阻塞约 20ms
+ * （跨 PWM 周期采样），塞进 ServoTask 会把舵机刷新拖慢一倍。单独放最低优先级，
+ * 20ms 阻塞对其它任务零影响；过流检测延迟最多 200ms，对堵转保护绰绰有余。 */
+osThreadId_t SafetyTaskHandle;
+const osThreadAttr_t SafetyTask_attributes = {
+  .name = "SafetyTask",
+  .stack_size = 512 * 4,
+  .priority = (osPriority_t) osPriorityLow,
+};
 /* USER CODE END Variables */
 
 /* Private function prototypes -----------------------------------------------*/
@@ -115,6 +127,7 @@ const osThreadAttr_t PrintTask_attributes = {
 void StartServoTask(void *argument);
 void StartProtocolTask(void *argument);
 void StartPrintTask(void *argument);
+void StartSafetyTask(void *argument);
 /* USER CODE END FunctionPrototypes */
 
 void MX_FREERTOS_Init(void); /* (MISRA C 2004 rule 8.1) */
@@ -153,6 +166,7 @@ void MX_FREERTOS_Init(void) {
   ServoTaskHandle   = osThreadNew(StartServoTask,   NULL, &ServoTask_attributes);
   ProtocolTaskHandle = osThreadNew(StartProtocolTask, NULL, &ProtocolTask_attributes);
   PrintTaskHandle   = osThreadNew(StartPrintTask,   NULL, &PrintTask_attributes);
+  SafetyTaskHandle  = osThreadNew(StartSafetyTask,  NULL, &SafetyTask_attributes);
   /* USER CODE END RTOS_THREADS */
 
   /* USER CODE BEGIN RTOS_EVENTS */
@@ -352,6 +366,21 @@ void StartPrintTask(void *argument)
       printf("STATE %u | PULSE %u %u %u %u %u %u\r\n", st, p0, p1, p2, p3, p4, p5);
       osMutexRelease(print_lock);
     }
+  }
+}
+
+/**
+  * @brief  安全监控任务（阶段 1 新增）：每 200ms 调一次 Safety_Tick。
+  *         检测 ACS712 过流，持续超阈值则触发 Arm_ReportFault 进 FAULT 态。
+  *         优先级最低——Safety_Tick 内采样会阻塞约 20ms，不影响舵机/协议任务。
+  * @param  argument: Not used
+  */
+void StartSafetyTask(void *argument)
+{
+  for(;;)
+  {
+    Safety_Tick();
+    osDelay(200);
   }
 }
 
