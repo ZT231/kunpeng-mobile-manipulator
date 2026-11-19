@@ -19,6 +19,7 @@
 /* Private includes ----------------------------------------------------------*/
 /* USER CODE BEGIN Includes */
 #include "pca9685.h"
+#include "acs712.h"
 #include "potentiometer.h"
 #include "arm_control.h"
 #include "uart_protocol.h"
@@ -104,6 +105,18 @@ int main(void)
 
   /* 控制核心：计算 HOME 位并上电输出安全位 */
   Arm_Init();
+
+  /* ACS712 电流传感器（J6 单路）：配置 ADC1 注入通道 PA6/IN6。
+     🔴 放在 Pot_Init() **之前**：此时 ADC 还没启动，改写注入序列绝对安全；
+        放之后虽然一般也能配，但那时 ADC 已由 HAL_ADC_Start_DMA 连续转换，
+        少一层不确定就少一个坑。
+     注入读取发生在 $CUR/$CURZ 命令里，那时 ADC 早已被 Pot_Init 使能，能正常触发。
+     零点不在这里标：Arm_Init() 刚把臂拉到 HOME，此刻电流还没回零，
+     标了会把「拉臂电流」当成零点。要用 $CURZ 命令在静止时手动标。 */
+  if (ACS712_Init() != HAL_OK)
+  {
+    printf("ACS712 init FAILED (check PA6 / ADC1 injected channel)\r\n");
+  }
 
   /* 电位器 DMA 采样启动并预热滑动窗口 */
   Pot_Init(&hadc1);

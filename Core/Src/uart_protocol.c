@@ -1,6 +1,7 @@
 #include "uart_protocol.h"
 #include "arm_control.h"
 #include "teach.h"
+#include "acs712.h"
 #include "cmsis_os.h"
 #include <string.h>
 #include <stdio.h>
@@ -413,6 +414,60 @@ static void cmd_log(const char *arg)
     proto_send_frame("OK");
 }
 
+/**
+  * @brief  $CUR —— 读 J6 夹爪舵机电流（单位 mA）。
+  * @note   回 $CUR,<mA>*CK。正值表示电流方向与 IP+ → IP- 一致。
+  *         这条就是「夹没夹住」的量化依据：空载约 100~300mA，
+  *         夹住物体后电流明显抬升，空夹到底最高（别久留，会堵转发热）。
+  */
+static void cmd_cur(void)
+{
+    char buf[32];
+    int32_t ma;
+    uint32_t mv;
+
+    ma = ACS712_Read_mA();
+    mv = ACS712_GetLast_mV();
+
+    /* 0 = 注入通道没配置成功（ACS712_Init 失败时留的标记）——
+       这种情况绝不能回 "CUR,0"，那会被当成「夹空了」。 */
+    if (mv == 0U)
+    {
+        proto_send_frame("CUR,NA");
+        return;
+    }
+
+    /* 到饱和阈值说明 ADC 已经封顶（>4.3A），这时候的 mA 没有意义。 */
+    if (mv >= ACS712_SATURATE_MV)
+    {
+        proto_send_frame("CUR,SAT");
+        return;
+    }
+
+    (void)snprintf(buf, sizeof(buf), "CUR,%ld", (long)ma);
+    proto_send_frame(buf);
+}
+
+/**
+  * @brief  $CURZ —— 把当前电流当零点（调用前舵机必须完全静止）。
+  * @note   回 $CURZ,<标零后立刻读到的mA>,Z<零点mV>*CK。
+  *         正常情况下 mA 应接近 0、零点应在 2400~2600 之间；
+  *         零点偏离这个范围说明接线或供电有问题（比如 VCC 没接 5V）。
+  *         为什么要手动标：ACS712 零点随温度/供电漂移，而且上电时
+  *         Arm_Init() 刚拉过臂，用那一刻的值当零点会整体偏低。
+  */
+static void cmd_curz(void)
+{
+    char buf[32];
+    int32_t ma;
+
+    ACS712_CalibrateZero();
+    ma = ACS712_Read_mA();
+    (void)snprintf(buf, sizeof(buf), "CURZ,%ld,Z%lu",
+                   (long)ma, (unsigned long)ACS712_GetZero_mV());
+    proto_send_frame(buf);
+}
+
 /* 分发：frame_buf 中为去除 '$' 的完整命令串（"*" 已被截断为 '\0'） */
 static void proto_dispatch(void)
 {
@@ -462,6 +517,14 @@ static void proto_dispatch(void)
     else if (strcmp(cmd, "JOINT") == 0)
     {
         cmd_joint(arg != NULL ? arg : "");
+    }
+    else if (strcmp(cmd, "CUR") == 0)
+    {
+        cmd_cur();
+    }
+    else if (strcmp(cmd, "CURZ") == 0)
+    {
+        cmd_curz();
     }
     else if (strcmp(cmd, "REC") == 0)
     {
@@ -763,5 +826,76 @@ void HAL_UART_RxCpltCallback(UART_HandleTypeDef *huart)
     if (HAL_UART_Receive_IT(huart, &rx_byte[idx], 1U) != HAL_OK)
     {
         rx_restart_pending[idx] = 1U;
+    }
+}
+
+/* ---------- HAL 回调：UART 错误（ORE 溢出 / NE 噪声 / FE 帧错 / PE 校验错） ----------
+ *
+ * 【为什么必须有这个函数】
+ * HAL 在 UART_IRQHandler 里一旦检测到 ORE（接收溢出），会走 "blocking error" 分支
+ * （stm32f4xx_hal_uart.c:2416-2421），先调 UART_EndRxTransfer()，而它会把
+ * CR1 的 RXNEIE|PEIE（:3373）和 CR3 的 EIE（:3374）三个中断位全部清掉，
+ * 再把 RxState 置为 READY（:3383）。随后 HAL 调用本回调 —— 而 HAL 自带的实现是
+ * __weak 空函数（:2679），什么都不做。
+ *
+ * 【不这么写会怎样】
+ * RXNE 中断被关掉后，HAL_UART_RxCpltCallback 再也不会被触发；
+ * 而本文件的重挂机制（UartProto_Process 里的 :652-661）依赖 rx_restart_pending，
+ * 这个标志只有在 RxCplt（:765）里才会置 1 —— 三条路同时断掉。
+ * 结果：USART1 永久收不到任何字节，但 CPU 照常跑、PWM 照常输出、TX 照常能发，
+ * 表现为「臂不动、没复位、PING 毫无回应」，只能断电重启才能恢复。
+ * 这是 STM32 HAL 的经典坑，现场表现为「莫名其妙就再也收不到命令了」。
+ *
+ * 【为什么必须先清 ORE 再重挂】
+ * HAL 只把 ORE 记进 ErrorCode（:2401），并不主动清硬件标志（唯一的例外是
+ * 「ORE 同时伴随 RXNE」时，:2410 的 UART_Receive_IT() 读 DR 会顺带把它清掉）。
+ * 若纯 ORE 场景下不清就重挂，下一次中断进来时 SR 里的 ORE 仍为 1，
+ * 会立刻再次判定 blocking、再关一次中断，变成「刚挂上就被关掉」的死循环。
+ *
+ * 【为什么只在 RxState==READY 时才重挂】
+ * 非 ORE 的轻度错误（NE/FE/PE）走 HAL 的 non-blocking 分支（:2464-2477），
+ * 中断位没被关、接收仍在进行（RxState 还是 BUSY_RX）。这时再调 Receive_IT
+ * 只会拿到 HAL_BUSY，虽然无害但没必要，判一下状态更干净。
+ */
+void HAL_UART_ErrorCallback(UART_HandleTypeDef *huart)
+{
+    uint8_t idx;
+
+    if (huart->Instance != USART1 && huart->Instance != USART2 &&
+        huart->Instance != USART3) return;
+
+    /* 找到这个串口在协议里的下标（拿对应的单字节接收缓冲 rx_byte[idx]） */
+    for (idx = 0U; idx < proto_uart_count; idx++)
+    {
+        if (proto_huarts[idx] == huart) break;
+    }
+    if (idx >= proto_uart_count) return;
+
+    /* 只有 ORE 需要清硬件标志。__HAL_UART_CLEAR_OREFLAG 的实现是「读 SR + 读 DR」，
+     * 读 DR 会把当前字节取走，所以不能无条件调用：
+     *   ① NE/FE/PE 时 DR 里可能是有效数据，乱读就丢字节；
+     *   ② 若本次 ORE 同时伴随 RXNE，HAL 已在 UART_Receive_IT()（:2410）里读过 DR，
+     *      硬件 ORE 位其实已被「读 SR + 读 DR」的时序清掉。这时再读一次 DR，
+     *      可能把刚到达的下一个字节吃掉。
+     * 所以先用 SR 判硬件位（只读 SR，不动 DR），真的还挂着才清。 */
+    if ((huart->ErrorCode & HAL_UART_ERROR_ORE) != 0U)
+    {
+        if (__HAL_UART_GET_FLAG(huart, UART_FLAG_ORE) != RESET)
+        {
+            __HAL_UART_CLEAR_OREFLAG(huart);
+        }
+    }
+    huart->ErrorCode = HAL_UART_ERROR_NONE;
+
+    /* blocking 错误已被 HAL 置回 READY ⇒ 说明中断被关了，重新挂上单字节接收。
+     * 说明：HAL_UART_Receive_IT() 内部只判 RxState==READY（hal_uart.c:1350），
+     * 不取 HAL 锁、也不和 TX 仲裁，不会因为 printf 正在发送就失败；
+     * 这里刚判过 READY，正常情况必然成功。保留 pending 兜底是防御未来改动。 */
+    if (huart->RxState == HAL_UART_STATE_READY)
+    {
+        if (HAL_UART_Receive_IT(huart, &rx_byte[idx], 1U) != HAL_OK)
+        {
+            rx_restart_pending[idx] = 1U;
+        }
     }
 }
