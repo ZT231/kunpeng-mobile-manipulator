@@ -57,7 +57,7 @@ static std::string runOneRound(MockSerialPort& port, FrameParser& parser, Comman
             port.write(bytes.data(), bytes.size());
             return out.payload();
         } else {
-            // 分发失败（未知命令）：转成 ERR,1（对应固件「未知命令」）
+            // 分发失败（未知命令）：转成 ERR,2（对应固件「未知命令」）
             Frame err = serial::makeError(serial::ErrorCode::UnknownCommand);
             std::string text = err.toString();
             std::vector<std::uint8_t> bytes(text.begin(), text.end());
@@ -100,16 +100,16 @@ static void test_move_valid_and_invalid() {
     CHECK(bad == "ERR,3");
 }
 
-static void test_unknown_command_returns_err1() {
+static void test_unknown_command_returns_err2() {
     MockSerialPort port;
     FrameParser parser;
     CommandDispatcher d;
     serial::registerFirmwareCommands(d);
     port.open();
 
-    // 未知命令：分派器返回 false，集成层转成 ERR,1（对应固件「未知命令」）
+    // 未知命令：分派器返回 false，集成层转成 ERR,2（对应固件「未知命令」）
     std::string resp = runOneRound(port, parser, d, Frame("FLY").toString());
-    CHECK(resp == "ERR,1");
+    CHECK(resp == "ERR,2");
 }
 
 static void test_glued_packets_all_answered() {
@@ -135,7 +135,7 @@ static void test_glued_packets_all_answered() {
 int main() {
     test_ping_roundtrip();
     test_move_valid_and_invalid();
-    test_unknown_command_returns_err1();
+    test_unknown_command_returns_err2();
     test_glued_packets_all_answered();
 
     std::cout << "passed = " << g_passed << ", failed = " << g_failed << "\n";

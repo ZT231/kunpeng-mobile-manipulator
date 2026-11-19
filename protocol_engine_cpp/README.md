@@ -109,11 +109,11 @@ build\test_frame.exe
 
 响应：   $OK[,<数据>]*XX\r\n
         $ERR,<code>*XX\r\n
-错误码： 1=未知命令  2=校验失败  3=格式/参数错误  4=当前状态禁止
+错误码： 1=帧/校验错误  2=未知命令  3=格式/参数错误  4=状态禁止  5=设备故障(FAULT)
 
 命令表：
   PING                      → OK,PONG
-  STATE                     → OK,S,<M|C|R|P|E>,<6 路脉宽>   状态：手动/命令/录制/回放/急停
+  STATE                     → OK,S,<M|C|R|P|E|F>,<6 路脉宽>,<fault>   状态：手动/命令/录制/回放/急停/故障 + 故障码
   MOVE,<ch>,<pulse>         → OK | ERR,3(ch/pulse 非法) | ERR,4(急停)
   JOINT,<6 路脉宽>          → OK | ERR,3 | ERR,4
   HOME / STOP / RESUME / MANUAL → OK | ERR,4

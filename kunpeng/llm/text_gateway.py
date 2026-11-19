@@ -95,7 +95,7 @@ def xor_checksum(payload):
       对的是**字节**；中文「抓」在 UTF-8 里是 3 个字节 E6 8A 93。
       如果 Python 写成 `for ch in text: ck ^= ord(ch)`，拿到的是
       Unicode 码点 0x6293（25235），早就超出 1 字节，算出来的 CK
-      和固件对不上，将来真接上 ESP32 会 100% 被判 ERR,2 校验失败。
+      和固件对不上，将来真接上 ESP32 会 100% 被判 ERR,1 校验失败。
       ⇒ 必须先 `.encode("utf-8")` 变成 bytes 再逐字节 XOR。
     规范定义：XOR 校验（longitudinal redundancy check 的最简形式）定义在
              字节序列上；跨语言对齐时须统一字符编码（此处 UTF-8）与字长（8 bit）。

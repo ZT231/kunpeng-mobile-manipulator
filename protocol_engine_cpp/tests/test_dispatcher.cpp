@@ -57,7 +57,7 @@ static void test_register_and_dispatch() {
     bool ok = d.dispatch(Frame("HELLO"), r);
     CHECK(ok && r.payload() == "OK,HI");   // 还是旧的 "OK,HI"，没被覆盖
 
-    // 未知命令 -> dispatch 返回 false（调用方负责回 ERR,1）
+    // 未知命令 -> dispatch 返回 false（调用方负责回 ERR,2）
     Frame dummy;
     CHECK(!d.dispatch(Frame("UNKNOWN"), dummy));
 
@@ -106,9 +106,13 @@ static void test_error_helper() {
     // makeError 生成的帧，其 payload 必须是精确的 "ERR,<code>"
     CHECK(serial::makeError(serial::ErrorCode::BadArgument).payload() == "ERR,3");
     CHECK(serial::makeError(serial::ErrorCode::StateForbidden).payload() == "ERR,4");
+    CHECK(serial::makeError(serial::ErrorCode::DeviceFault).payload() == "ERR,5");
+    // 阶段 2 定版：1=帧/校验错误、2=未知命令（与固件 uart_protocol.c 一致）
+    CHECK(serial::makeError(serial::ErrorCode::BadChecksum).payload() == "ERR,1");
+    CHECK(serial::makeError(serial::ErrorCode::UnknownCommand).payload() == "ERR,2");
     // 且能直接 to-string 成合法帧
     Frame e = serial::makeError(serial::ErrorCode::BadChecksum);
-    CHECK(e.toString().size() == 1 + 5 + 1 + 2 + 2);   // "$ERR,2*XX\r\n"
+    CHECK(e.toString().size() == 1 + 5 + 1 + 2 + 2);   // "$ERR,1*XX\r\n"
 }
 
 int main() {

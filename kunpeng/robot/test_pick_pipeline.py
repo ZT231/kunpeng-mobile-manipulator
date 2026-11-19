@@ -112,7 +112,7 @@ class FlaskHandler(BaseHTTPRequestHandler):
             #    （固件 proto_dispatch 用 strchr(cmd, ',')，空格会让整串当命令名）。
             parts = payload.split(",")
             if len(parts) != 7 or parts[0] != "JOINT":
-                self._json({"ok": True, "resp": "ERR,1"})
+                self._json({"ok": True, "resp": "ERR,2"})
             else:
                 # 模拟舵机立刻到位：把"当前脉宽"改成目标值。
                 # 🔴 真机有 1250 µs/s 的斜坡，这里不模拟延时，

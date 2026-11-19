@@ -139,11 +139,14 @@ static void test_frame_copy() {
 }
 
 static void test_error_code() {
-    CHECK(static_cast<int>(serial::ErrorCode::UnknownCommand) == 1);
-    CHECK(static_cast<int>(serial::ErrorCode::BadChecksum) == 2);
+    // 阶段 2 定版：1=帧/校验错误、2=未知命令（与固件 uart_protocol.c 一致）
+    CHECK(static_cast<int>(serial::ErrorCode::BadChecksum) == 1);
+    CHECK(static_cast<int>(serial::ErrorCode::UnknownCommand) == 2);
     CHECK(static_cast<int>(serial::ErrorCode::BadArgument) == 3);
     CHECK(static_cast<int>(serial::ErrorCode::StateForbidden) == 4);
+    CHECK(static_cast<int>(serial::ErrorCode::DeviceFault) == 5);
     CHECK(std::string(serial::toString(serial::ErrorCode::StateForbidden)) == "当前状态禁止该操作");
+    CHECK(std::string(serial::toString(serial::ErrorCode::DeviceFault)) == "设备故障(FAULT)");
 }
 
 int main() {

@@ -28,7 +28,7 @@
 | WakeNet | 「嘿 Siri」那种：一直听着、听到固定唤醒词才醒 | 乐鑫 ESP-SR 中的离线唤醒词模型（keyword spotting，本地神经网络推理），无需联网 |
 | XOR 校验帧 | 给每句话末尾加个「指纹」，收方重算一遍对不上就丢掉 | 项目统一串口帧 `$<CMD>[,<ARG>...]*<CK>\r\n`，CK = payload 各**字节**逐字节异或、2 位大写 HEX（真源 `Core/Src/uart_protocol.c`） |
 
-**⚠️ 跨语言坑（完整五段式见 `docs/排障记录-LLM.md` 第 2 条）**：XOR 定义在**字节序列**上，中文是 UTF-8 多字节。Python 侧必须先 `.encode("utf-8")` 再逐字节 XOR；若按 `ord(ch)` 逐字符算，与 C 固件 `(uint8_t)` 对不齐，将来真接板子会被全判 `ERR,2`。
+**⚠️ 跨语言坑（完整五段式见 `docs/排障记录-LLM.md` 第 2 条）**：XOR 定义在**字节序列**上，中文是 UTF-8 多字节。Python 侧必须先 `.encode("utf-8")` 再逐字节 XOR；若按 `ord(ch)` 逐字符算，与 C 固件 `(uint8_t)` 对不齐，将来真接板子会被全判 `ERR,1`。
 
 ## 二、这块板在系统里的位置
 
@@ -151,7 +151,7 @@ esp32/
 **`protocol.c`（统一帧封包）**
 ① 纯标准 C：`uint8_t` 逐字节 `^=`、`static const char HEX_DIGITS[]` 查表、`char *out` + `size_t out_size` 显式长度、手工拼帧并返回长度。
 ② 只依赖 `<stddef.h>` / `<stdint.h>`，不碰 ESP-IDF 头 ⇒ 能脱离板子在本机 gcc 编译跑自测；传 `out_size` 让调用方无法溢出；`uint8_t` 明确「按字节算」，和 C 固件 `(uint8_t)` 天然对齐。
-③ 不检查 `out_size` 就是经典缓冲区溢出；按 Unicode 码点算中文（Python 侧常见错）会与固件判 `ERR,2`；`protocol_build_frame()` 若直接接 UART 写就变成「下发」，本骨架**故意只打印不下发**。
+③ 不检查 `out_size` 就是经典缓冲区溢出；按 Unicode 码点算中文（Python 侧常见错）会与固件判 `ERR,1`；`protocol_build_frame()` 若直接接 UART 写就变成「下发」，本骨架**故意只打印不下发**。
 
 **`tcp_client.c` + `main.c`（Wi-Fi TCP 上行层，11-14 晚新增）**
 ① **用了什么语法**：BSD socket 四件套 `getaddrinfo()` → `socket()` → `connect()` → `send()/recv()/close()`（头 `<sys/socket.h>` / `<netdb.h>` / `<sys/time.h>` / `<unistd.h>`，在 ESP-IDF 里由 **lwip** 组件提供）；`setsockopt(SO_RCVTIMEO/SO_SNDTIMEO)` 配 `struct timeval` 超时；`snprintf()` 把端口转字符串、`memset()` 清零、`size_t` 累加已发字节；`enum` 定义 `TCP_ERR_*` 分级错误码 + `tcp_client_strerror()` 翻人话；`#define` 把网关 IP / 端口 / 超时 / 缓冲区集中在头文件；`typedef struct` 做「帧表」把数据和发送逻辑分开；C99 八进制转义 `\ooo` 写中文 UTF-8 字节串；`#if SEND_CN_HOME_FRAME` 做编译期安全闸门；`vTaskDelay(pdMS_TO_TICKS())` 让出 CPU。

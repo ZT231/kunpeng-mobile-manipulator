@@ -47,7 +47,7 @@ public:
         std::unordered_map<std::string, Handler>::const_iterator it =
             handlers_.find(request.command());
         if (it == handlers_.end()) {
-            return false;   // 调用方负责回 ERR,1（未知命令）
+            return false;   // 调用方负责回 ERR,2（未知命令）
         }
         out = it->second(request);   // 间接调用处理函数，结果写进 out
         return true;

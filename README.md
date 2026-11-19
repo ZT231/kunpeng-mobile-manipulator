@@ -68,11 +68,20 @@
 | `StartServoTask` | 20ms | High | 4096 | 电位器/按键/RFID 采集、示教、`Arm_Update()` 刷新 6 路舵机 |
 | `StartProtocolTask` | 5ms | Normal | 2048 | 解析 UART 帧、分发命令、执行运动 |
 | `StartPrintTask` | 3s | Low | 2048 | 周期遥测打印 |
+| `StartSafetyTask` | 200ms | Low | 2048 | 过流检测（ACS712 采样跨 20ms，独立任务不拖慢舵机）→ `Arm_ReportFault` |
 
 - **中断只收字节**：ISR 内仅做单字节接收与帧状态机，命令解析与执行全部放在任务上下文（中断优先级 5，匹配 `configLIBRARY_MAX_SYSCALL_INTERRUPT_PRIORITY`）。
 - **两把互斥锁**：`arm_lock`（机械臂状态）、`print_lock`（串口输出），从不同时持有，避免死锁。
 - **协议帧格式**：`$<CMD>[,<ARG>...]*<CK>\r\n`，`CK` = CMD 字段（`$` 与 `*` 之间）所有字节的 XOR，2 位大写十六进制；响应 `$OK[,<数据>]` / `$ERR,<code>`。
 - **双缓冲应答**：活动槽 + 备用槽，临界区保护，保证连发命令的应答不丢失。
+
+### 阶段 1 安全监控（safety 模块 + FAULT 状态机，2026-11-19 新增）
+
+> 🔶 代码已落盘，**未上板编译/实机验证**（本地无 Keil，需回教室编译）。IWDG 与断链保护按决策延后，本阶段只做了「FAULT 状态机 + 过流急停」两项无砖级风险的纯软件改造。
+
+- **① 用了什么语法/设计**：`arm_control.h` 状态机枚举新增 `ARM_STATE_FAULT`；`arm_control.c` 加 `static uint8_t fault_code`（故障码锁存）+ `state_is_frozen()`（把「急停或故障」的冻结判断收敛成一个函数）+ `Arm_ReportFault/ClearFault/GetFault/IsFrozen` 四个接口；新增 `safety.h/safety.c`（`Safety_Tick()` 读 ACS712、连续 3 次超 800mA 才触发）；`uart_protocol.c` 加 `$FAULT`/`$CLEARFAULT` 命令、STATE 响应末尾追加 fault 字段；`freertos.c` 加 `StartSafetyTask`。
+- **② 为什么这么设计**：急停像「按暂停」、故障像「机器亮红灯」，必须分开——故障需人工诊断后才能复位，不能被 RESUME 一句话带过去。过流检测放**独立低优先级任务**是因为 `ACS712_Read_mA()` 跨 PWM 周期采样会阻塞约 20ms，塞进 20ms 的舵机任务会把刷新拖慢一倍。STATE 的 fault 字段**追加到末尾**（而非插中间）是为了向后兼容 `arm_host.py`/`web_control.py` 的 `parts[3:9]` 精确切片解析。
+- **③ 不这么写会出什么问题**：若把 ESTOP/FAULT 混成一个态，过流异常会被 RESUME 带过 = 保护形同虚设；若在 `Arm_Update`/各 Command 里各自写 `==ESTOP || ==FAULT`，漏一处就是「急停不住」的安全漏洞；若 STATE 把 fault 插进字段中间，老上位机解析直接崩。
 
 ## 三大核心支柱（项目定位定稿，2026-11-13）
 
@@ -327,7 +336,7 @@ python3 kunpeng/robot/handeye_calib.py solve --samples samples.json --out handey
 **串口协议与固件**
 
 - **多串口同时收发时偶发数据错乱**：发送侧双缓冲（活动槽 + 备用槽）在 tx_busy 期间 ISR 写备用槽，主循环搬运与发送前置位存在竞态；搬运与发送前置位两处均用 `__disable_irq`/`__enable_irq` 临界区保护，避免 ISR 误写活动槽或破坏拷贝。
-- **蓝牙指令返回 $ERR,2**：校验码错误；上位机自动计算 XOR 校验码（如 `$MOVE,0,1800*28`），无需手算。
+- **蓝牙指令返回 $ERR,1**：校验码错误；上位机自动计算 XOR 校验码（如 `$MOVE,0,1800*28`），无需手算。
 - **编译报 huart2 未定义 / 链接缺少 bt、wifi 模块**：`stm32f4xx_it.c` 的 USER CODE Includes 段补 `#include "usart.h"`；bt.c、wifi.c 手动加入 Keil 工程的 Application/User/Core 分组。
 
 ## 演示要点（建议 15 分钟流程）

@@ -377,7 +377,7 @@ def send_cmd(payload, base_url=DEFAULT_BASE_URL, timeout=HTTP_TIMEOUT_S):
     """把固件命令字发给已实机验收的网页服务，并检查固件回执（会碰硬件）。
 
     🔴 为什么必须看 resp：`/api/cmd` 的 `ok:true` 只代表「串口写进去了」，
-    固件真正执行结果在 `resp` 里（OK / ERR,1 未知命令 / ERR,4 急停中）。
+    固件真正执行结果在 `resp` 里（OK / ERR,2 未知命令 / ERR,4 急停中）。
     只判 ok 不看 resp，就会把「帧格式写错」当成「执行成功」——
     这条与 `action_primitives.send_joint()` 是同一套口径。
     """

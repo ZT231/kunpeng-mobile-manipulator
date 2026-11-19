@@ -10,10 +10,11 @@ namespace serial {
 //   编译器帮你挡住「把错误码当普通数字乱用」的 bug。这是新手也该养成的好习惯。
 enum class ErrorCode : std::uint8_t {
     None = 0,
-    UnknownCommand = 1,   // ERR,1 未知命令
-    BadChecksum = 2,      // ERR,2 校验失败
+    BadChecksum = 1,      // ERR,1 帧/校验错误
+    UnknownCommand = 2,   // ERR,2 未知命令
     BadArgument = 3,      // ERR,3 格式/参数错误
     StateForbidden = 4,   // ERR,4 当前状态禁止该操作
+    DeviceFault = 5,      // ERR,5 设备故障(FAULT)
 };
 
 // 把错误码变成给人看的文字（中文）。
@@ -22,10 +23,11 @@ enum class ErrorCode : std::uint8_t {
 inline const char* toString(ErrorCode code) {
     switch (code) {
         case ErrorCode::None:           return "无错误";
+        case ErrorCode::BadChecksum:    return "帧/校验错误";
         case ErrorCode::UnknownCommand: return "未知命令";
-        case ErrorCode::BadChecksum:    return "校验失败";
         case ErrorCode::BadArgument:    return "格式/参数错误";
         case ErrorCode::StateForbidden: return "当前状态禁止该操作";
+        case ErrorCode::DeviceFault:    return "设备故障(FAULT)";
     }
     return "未知错误码";
 }

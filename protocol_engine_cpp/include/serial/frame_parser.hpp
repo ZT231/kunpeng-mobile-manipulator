@@ -28,7 +28,7 @@ public:
     // 丢帧统计：上位机跑起来第一件事就是盯这几个数，而不是靠肉眼猜哪里出问题。
     struct Stats {
         std::size_t frames_ok = 0;        // 成功解析的帧
-        std::size_t checksum_errors = 0;  // 校验不对（对应固件 ERR,2）
+        std::size_t checksum_errors = 0;  // 校验不对（对应固件 ERR,1）
         std::size_t format_errors = 0;    // 结构不对：没收到 "*CK"、CK 不是十六进制
         std::size_t overflow_drops = 0;   // 超长帧整体丢弃
         std::size_t noise_bytes = 0;      // 帧外的噪声字节

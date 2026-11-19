@@ -82,9 +82,9 @@ class FakeFlask(http.server.BaseHTTPRequestHandler):
             payload = body.get("payload", "")
             FakeFlask.cmd_log.append(payload)
             if FakeFlask.fail_mode == "err":
-                # 模拟固件回 ERR,1（未知命令）：注意 ok 仍是 true，
+                # 模拟固件回 ERR,2（未知命令）：注意 ok 仍是 true，
                 # 真实 /api/cmd 就是这样 —— ok:true 只代表串口写进去了。
-                self._json({"ok": True, "resp": "ERR,1"})
+                self._json({"ok": True, "resp": "ERR,2"})
                 return
             if payload.startswith("JOINT,"):
                 FakeFlask.target = [int(x) for x in payload.split(",")[1:]]
@@ -157,7 +157,7 @@ def main():
         ok = False
         print("  ✗ 结束时 J6 应为闭合 %d，实际 %d" % (ap.JAW_CLOSE, FakeFlask.state[5]))
 
-    # ---- 用例 2：固件回 ERR,1，必须抛异常并返回 4（不是静默成功）----
+    # ---- 用例 2：固件回 ERR,2（未知命令），必须抛异常并返回 4（不是静默成功）----
     reset()
     FakeFlask.fail_mode = "err"
     rc = ap.run_plan(ap.plan_pick(10.0, 18.0, compensate=False), yes=True)
