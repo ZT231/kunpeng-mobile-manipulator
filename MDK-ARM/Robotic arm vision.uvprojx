@@ -424,6 +424,11 @@
               <FilePath>..\Core\Src\pca9685.c</FilePath>
             </File>
             <File>
+              <FileName>acs712.c</FileName>
+              <FileType>1</FileType>
+              <FilePath>..\Core\Src\acs712.c</FilePath>
+            </File>
+            <File>
               <FileName>potentiometer.c</FileName>
               <FileType>1</FileType>
               <FilePath>..\Core\Src\potentiometer.c</FilePath>
