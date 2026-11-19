@@ -1,0 +1,72 @@
+{
+  "meta": {
+    "status": "draft",
+    "created": "2026-11-15",
+    "note": "提前草案：只提供可静态校验的流/规则文本，未部署、未连 EMQX、未连 eKuiper、未连 InfluxDB、未实机。按 11-14 重排，本项排在『ESP32 真发帧』之后。",
+    "source": "docs/核心化路线图-ESP32与IoT.md 第 59/71/72 行（字段 rssi/heap_free/wake_cnt/cmd_ok；阈值 rssi<-70、心跳超时>10s；alerts measurement）",
+    "credential_note": "token 一律用 ${INFLUX_TOKEN} 占位符，部署时由环境变量注入；仓库里不写任何真实值。",
+    "heartbeat_note": "心跳超时不能用 eKuiper 窗口检测：窗口由『收到消息』驱动，设备彻底离线时一条消息都没有，SQL 窗口不会触发。故由板侧 is_heartbeat_stale() 生成 heartbeat_timeout 告警 -> alerts/esp32_01 -> esp32_alerts_to_influx 落库。",
+    "isolation_note": "现有 deploy.sh 的 to_influx 规则订阅 device/+/telemetry 通配，会把 ESP32 消息当成机械臂数据、SELECT 到 null 字段写进 arm_telemetry，触发 InfluxDB field type conflict。草案用独立流（精确 DATASOURCE）+ 独立 measurement 隔离；实机部署前必须给 to_influx 加 WHERE deviceId='kunpeng_01'，本草案不擅自改 deploy.sh。",
+    "template_note": "mqtt / influx2 action 不使用 dataTemplate：eKuiper 2.1.0 求模板时上下文是 []map[string]interface{} 切片，取 {{.deviceId}} 会报 can't evaluate field（见 deploy.sh 第 80-83 行注释）。tags 用静态字符串 map。"
+  },
+  "streams": [
+    {
+      "sql": "CREATE STREAM esp32_stream () WITH (TYPE=\"mqtt\", DATASOURCE=\"device/esp32_01/telemetry\", FORMAT=\"json\");"
+    },
+    {
+      "sql": "CREATE STREAM alert_stream () WITH (TYPE=\"mqtt\", DATASOURCE=\"alerts/+\", FORMAT=\"json\");"
+    }
+  ],
+  "rules": [
+    {
+      "id": "esp32_to_influx",
+      "sql": "SELECT rssi, heap_free, wake_cnt, cmd_ok, deviceId FROM esp32_stream",
+      "actions": [
+        { "log": {} },
+        {
+          "influx2": {
+            "addr": "http://influxdb:8086",
+            "token": "${INFLUX_TOKEN}",
+            "org": "robotics",
+            "bucket": "telemetry",
+            "measurement": "esp32_telemetry",
+            "tags": { "device": "esp32_01" },
+            "fields": ["rssi", "heap_free", "wake_cnt", "cmd_ok"]
+          }
+        }
+      ]
+    },
+    {
+      "id": "esp32_rssi_low",
+      "sql": "SELECT deviceId, ts, rssi FROM esp32_stream WHERE rssi < -70",
+      "actions": [
+        { "log": {} },
+        {
+          "mqtt": {
+            "server": "tcp://emqx:1883",
+            "topic": "alerts/esp32_01",
+            "qos": 1
+          }
+        }
+      ]
+    },
+    {
+      "id": "esp32_alerts_to_influx",
+      "sql": "SELECT deviceId, kind, level, detail FROM alert_stream",
+      "actions": [
+        { "log": {} },
+        {
+          "influx2": {
+            "addr": "http://influxdb:8086",
+            "token": "${INFLUX_TOKEN}",
+            "org": "robotics",
+            "bucket": "telemetry",
+            "measurement": "alerts",
+            "tags": { "device": "esp32_01" },
+            "fields": ["kind", "level", "detail"]
+          }
+        }
+      ]
+    }
+  ]
+}

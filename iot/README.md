@@ -1,7 +1,13 @@
-# KunPeng Pro · IoT 栈最小闭环部署包
+# KunPeng Pro · 可观测性闭环（支柱③ 核心必备）
 
-把"设备 → Broker → 边缘规则引擎 → 时序库 → 看板"这条 IoT 链路在 KunPeng Pro（openEuler 22.03 / aarch64）上跑通。
-这是简历项目里 IoT 端-边-云链路的**最小骨架**；本包只落地端-边侧的板内闭环，先立起来、不卡任何硬件。
+把"设备 → Broker → 边缘规则引擎 → 时序库 → 看板"这条链路在 KunPeng Pro（openEuler 22.03 / aarch64）上跑通。
+
+> 🔴 **定位（2026-11-13 调整）**：本目录从「IoT 最小骨架 / 附加项」提升为**项目三大核心支柱之三**。
+> 判据不变：**核心 = 必须能演示 + 能讲清边界**。
+> **已覆盖**：STM32 六路实际脉宽（经鲲鹏串口）→ EMQX → eKuiper → InfluxDB → Grafana 六条曲线。
+> **未覆盖（核心化的欠账）**：① ESP32-S3 节点自身遥测（RSSI / 剩余堆 / 唤醒次数）尚未进 EMQX；
+> ② eKuiper 只有字段筛选、**无阈值告警规则**；③ 无断网补传、无云端。
+> 口径红线仍在：本支柱**只增可观测性、不增抓取能力**，不叫「云端 IoT」、不叫「设备影子」。
 
 ## 链路
 ```
@@ -373,3 +379,30 @@ A2. 在 `docker-compose.yml` 末尾加 Telegraf 服务（**同样要带 `securit
   ② trusted zone 只手工绑一次 → 重启 / 网络重建后复发 `no route to host`（第 8 条，15:03 实证）；
   ③ `tags` 留 `{{.deviceId}}` → 每条记录卡在 transform 阶段（第 9 条）；
   ④ REST 只靠 `set -e` + curl 退出码 → HTTP 200 带 `"error"` 的 JSON 会静默失败、脚本还打印「完成!」。
+
+## 附：ESP32 遥测与告警「提前草案」· README 三行法
+
+> 📋 2026-11-15 傍晚宿舍无硬件，先把「字段契约 + 板侧适配层 + eKuiper 规则文本」写掉。
+> 大白话：定好 ESP32 该往 MQTT 发哪几个数、脏数据怎么挡、什么情况要告警，
+> 但**不连任何服务、不动板上已实机的四容器**。完整说明 → `docs/IoT-ESP32遥测与eKuiper告警草案.md`。
+
+- **① 用了什么语法 / 技术栈**：`argparse`（含 `--dry-run` / `--publish` 互斥优先级）、
+  纯函数 `build_payload()` / `is_publishable()` / `is_heartbeat_stale()` / `build_alert()` 分层、
+  `isinstance` + `bool` 显式排除的类型闸门、`json` 序列化、`paho.mqtt` **延迟导入**并兼容 2.x / 1.x 回调 API、
+  `unittest` 27 项 + `subprocess` 子进程回归（含 `PYTHONIOENCODING=ascii`）、`json.loads` 静态校验规则文本。
+- **② 为什么这么设计**：① 拆纯函数是为了零联网、零装包就能用假数据验字段，与 `telemetry_bridge.py` 同一套做法；
+  ② `is_publishable()` 在**发布端**挡脏数据，因为 InfluxDB 2.x 的 `measurement+field` 类型首次写入即锁定，
+  下游清库 / 换 measurement 都绕不开（第 11 条排障）；③ 心跳超时放板侧看门狗，因为 eKuiper 窗口
+  由「收到消息」驱动，设备彻底离线时一条消息都没有；④ 规则用**精确主题** + **独立 measurement**
+  （`esp32_telemetry` / `alerts`）隔离，避免 `device/+/telemetry` 通配把 ESP32 消息灌进机械臂 `to_influx`；
+  ⑤ token 全用 `${INFLUX_TOKEN}` 占位符，凭据不进版本库；⑥ 默认 dry-run 且 dry-run 优先，
+  误给 `--publish` 也绝不真连 MQTT。
+- **③ 不这么写会怎样**：① 把 `null` 发上 MQTT → eKuiper influx2 sink 写成 string →
+  撞历史 float → `partial write: field type conflict` 整批 drop；② 不排除 `bool` →
+  `True` 被当成 `1` 写进浮点 field（Python 里 `bool` 是 `int` 子类）；
+  ③ 用 `{{.deviceId}}` 模板 → eKuiper 2.1.0 报 `can't evaluate field deviceId`（第 9 条排障）；
+  ④ 共用 `device/+/telemetry` 又不按 `deviceId` 分流 → 两套设备字段互相污染；
+  ⑤ 顶层 `import paho` → 没装包的机器连 `--self-test` 都跑不起来。
+
+🔴 **档位**：这只是 📋 提前草案（27 项本机单测全绿），ESP32 固件侧真 MQTT client 尚未写、
+真节点未烧录、规则未部署 → **支柱③ 仍 🔶 未覆盖 ESP32 节点 / 无告警规则，不抬档**。
