@@ -62,3 +62,6 @@ kunpeng/robot/collect_imgs/
 .idea/
 Thumbs.db
 Desktop.ini
+
+# 调试看图临时文件（摆位/棋盘现场照片，一次性产物，不进版本库）
+kunpeng/robot/look.jpg
