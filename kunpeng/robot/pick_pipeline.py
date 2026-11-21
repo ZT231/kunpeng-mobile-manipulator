@@ -840,7 +840,7 @@ def build_parser():
     g2.add_argument("--model", default="qwen2.5vl:3b", help="模型名")
     g2.add_argument("--base-url", default="http://127.0.0.1:11434/v1",
                     help="OpenAI 兼容地址（ollama 默认 11434）")
-    g2.add_argument("--model-timeout", type=float, default=60.0)
+    g2.add_argument("--model-timeout", type=float, default=120.0)
     g2.add_argument("--observe-timeout", type=float, default=8.0)
 
     g3 = p.add_argument_group("几何与动作")

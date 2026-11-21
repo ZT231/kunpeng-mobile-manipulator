@@ -343,7 +343,7 @@ def build_parser():
     g5.add_argument("--save-frame", default="", help="慢通道决策帧存为 jpg")
     g5.add_argument("--dynamic-grip", action="store_true",
                     help="合爪用电流判据当场定夹持脉宽（需 ACS712 已接好）")
-    g5.add_argument("--model-timeout", type=float, default=60.0, help="ASR/VLM 超时秒数")
+    g5.add_argument("--model-timeout", type=float, default=120.0, help="ASR/VLM 超时秒数")
     g5.add_argument("--observe-timeout", type=float, default=8.0, help="观测超时秒数")
     return p
 
