@@ -44,7 +44,7 @@ vlm_decider.py —— 阶段 6 / P2：VLM 语义决策层（只选编号，不�
         只打印将要发给模型的 prompt，不调用模型。调 prompt 时用这个。
 
   python3 vlm_decider.py --instruction "把杯子抓起来" \\
-          --detector http://10.160.120.1:8080 \\
+          --detector http://192.168.77.100:8080 \\
           --backend http --model qwen2.5vl:3b
         完整跑一次：拉 /observe → 调模型 → 打印决策 JSON。
         （默认 base_url 是 http://127.0.0.1:11434/v1，即 ollama 的

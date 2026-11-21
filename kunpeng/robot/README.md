@@ -32,6 +32,7 @@
 | `voice_gateway.py` | 🆕 **鲲鹏侧语音入口网关（阶段 2 / B 项）**：TCP `:9000` 收 `$ASR,<文本>*<CK>` → 帧校验 → 急停快速通道 → `parse_intent` → **本地仲裁器白名单** → `/api/cmd` 下发；默认 **dry-run**，仅 `--apply` 真下发，只授权 `HOME / STOP / RESUME` 三个无参数命令字 |
 | `test_voice_gateway.py` | 🆕 网关回归考卷：XOR / 帧归一化 / 仲裁 / 急停 / dry-run / 下发失败容错 / 多线程锁，**38 项 unittest 全绿，不动臂不联网** |
 | `check_esp32_link.py` | 🆕 **ESP32 链路四层硬判据自动判定**（2026-11-15 宿舍无硬件时写）：喂串口 monitor / `/root/gw.log` / PC 侧 `nc` 输出三份文本，自动逐层打勾；只读日志、零第三方依赖、`--self-test` 5 组自证，**不抬档不动臂** |
+| `audio_sink.py` | 🆕 **ESP32 9001 PCM 接收端（11-21 新增）**：监听 `0.0.0.0:9001`，把 16kHz/16bit/单声道 PCM 落标准 44 字节 WAV；`--out` 默认 `/root/cap.wav`、`--max-secs 0` 不限、`--self-test` 只验 WAV 头不占端口。**尚未上板部署，9001 端到端未验收** |
 
 前 3 个必须放**同一目录**：`arm_params.json` 按 `__file__` 同目录加载，`collect` / `selftest` / `Kinematics` 都用 `sys.path.insert` 就地 import 同目录模块。
 
@@ -292,7 +293,7 @@ FK 给 1.8~2.4cm，真值 26cm）—— 所以输出标签特意写成「相对�
 - 把归一化塞进 `text_gateway.parse_frame()` ⇒ 牵动它 18 项既有单测，且底层纯函数不该替调用方猜格式；shell 单引号里的 `\r\n` 是 4 个普通字符，好帧会被判 `bad_ck_len`（本次真踩到）。
 - 多线程 TCP 下急停标志不上锁 ⇒ A 刚判完「没急停」、B 紧接着发急停会漏判；`nohup` 重定向时 `print` 不 `flush` ⇒ 日志看不见（11-14 启动事故同源）。
 - 只看 `/api/cmd` 的 `ok:true` 不看 `resp` ⇒ 把「帧写进串口」当成「固件执行成功」（`action_primitives.send_joint()` 同一套口径）；Flask 没起时不兜异常 ⇒ 客户端连接直接断、收不到任何应答。
-> ✅ 档位（2026-11-14 16:40 抬）：**阶段 2 网关链路已上板实机验证**（38 项本机单测 + 四层硬判据全绿，详见 F 节与 `docs/上板验收-语音网关阶段2.md`）；🔴 **语音入口整体仍 🔶**：ESP32 整机 `idf.py build` 已通过但未烧录 / 未联调，`source` 恒 `mock`，没接云端大模型 / ASR / ESP32。
+> ✅ 档位（2026-11-14 16:40 抬）：**阶段 2 网关链路已上板实机验证**（38 项本机单测 + 四层硬判据全绿，详见 F 节与 `docs/上板验收-语音网关阶段2.md`）；🔴 **语音入口整体仍 🔶**：ESP32 已烧录实机验证（TCP 9000/采音），`source` 恒 `mock`，没接云端大模型 / ASR / ESP32。
 > ✅ **11-14 16:40 已上板 `--apply` 跑完该硬判据，四层证据齐 ⇒ 阶段 2 网关链路抬 ✅**（原始输出与记录表 → `docs/上板验收-语音网关阶段2.md` 第五节）。🔴 但仍不许写成「语音控制已实现 / 语音→动作闭环」—— 那只证明「网关 → Flask → 固件 → 臂」链路通，与语音识别无关。
 
 ### A. 无硬件打通链路（本轮已完成，PC 上就能跑）
@@ -465,7 +466,7 @@ python3 handeye_calib.py solve --samples samples_fkfix.json --out handeye_X.json
 `cd ~ && python3 web_control.py` 会跑它 ⇒ `unrecognized arguments: --eye-in-hand`，
 而 `scp` 更新的却是 `~/kunpeng_vision/` 那份，两份同时被 `pkill -f` 杀掉，极难察觉。
 ```
-pkill -f web_control.py; sleep 1; nohup python3 -u /root/kunpeng_vision/web_control.py --host 0.0.0.0 --port 5000 --ik-dir /root/kunpeng_vision --eye-in-hand --video-url http://10.160.120.1:8080/video --detections-url http://127.0.0.1:8080/detections > /root/web.log 2>&1 &
+pkill -f web_control.py; sleep 1; nohup python3 -u /root/kunpeng_vision/web_control.py --host 0.0.0.0 --port 5000 --ik-dir /root/kunpeng_vision --eye-in-hand --video-url http://192.168.77.100:8080/video --detections-url http://127.0.0.1:8080/detections > /root/web.log 2>&1 &
 ```
 判版本只认**字节数 + `grep -c`**：`web_control.py` 新版 `--eye-in-hand` 出现 5 次、
 `eye_check.py` 新版 `--radial-fix` 出现 5 次。
@@ -483,10 +484,10 @@ pkill -f web_control.py; sleep 1; nohup python3 -u /root/kunpeng_vision/web_cont
 - **`-u` 必带**：`nohup … > 文件` 时 Python stdout 变**块缓冲**，启动横幅「[串口]… / 逆解：已就绪 / 眼在手：已启用」会卡在内存里不落盘，只有 Werkzeug 英文横幅（走 stderr）立刻可见 ⇒ `grep` 中文空会误以为启动失败（11-14 实测踩过）。`-u` = unbuffered，根治。
 判活最可靠的是 `curl -s http://127.0.0.1:5000/api/ik/eye` 看 `"enabled":true`，不是看日志横幅；串口是否真连看 `POST /api/state` 能否回 `ok:true` + 6 路真实脉宽 —— 该接口**没有兜底值**，`_HOST` 为空会直接 `ok:false`，所以 `ok:true` 就等于「STATE 真回读」。
 
-【PC · 浏览器】打开 `http://10.160.120.1:5000`，先点「连接」，勾选取点，点画面 → 调
+【PC · 浏览器】打开 `http://192.168.77.100:5000`，先点「连接」，勾选取点，点画面 → 调
 `POST /api/ik/eye/solve`（页面尚未加按钮，暂用下面命令验证）：
 ```
-curl -s -X POST http://10.160.120.1:5000/api/ik/eye/solve -H "Content-Type: application/json" -d '{"u":320,"v":240,"apply":false}'
+curl -s -X POST http://192.168.77.100:5000/api/ik/eye/solve -H "Content-Type: application/json" -d '{"u":320,"v":240,"apply":false}'
 ```
 
 期望返回里出现 `"mode": "eye_in_hand"`、`"x"/"y"/"z"`、`"depth"`、`"placeholder": true`。
@@ -555,7 +556,7 @@ python3 -B voice_gateway.py --apply --host 0.0.0.0
 ### F. 上板验收：阶段 2 硬判据（`docs/上板验收-语音网关阶段2.md`，2026-11-14）
 
 > ✅ **2026-11-14 16:40 已在板端跑完全部硬判据并回报，四层证据齐 ⇒ 阶段 2 网关链路抬 ✅**（记录表见规程第五节）。
-> 下面 ①②③ 是这套验收方法本身的三行法；🔴 抬的只是「网关链路」，**语音入口整体仍 🔶**（ESP32 整机 build 已通过、未烧录 / 未联调）。
+> 下面 ①②③ 是这套验收方法本身的三行法；🔴 抬的只是「网关链路」，**语音入口整体仍 🔶**（ESP32 整机 build 已通过、已烧录实机验证）。
 > **实机结果摘要**：八进制 `$ASR,回初始位*61` → `$OK,HOME*27` → `/api/state` 由 C 姿态变初始位 → 日志 `sent:true` → **用户肉眼确认臂动**；`PICK`→`$ERR,3`、急停四帧全对、`解除急停`→`$OK,RESUMED*75`。
 
 ① **用了什么语法/技术**：`printf` 八进制字节转义 `\345\233\236…`（POSIX 通用、绕开 SecureCRT 中文编码）+ `socket.create_connection()` 一行兜底（不依赖 `nc`）+ 精确 CK 速查表（由 `build_frame()` / `xor_checksum()` 实算）+ **四层证据链**（应答帧 / 网关日志 `sent:true` / `/api/state` 脉宽 / 肉眼）；板端命令一律单行、PC 侧 PowerShell 分两行（PS5.1 无 `&&`）。
@@ -624,10 +625,10 @@ b) `EMERGENCY_WORDS` 含裸词「急停」，而 `RESUME_WORDS` 里的「解除�
 - 本机验证只证明**数学与接线正确**；合成数据 `~1e-15 cm` 是机器精度，实机含噪声误差会大得多。
 - `rpy_cam2gripper_deg` 在绕 Y=180° 附近有多种等价表示（`[0,180,0]` 与 `[180,0,180]` 描述同一旋转），
   这是 ZYX 欧拉角在奇异点附近的固有不唯一性，**看 `X_matrix` 才是唯一真相**。
-- ✅ **`voice_gateway.py`（B 项 / 阶段 2）网关链路 11-14 16:40 已上板 `--apply` 实机验证**（38 项本机单测 + 四层硬判据全绿，记录见 `docs/上板验收-语音网关阶段2.md`）；🔴 **语音入口整体仍 🔶**：未与 ESP32 联调、帧草案未对齐、`esp32/` 骨架整机 build 已通过、未烧录。
+- ✅ **`voice_gateway.py`（B 项 / 阶段 2）网关链路 11-14 16:40 已上板 `--apply` 实机验证**（38 项本机单测 + 四层硬判据全绿，记录见 `docs/上板验收-语音网关阶段2.md`）；🔴 **语音入口整体仍 🔶**：ESP32 已接入并发链路自检帧、`$ASR` 语义层未对齐、`esp32/` 已烧录实机（TCP 9000/采音）。
   `source` 恒 `mock`，没接云端大模型 / ASR / ESP32；`$ASR,<文本>*<CK>` 是 `llm/text_gateway.py` 的**建议草案、未与 ESP32 实机对齐**。
   ✅ 能写「搭建鲲鹏侧收帧网关与本地仲裁器，38 项单元测试通过、默认 dry-run 不下发；11-14 上板 `--apply` 用假帧驱动机械臂回初始位、`PICK` 被拒、急停可冻结」；
-  ❌ 不能写「语音控制已实现 / 语音→动作闭环 / 已接 ESP32 / 自然语言控制机械臂」。
+  ❌ 不能写「语音控制已实现 / 语音→动作闭环 / 已接 ESP32 语音链路 / 自然语言控制机械臂」。
   路线图阶段 2 硬判据「喂假帧 ⇒ 机械臂真的动」**已于 11-14 16:40 上板 `--apply` 实跑通过**。
 - 🔴 急停只在**网关层**冻结后续下发并转发 `STOP` 给固件；仍是开环、无位置反馈，**不是**功能安全认证意义上的急停。
 

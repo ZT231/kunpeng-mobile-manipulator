@@ -36,7 +36,7 @@ import 本文件的 build_frame()，一行就能接上。这也符合
     python3 car_gateway.py --port COM7 --cmd STOP
 
     # 经网络透传（ESP32 / WiFi 模块做串口服务器时）
-    python3 car_gateway.py --tcp 10.160.120.1:9000 --cmd BWD --ms 300
+    python3 car_gateway.py --tcp 192.168.77.100:9000 --cmd BWD --ms 300
 
     # 带速度参数：$CAR,FWD,800,900
     python3 car_gateway.py --port COM7 --cmd FWD --ms 800 --speed 900
@@ -148,7 +148,7 @@ def send_tcp(frame, addr, timeout_s):
 
     host, sep, port = addr.rpartition(":")
     if not sep:
-        raise ValueError("--tcp 要写成 host:port，例如 10.160.120.1:9000")
+        raise ValueError("--tcp 要写成 host:port，例如 192.168.77.100:9000")
     with socket.create_connection((host, int(port)), timeout=timeout_s) as sock:
         sock.settimeout(0.1)
         sock.sendall(frame.encode("ascii"))
@@ -175,7 +175,7 @@ def main():
         description="底盘统一帧网关（$CAR,...*CK），帧格式与机械臂固件一致")
     src = ap.add_mutually_exclusive_group(required=True)
     src.add_argument("--port", help="串口，如 COM7 或 /dev/ttyUSB1")
-    src.add_argument("--tcp", help="TCP 地址 host:port，如 10.160.120.1:9000")
+    src.add_argument("--tcp", help="TCP 地址 host:port，如 192.168.77.100:9000")
     src.add_argument("--dry-run", action="store_true", help="只打印帧，不真的发出去")
 
     cmd = ap.add_mutually_exclusive_group(required=True)

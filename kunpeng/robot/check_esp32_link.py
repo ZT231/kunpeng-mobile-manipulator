@@ -176,7 +176,7 @@ def run(uart_text, gw_text, probe_text, notes):
     _emit("")
     _emit("RESULT: PASS=%d FAIL=%d" % (npass, 4 - npass))
     _emit("🔴 判定通过 ≠ 抬档：把结果填进 docs/明日回教室-ESP32照跑清单.md 第八节记录表并回报，")
-    _emit("   才统一订文档；esp32/ 与语音入口整体档位仍 🔶（未烧录前本脚本只能跑 --self-test）。")
+    _emit("   才统一订文档；esp32/ 已烧录实机（TCP 9000/采音），语音入口整体档位仍 🔶（识别未接）。")
     return 0 if npass == 4 else 1
 
 
