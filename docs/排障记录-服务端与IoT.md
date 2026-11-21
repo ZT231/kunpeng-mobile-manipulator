@@ -1,9 +1,164 @@
-# 排障记录 · IoT 遥测阶段（阶段 1）
+# 排障记录：服务端与 IoT
+
+> 本文由以下文档合并而成（2026-11-21 整理，内容未改写，仅重组与订正）：
+> - 排障记录-服务端与IoT.md
+> - 排障记录-服务端与IoT.md
+> - 排障记录-服务端与IoT.md
+>
+> 硬件口径以《硬件清单与接线》与《00-项目总览与硬数据速查》为准。
+
+## 目录
+
+1. 鲲鹏侧语音入口网关
+2. IoT 遥测阶段
+3. LLM 意图解析层
+
+---
+
+## 一、鲲鹏侧语音入口网关
+
+> 来源：`排障记录-服务端与IoT.md`
+
+> 定稿 2026-11-14。格式固定「现象 → 排查过程 → 根因 → 解决 → 一句话面试说辞」。
+> 只记**关键 / 面试官会追问**的问题；1~4 是本次开发真实踩到或当场验证的坑，5 是**设计阶段预判并规避**（不是实机故障），
+> **6~7 是 11-14「代码仔细检查一遍」时用 `PYTHONIOENCODING=ascii` 与词表逐条实跑实证的两处真冲突**（照 `car/排障记录.md` 的口径如实标注）。
+> 1~7 是**本机 / PC 侧**验证，不是实机故障；**8 是 11-14 板端实机验收里两个「看着像故障」的误判点**（全程零故障）。
+> ✅ 网关**阶段 2 链路 2026-11-14 16:40 已上板实机验证**（四层硬判据全绿，记录见 `docs/KunPeng部署与语音网关上板验收.md`）；
+> 🔴 **语音入口整体仍 🔶**（ESP32 已烧录实机（TCP 9000/采音），$ASR 帧草案未与 ESP32 对齐）。
+> 关联：`docs/手眼标定与一车全载抓取.md`（15 条）、`car/排障记录.md`（4 条）、`docs/排障记录-服务端与IoT.md`。
+
+---
+
+### 1. 好帧被判 `ERR,1 bad_ck_len`：shell 单引号里的 `\r\n` 是 4 个普通字符（真实踩到）
+
+**现象**：用 `python3 voice_gateway.py --frame '$ASR,回初始位*61\r\n'` 喂一条**校验和正确**的帧，网关一律回 `$ERR,1`，`parse_frame()` 报 `bad_ck_len`；换成 `--text "回初始位"`（内部用 `build_frame()` 造帧）却完全正常。
+
+**排查过程**：先确认 CK 没错 —— `xor_checksum("ASR,回初始位")` 与手工算的一致，`--make-frame "回初始位"` 打出来的帧也是 `*61`。差异只在**帧从哪来**：一个 shell 里手写、一个程序造。把收到的字符串 `repr()` 打出来，看到 `'...*61\\r\\n'`（4 个可打印字符 `\` `r` `\` `n`），而不是真实的 CR/LF。
+
+**根因**：**转义序列与字节值的差异**。shell 单引号不做转义展开，`\r\n` 在命令行里是字面量 4 个 ASCII 字符；`parse_frame()` 用 `rstrip("\r\n")` 只去真实 CR/LF，于是 `*` 后面变成 `61\r\n`（字面量），校验位长度不是 2 ⇒ 判成坏帧。规范定义：CR/LF 是控制字符 U+000D / U+000A，字面量 `\r\n` 是四个可打印字符，二者字节序列不同。
+
+**解决**：在网关**适配层**加纯函数 `normalize_frame()`，把字面量 `\r\n` 还原成真实换行（**顺序不能反**：先换长的 `\r\n`、再换短的 `\n`，否则会残留一个字面量 `\r`），在 `handle_frame()` 最前面调用。刻意**不改** `llm/text_gateway.py` —— 它是底层纯函数，不该替调用方猜格式，改了还会牵动它 18 项既有单测。归一化后 `handle_frame()` 与 `special_text()` 都受益；单测 `test_normalize_literal_crlf` / `test_normalize_order_matters` 锁住。
+
+**一句话面试说辞**：「外部输入和内部契约的边界要由**适配层**处理，不是往底层纯函数里塞特判 —— 我用一层归一化把 shell 字面量换行还原，底层解析器和它的 18 项单测一行没动。」
+
+---
+
+### 2. `$ESTOP*CK` 急停帧被 `NOT_ASR` 丢掉：急停不该等意图解析（真实踩到）
+
+**现象**：想给 ESP32 留一条最短的急停通道 `$ESTOP*CK\r\n`，实测被 `parse_frame()` 判 `RejectReason.NOT_ASR` 后直接丢弃；急停必须先用 `$ASR,急停*CK` 这种文本帧才能进，慢了一层。
+
+**排查过程**：读 `text_gateway.parse_frame()`，它按帧头命令字校验、只认 `ASR,...`，非 ASR 一律拒收 —— 这是**入口契约**的正确行为，不是 bug。问题在于「急停」这条语义比「ASR 文本」更底层、更紧急，不该被文本入口的格式要求挡住；而且翻译员 `parse_intent()` 可能返回 `unknown`，等它查表会多一跳延迟。
+
+**根因**：把「急停」和「普通语音文本」放在了同一条校验路径上。急停优先级应当高于命令字分类，也高于意图解析。
+
+**解决**：加 `extract_payload()`（只读 `$` 与 `*` 之间的 payload，**CK 仍由 `parse_frame` 校验过，不是绕过校验**）+ `special_text()` 快速通道：`result.reason == NOT_ASR` 且 payload 命中 `SPECIAL_PAYLOADS`（`ESTOP`/`STOP` → 急停、`RESUME` → 恢复）时，直接把对应中文文本交给仲裁器。同时把**急停词文本匹配放在 `parse_intent()` 之前**（`arbitrate()` 第①步），保证最快。单测 `test_non_asr_estop_fast_channel` 覆盖。
+
+**一句话面试说辞**：「急停是安全路径，我让它绕过意图解析和命令字分类，只在网关层做文本匹配 + 转发固件 `STOP`；但**校验没绕过** —— CK 仍由原有解析器验过，快速通道只是『再读一次 payload』。」
+
+---
+
+### 3. `--apply` 但 Flask 没起：网关抛异常、客户端收不到应答（真实踩到）
+
+**现象**：加了 `--apply` 真下发、但 5000 网页服务没启动时，`urllib.request.urlopen()` 抛 `URLError`（`Connection refused`；有系统代理时是 `502 Bad Gateway`），异常一路冒到 TCP handler，连接直接断，客户端既收不到 `$OK` 也收不到 `$ERR`。
+
+**排查过程**：把「下发」从主流程里单独拎出来看 —— `send_cmd()` 是唯一会碰外部世界的函数，网络错、Flask 回 `ok:false`、固件回 `ERR,x` 三种失败此前都没被统一收口。
+
+**根因**：**副作用没有与错误码映射隔离**。同理，`/api/cmd` 的 `ok:true` 只代表「串口写进去了」，固件真正执行结果在 `resp` 里；只看 `ok` 会把「帧写错」当成「执行成功」（`action_primitives.send_joint()` 是同一套口径）。
+
+**解决**：`send_cmd()` 统一抛 `RuntimeError`；`handle_frame()` 的 `Decision.ALLOW` 分支用 `try/except RuntimeError` 兜住，回 `build_reply("ERR,4")` 并在日志字典里记 `downlink_error`，进程不崩。错误码沿用项目统一语义：`ERR,1` 帧错 / `ERR,2` 未识别 / `ERR,3` 仲裁拒绝 / `ERR,4` 下发失败。单测 `test_downlink_failure_returns_err4_without_crash` 用会抛错的假 sender 覆盖。
+
+**一句话面试说辞**：「下发层是唯一有副作用的地方，我把它做成可替换函数并统一异常→错误码映射：Flask 没起就回 `ERR,4` 而不是让连接断掉，单测能用一个会抛错的假 sender 验证。」
+
+---
+
+### 4. 多线程 TCP 下急停状态会漏判 + 日志看不见（预判，已用并发单测验证）
+
+**现象（预判并当场验证）**：`ThreadingTCPServer` 每个连接一个线程，若急停标志是裸布尔，A 连接刚判完「没急停」、B 连接紧接着发急停，A 的后续下发仍会被放行；另外板上 `nohup … > 日志` 时，`print()` 走 stdout 块缓冲，日志里看不到裁决记录。
+
+**排查过程**：这两条都是**已有事故的同源问题** —— 11-14 启动 Flask 时中文横幅卡在 stdout 缓冲区，误判成启动失败（后用 `python3 -u` 根治）；串口帧是字节流，两个进程同时 `read()` 会抢帧（标定链踩过），所以本网关刻意不直连串口，只通过 HTTP 调 5000。
+
+**根因**：共享可变状态无互斥保护 + 重定向后 stdout 缓冲策略变化。规范定义：互斥量（`threading.Lock`）保护共享状态避免竞态条件；`print(flush=True)` 或 `python3 -u` 强制无缓冲。
+
+**解决**：`GatewayState` 把 `_estop` 收进 `threading.Lock` 的 `get_estop()` / `set_estop()`；`_FrameHandler` 处理完统一 `print(json.dumps(record, ensure_ascii=False), flush=True)`。仲裁器 `arbitrate()` 保持**纯函数**（不读全局状态，`estop_active` 由外层传入），改状态交给 TCP 外壳，单测才能断言 `new_estop` 正确传播。`test_concurrent_toggle_does_not_crash` 用 8 线程 × 200 次 toggle 验证不崩。
+
+**一句话面试说辞**：「仲裁器写成纯函数、状态交给带锁的外壳，这样既能并发安全，又能在不开端口不动臂的情况下单测每一条判决。」
+
+---
+
+### 5.【设计阶段预判并规避，不是实机故障】路线图原写「下发 `$JOINT`」：一步踩进四个雷区
+
+**现象**：`docs/固件与ESP32开发.md` 阶段 2 原判据是「TCP 收帧 → `parse_frame` 校验 → `parse_intent` → 下发 `$JOINT`」，并写「喂一条假帧 ⇒ 机械臂真的动」。按这个写，第一版实现就会去拼六路脉宽。
+
+**排查过程**：对照本项目已定案的四类静默风险逐条过：① `to_pulses()` 里 J3/J5 map 反向、J3/J4 存相对角，手算符号必错；② `to_pulses()` 对越界脉宽**静默夹紧**，`solve()` 成功 ≠ 舵机能到；③ 六路软限位与量程；④ 重力下垂 `SAG_DZ` 净空折算闸门（远端不折算会擦到桌面，11-14 实测踩过）。
+
+**根因**：把「语音链路打通」和「运动控制正确」两件事混在一起了。阶段 2 的目的是验**链路**，不是验**逆解**。
+
+**解决**：白名单只授权固件原生的 `HOME / STOP / RESUME`（`uart_protocol.c:428-451`，均回 `OK`）三个**无参数命令字**，从结构上消掉以上四类风险；`PICK / PLACE / MOVE_LEFT / MOVE_RIGHT` 一律 `ERR,3`，`LOOK` 为 NOOP。默认 dry-run，只有显式 `--apply` 才真下发。路线图阶段 2 的「下发 `$JOINT`」已据此订正为「下发固件原生命令字」，硬判据仍保留「喂假帧 ⇒ 臂真的动」（**上板 `--apply` 才算过**）。
+
+**一句话面试说辞**：「我把『语音能不能驱动动作』和『动作算得对不对』拆成两个阶段：阶段 2 只发三个不带参数的固件原生命令，用白名单把脉宽越界、符号、夹紧、下垂净空这四类风险变成结构上不可能，先证明链路通，再谈复杂动作。」
+
+---
+
+### 6. 板端 `LANG=C`：服务起不来、`--self-test` rc=1、日志吞掉应答（11-14 代码审查实测）
+
+**现象**：用 `PYTHONIOENCODING=ascii` 模拟鲲鹏板 `LANG=C` 本机复现，三个症状连成一条链：
+① 起网关（含 `--apply`）时 `main()` 启动横幅 `print("语音入口网关 · TCP …")` 抛 `UnicodeEncodeError`，**进程直接退出，服务根本没起来**；
+② `python3 -B voice_gateway.py --self-test` 先打出 `SELF_TEST PASS`，紧接着中文 JSON 抛编码异常，**退出码 1** —— 而它正是上板验收规程 1.3 唯一「零硬件判结构对不对」的自检，会误判成失败；
+③ 即便服务侥幸起来（UTF-8 环境），`_FrameHandler.handle()` 里 `print(json.dumps(record, ensure_ascii=False), flush=True)` 写在 `self._write(reply)` **之前**，日志含中文/emoji 抛异常时**应答帧根本发不出去**（客户端 `recv` 得空字节）。
+
+**排查过程**：把每个 `print` 的位置列出来，发现它们全在本机 UTF-8 环境测试，所以原有 32 项单测、TCP 四步链路、dry-run 演练全绿也测不出这个坑；用 `PYTHONIOENCODING=ascii` + socket 发一条中文帧才实证 `GOT REPLY: b''` 与 stderr 的 `UnicodeEncodeError`。根因不在协议、不在仲裁，而在**输出层假设了终端编码**。
+
+**根因**：`print()` 走 `sys.stdout`（TextIOWrapper），编码由 locale 决定；`ensure_ascii=False` 让中文/emoji 原样进入编码步骤。规范定义：`TextIOWrapper.reconfigure(encoding=..., errors=...)` 可就地改编码与错误处理策略；`str.encode("ascii", "backslashreplace")` 把不可编码字符转成 `\uXXXX` 转义，输出恒为可编码字节。**更关键的是副作用顺序**：日志是给人看的、应答是给客户端的，把日志写在应答之前，等于让「可观测性」拥有了阻断「功能」的能力。
+
+**解决**：① 模块加载时 `_configure_stdout()` 尽量把 stdout 设成 UTF-8 + `backslashreplace`；② 所有 `print` 收口到 `_emit()`（正常路径 UTF-8 中文可读，退路 `backslashreplace` 转纯 ASCII，绝不抛）；③ `_FrameHandler` 改成**先 `_write(reply)`、后 `_emit(日志)`**，把「日志不许吞应答」变成结构上不可能；④ 新增 4 项端到端回归（`TestAsciiStdout`）：ASCII 下 `--self-test` rc=0、`--make-frame` 出 `*61`、`_emit` 退路输出纯 ASCII、真 TCP server 能起且中文帧回 `$OK,HOME*27`。**修完重跑 38 项全绿**，`text_gateway.py` / `intent_parser.py` 自检未受影响。
+
+**一句话面试说辞**：「我不信任目标板的 locale —— 把所有输出收口到一层编码容错，并让应答帧先于日志发出；再用强制 ASCII 的子进程回归，把『本机测不出、上板才炸』的问题锁死在本机。」
+
+---
+
+### 7. 喊「解除急停」反而又急停一次：短词表子串歧义（11-14 代码审查实测）
+
+**现象**：`arbitrate("解除急停")` 返回 `payload='STOP'`、`set_estop=True`，整帧回 `$OK,ESTOP*75` —— 用户想解除急停，系统却再次冻结。`RESUME_WORDS` 里明明列了「解除急停」，却永远走不到。另外 `arbitrate("stop")` / `arbitrate("resume")` 落到意图层变「未识别」，而 `special_text()` 里同样的词能识别，**纯函数层与适配层不自洽**。
+
+**排查过程**：逐条实跑词表，发现 `EMERGENCY_WORDS` 含裸词「急停」，而「解除急停」是它的超集字符串 ⇒ `any(w in text for w in EMERGENCY_WORDS)` 先命中，恢复分支根本没机会执行。这是**子串包含歧义**（「急停」⊂「解除急停」），不是解析错；同类问题在 `special_text()` 里也存在（它把整帧文本归一化成「急停」再交给仲裁器，两层都错）。
+
+**根因**：用裸子串匹配做**语义分类**，且两个词表存在包含关系；两层各自实现匹配逻辑、行为不一致。规范定义：关键词分类应做「消歧 / 优先级显式化」，短词表尤其要处理一个词是另一个词子串的情形。
+
+**解决**：抽 `_match_resume()` / `_match_estop()` 两个纯函数 helper，`_match_estop()` **先问是不是恢复、是就不算急停**，再判急停词；`special_text()` 与 `arbitrate()` 统一复用这一套，顺带把小写 `stop` / `resume` 在纯函数层也认出来。急停优先级语义不变 —— 它由 `arbitrate()` 第③步的 `estop_active` 冻结闸门保证（急停中除「恢复」外一律拒绝），词表顺序只决定「这一帧归类为急停还是恢复」。回归单测 `test_resume_word_containing_estop_is_not_misread`、`test_ascii_words_recognized_by_arbiter_itself` 锁住；验收规程 3.1 新增 `$ASR,解除急停*6F` → `$OK,RESUMED*75`。⚠️ 诚实边界：混合语句（同时含急停词与恢复词，如「急停后恢复」）按「恢复」处理，属 mock 词表已知边界，阶段 4 接真模型再细化。
+
+**一句话面试说辞**：「短词表里一个词是另一个词的子串时，裸子串匹配会给出反向语义；我把匹配抽成两个纯函数、显式消歧，并让两层共用同一套，再用单测把『喊解除反而急停』这个危险 case 钉死。」
+
+---
+
+### 8. 板端实机验收里两个「看着像故障」的误判点（11-14 16:40，全程零故障）
+
+**现象**：阶段 2 上板 `--apply` 实跑时，有两处输出容易被当成失败：① 起后台网关后立刻 `tail -20` 日志**是空的**；② SecureCRT 多行粘贴时命令回显串扰、看着像命令没执行完。但四层硬判据（应答帧 / 日志 `sent:true` / `/api/state` 脉宽变化 / 肉眼见臂动）全部照常拿到，链路零故障。
+
+**排查过程**：① `nohup … > 日志 2>&1 &` 后进程刚 fork、日志还没落盘就去 `tail`，属**时序问题**；隔几秒再 `tail` 或 `curl` 探活即可，不是服务没起。② SecureCRT 多行粘贴会把后续行的回显挤在一起，但每条命令本身都成功执行 —— 用「板端命令一律单行、逐条粘」的既有纪律复核即可确认。另外两处非失败观察：`/api/open` 已 `ok:true` 仍按条件触发重启了 Flask（命令带 `--ik-dir /root/kunpeng_vision --eye-in-hand`、不带 `--radial-fix`，后续成功，但 `/api/ik/eye` 的 `enabled:true` 是重启前查的）；scp 首次密码 `Permission denied` 后重试成功。
+
+**根因**：**「日志/回显的时序与呈现」不等于「功能结果」**。规范定义：进程重定向到文件的写入有缓冲与调度延迟；终端回显是本地呈现层，不改变远端命令的实际执行。判活只认功能性证据（应答帧、`/api/state` 回读、物理动作），不认日志出现的早晚。
+
+**解决**：验收规程把「四层硬判据」写成唯一通过判据，日志只作辅助；明确 `tail` 空 / 回显串扰属非失败观察，记录进 `docs/KunPeng部署与语音网关上板验收.md` 第五节「非失败现场观察」，不追加为故障、不改动任何代码。本次抬档只依据四层证据，不因这些观察反复重试或改参。
+
+**一句话面试说辞**：「实机验收我只认功能性证据 —— 应答帧、状态回读、物理动作；日志晚到几秒、终端回显串扰是呈现层的事，我不会把它们当成故障去调参，这也是先写死判据再上板的好处。」
+
+---
+
+> 本机验证留档（11-14 代码审查加固后复跑）：`python3 -B test_voice_gateway.py -v` → `Ran 38 tests in 1.4s / OK`；
+> `python3 -B voice_gateway.py --self-test` → `SELF_TEST PASS`；
+> `PYTHONIOENCODING=ascii` 下 `--self-test` rc=0、TCP server 能起且回 `$OK,HOME*27`（第 6 条回归）；
+> `text_gateway.py` / `intent_parser.py` 自检均 rc=0（未牵动）。**均非实机证据。**
+
+---
+
+## 二、IoT 遥测阶段
+
+> 来源：`排障记录-服务端与IoT.md`
 
 > 范本：`protocol_engine_cpp/排障记录.md`。固定五段式，只记重要 / 关键 / 面试官关心的问题。
 > 记录区间：2026-11-08。本地自用，不进 Git。
 
-### 1. 板上 `docker -v` 报「未找到命令」——先验发现是干净系统，不必照 README 走 CentOS 8 源
+#### 1. 板上 `docker -v` 报「未找到命令」——先验发现是干净系统，不必照 README 走 CentOS 8 源
 
 - **现象**：阶段 1 先验时 `docker -v` 与 `docker compose version` 都回
   `-bash: docker：未找到命令`，`docker compose up -d emqx` 随之失败。
@@ -40,7 +195,7 @@
   通用文档的最坏情况流程；这块板官方源自带 docker，就没必要引第三方源增加依赖冲突面。
   先测量再动手，比直接照教程跑更稳。」
 
-### 2. `--dry-run --once` 三个核心字段全 `null`——不是桥的 bug，是上游服务没跑全
+#### 2. `--dry-run --once` 三个核心字段全 `null`——不是桥的 bug，是上游服务没跑全
 
 - **现象**：`telemetry_bridge.py --dry-run --once` 打印
   `{"mode":"serial","baud":115200,"camera_on":false, "pulses":null,"frame_id":null,"det_count":null}`
@@ -75,7 +230,7 @@
   `[warn]` 的有无把『HTTP 200 但 `ok:false`』和『网络超时』分开，再逐层定位到串口连接和
   8080 服务，最后用 `/api/open` 零重启恢复，没有动主链路一行代码。」
 
-### 3. `docker pull emqx:5.8.8` 报 `Client.Timeout exceeded`——Docker Hub 直连不通，改镜像加速
+#### 3. `docker pull emqx:5.8.8` 报 `Client.Timeout exceeded`——Docker Hub 直连不通，改镜像加速
 
 - **现象**：`docker pull emqx:5.8.8` 与 `docker run ... emqx:5.8.8` 都报
   `Get https://registry-1.docker.io/v2/: net/http: request canceled ... Client.Timeout exceeded`；
@@ -102,7 +257,7 @@
   `/v2/`，401 算通、000 算不通，只把探活的源写进 `registry-mirrors`；不照抄教程里那份
   已经停服的加速清单，也不盲目堆多个源拖慢每次 pull。」
 
-### 4. EMQX 容器 `Exited (1)`：`Failed to create thread: Operation not permitted`——旧 Docker seccomp 拦了 `clone3`
+#### 4. EMQX 容器 `Exited (1)`：`Failed to create thread: Operation not permitted`——旧 Docker seccomp 拦了 `clone3`
 
 - **现象**：`docker run -d` 回显容器 ID 但 `docker ps` 只有表头；`docker ps -a` 显示
   `Exited (1) 10 minutes ago`；`ss -lntp | grep 1883` → `NO_1883`；paho 订阅与 bridge
@@ -143,7 +298,7 @@
   白名单缺 `clone3` 与新 glibc 的兼容问题。日志里那串 arch / dependencies 是崩溃后的
   诊断清单，不是根因。修的时候讲清『绕开过滤』与『升级引擎』的区别和安全取舍。」
 
-## 第 5 条：`./deploy.sh` 起 influxdb 报 `0.0.0.0:8086: bind: address already in use`
+### 第 5 条：`./deploy.sh` 起 influxdb 报 `0.0.0.0:8086: bind: address already in use`
 
 - **现象**：1.2b 第 4 组 `docker-compose up -d` 时 `Creating emqx ... done` / `Creating ekuiper ... done`，
   到 `Creating influxdb ... error`，报
@@ -172,7 +327,7 @@
 
 ---
 
-## 第 6 条：eKuiper 建流报 `found "WITH", expected lparen after stream name`（error 3000），且脚本静默失败
+### 第 6 条：eKuiper 建流报 `found "WITH", expected lparen after stream name`（error 3000），且脚本静默失败
 
 - **现象**：1.2b 首次真正跑 `./deploy.sh` 建流/建规则时，
   `POST /streams` 返回 `{"error":3000,"message":"Stream command error: found \"WITH\", expected lparen after stream name."}`；
@@ -198,7 +353,7 @@
 
 ---
 
-## 第 7 条：eKuiper influx2 sink 报 `'tags' expected a map, got 'string'`（error 2201）
+### 第 7 条：eKuiper influx2 sink 报 `'tags' expected a map, got 'string'`（error 2201）
 
 - **现象**：第 6 条把建流修好后，`POST /rules` 返回
   `{"error":2201,"message":"error configuring influx2 sink: 1 error(s) decoding:\n\n* 'tags' expected a map, got 'string'"}`；
@@ -224,7 +379,7 @@
 
 ---
 
-## 第 8 条：规则 `created successfully` 却 `stopped by error` —— firewalld nftables 兜底 REJECT 把容器流量全拒了
+### 第 8 条：规则 `created successfully` 却 `stopped by error` —— firewalld nftables 兜底 REJECT 把容器流量全拒了
 
 - **现象**：1.2b 第 6 组之后，`POST /rules` 回 `Rule to_influx was created successfully.`，
   但 `GET /rules/to_influx/status` 是 `"status":"stopped by error"`，message
@@ -295,7 +450,7 @@
 
 ---
 
-## 第 9 条：规则 running、数据也进来了，却一条没写进 InfluxDB —— `tags` 的 dataTemplate 在运行时求值失败
+### 第 9 条：规则 running、数据也进来了，却一条没写进 InfluxDB —— `tags` 的 dataTemplate 在运行时求值失败
 
 - **现象**：第 8 条把 firewalld 修好后，`POST /rules/to_influx/restart` →
   `Rule to_influx was restarted`，`GET /rules/to_influx/status` →
@@ -349,7 +504,7 @@
 
 ---
 
-## 第 10 条：Grafana 数据源列表为空 `[]` —— provisioning 目录权限 600，容器内非 root 用户读不了
+### 第 10 条：Grafana 数据源列表为空 `[]` —— provisioning 目录权限 600，容器内非 root 用户读不了
 
 - **现象**：1.2b 最后一步，`GET /api/datasources` 返回 `[]`，Explore 下拉只有
   `-- Grafana --`（内置 TestData）与 `-- Mixed --`，**没有 InfluxDB** ⇒ 看板画不出六路曲线。
@@ -398,7 +553,7 @@
 
 ---
 
-## 第 11 条：配置/网络/鉴权全对，sink 却 100% 异常 —— InfluxDB field 类型冲突（null 被写成 string）
+### 第 11 条：配置/网络/鉴权全对，sink 却 100% 异常 —— InfluxDB field 类型冲突（null 被写成 string）
 
 - **现象**：15:03 修好 firewalld 复发、规则 `restart` 成功 `running`、
   `sink_influx2_1_0_connection_status: 1`（sink 探活成功）之后，
@@ -459,7 +614,7 @@
 
 ---
 
-## 本阶段诚实边界（阶段 1.1 / 1.2，别写越线）
+### 本阶段诚实边界（阶段 1.1 / 1.2，别写越线）
 - ✅ 已实证（阶段 1.1，16:56 两端截图逐条闭环）：**真实串口六路脉宽 + 8080 真实帧号/检测数 → 组 JSON → MQTT 发布 → 订阅收到**。发布端 `[bridge] -> {...}` 与订阅端 `device/kunpeng_01/telemetry {...}` **十条一一对应**（`ts` 1794128066~111、`frame_id`、`det_count` 全一致）。`pulses` 恒为 `[1580,1900,2400,700,1450,1500]` = 固件初始位 INIT（臂静止在 HOME）；`frame_id` 32692→33804 / 45s ≈ 24.7 fps，与页面 26.6 fps 吻合；`det_count` 在 `0/1/4` 之间**真实变化**，不是固定假数据。🔴 图里 `"frame_id": 3269` 接折行 `2,` = `32692`，是终端宽度折行，不是数据错位。
 - 🔴 桥 `/api/state` 是 **POST**，每 5 秒会真的往串口多发一条 STATE 帧（唯一副作用，已在代码注释写明并降频）；不是纯读。
 - ✅ **1.2b 已实证（15:13）**：真实串口遥测 → MQTT → EMQX → eKuiper → InfluxDB → Grafana **端到端可观测性闭环成立**：Explore 出六个 `j1~j6` series，Table 有 15:12:57~15:13:27.5 的真实六路点（= 固件初始位 INIT，真实串口回读非 mock）。`-24h` Flux 返回 11 个 field 全齐的真实 CSV。八连修排障链（第 5~11 条）全部板上实证，四次错误假设已逐一证伪撤回。
@@ -474,3 +629,76 @@
   `telemetry_bridge.py`，确认静态 tags / 动态重绑 / 跳过 null 点在板上同样生效后再提交。
   🔴 **现在仍不能写「已交付」**：板上复验未完成；且本阶段一律只叫「可观测性闭环」。
 - ❌ 不得写「云端 IoT / 数字孪生 / 自动抓取 / 闭环控制 / IoT 五件套已通 / 抓取曲线」。
+
+---
+
+## 三、LLM 意图解析层
+
+> 来源：`排障记录-服务端与IoT.md`
+
+> 记录区间：2026-11-08。格式固定：**现象 → 排查过程 → 根因 → 解决 → 一句话面试说辞**。
+> 只记重要 / 关键 / 面试官关心的问题，鸡毛蒜皮不记。
+
+### 第 1 条：`python -m unittest discover -s <目录>` 报 `ImportError: Start directory is not importable`
+
+- **现象**：17:14 在 PowerShell 跑
+  `python.exe -B -m unittest discover -s "D:\...\kunpeng\llm" -p "test_*.py"`，
+  报 `ImportError: Start directory is not importable: 'D:\\...\\kunpeng\\llm'`，
+  一条测试都没跑起来。当时容易误判成「刚写的代码有语法错 / 模块导入失败」。
+
+- **排查过程**：
+  1. `Glob kunpeng/llm/**` → `No files found`，确认**阶段 2 源码当时根本还没落盘**（按「点头才动手」约定，目录都不存在）；
+  2. 17:18 落盘后先补 `__init__.py`，在目录内跑 `discover -s . -p "test_*.py" -v` → **26 项全绿**；
+  3. 再用原样的绝对路径版 `discover -s "D:\...\kunpeng\llm"` 复跑 → exit code 0，报错不复现；
+  4. 对照 CPython 3.11+ `unittest/loader.py`：`TestLoader.discover()` 要用 start_dir 推导模块名，要求该目录**可导入**；3.11 起不再支持 namespace package（无 `__init__.py` 的目录）作为发现起点。
+
+- **根因**：**两个原因叠加**，都跟 `intent_parser.py` 的逻辑无关。
+  ① 主因是**验证命令跑在代码落盘之前** —— 目录不存在，谈不上导入；
+  ② 即便目录建好，Python 3.11+ 的 `unittest discover` 要求起始目录是 **regular package**（含 `__init__.py`），否则拒收。
+  规范定义：PEP 420 引入 namespace package；CPython 3.11 的 unittest 移除了对它的 discover 支持（`TestLoader.discover` 里 `is_not_importable` 检查）。
+
+- **解决**：
+  1. **流程**：按「先点头 → 再落盘 → 最后给验证命令」执行；「待点头 / 尚未落盘」阶段不再把可整段复制的验证命令摆进代码块（已写进跨项目习惯）。
+  2. **代码**：新增 `kunpeng/llm/__init__.py`（空文件 + docstring），让目录成为 regular package。
+  3. **命令**：保留绝对路径 `-s` 也能过（包已可导入）；另给一条更稳的写法是先 `cd` 进目录跑 `discover -s .`。
+  4. **实测**：`--self-test` → `SELF_TEST PASS`；`unittest discover` → `Ran 26 tests OK`；PowerShell 绝对路径版 → exit code 0。
+
+- **一句话面试说辞**：「`unittest discover` 在 Python 3.11 之后要求起始目录是可导入包，我给模块补了 `__init__.py`；那次报错更主要的原因是验证命令跑在代码落盘之前，所以我把『先写后验』定成了流程。」
+
+### 第 2 条：中文串口帧 XOR「按字节还是按字符」——跨语言对齐坑
+
+- **现象**：16:35 做 ESP32 文本入口离线网关时，`--self-test` 一开始把演示用的空文本帧
+  `$ASR,*3C\r\n` 判成 `CK_MISMATCH`（算出 `6C`、帧里写 `3C`），不是预期的 `EMPTY_TEXT`。
+  更要紧的是：若在 Python 里按 `for ch in text: ck ^= ord(ch)` 算中文校验和，
+  拿到的是 Unicode 码点（「抓」= 0x6293），远超 1 字节，与 C 固件对不上。
+
+- **排查过程**：
+  1. 回读 `Core/Src/uart_protocol.c`：L123 `ck ^= (uint8_t)payload[i]`（发包）、
+     L523 `calc_ck ^= frame_buf[i]`（收包）都是对 **uint8_t 字节**做 XOR，L128-129 输出 2 位大写 HEX；
+  2. 确认 Python 的 `str` 是 Unicode 码点序列，「抓」在 UTF-8 里是 3 字节 `E6 8A 93`；
+  3. 用 S2 已实机的 `$PING*10` / `$OK,PONG*3E` 反查：CK("PING")=0x10、CK("OK,PONG")=0x3E，
+     证明「逐字节 XOR」实现与固件一致，不是自说自话；
+  4. 空文本帧那条其实是**演示用例手算 CK 写错**（`ASR,` 的 XOR 应为 6C），
+     改用 `build_frame("")` 生成后，校验层才正常走到 `EMPTY_TEXT` 分支。
+
+- **根因**：XOR 校验定义在**字节序列**上，而 Python `str` 是字符（码点）序列。
+  跨语言对齐必须同时统一 ① 字符编码（UTF-8）② 字长（8 bit）。
+  规范定义：纵向冗余校验（LRC）作用于 octet stream；`uint8_t` 逐字节累加后截断到 0~255，
+  与 Unicode code point 不是同一数学对象。
+
+- **解决**：
+  1. `xor_checksum()` 里先 `payload.encode("utf-8")` 再逐字节 `ck ^= byte`，最后 `& 0xFF`；
+  2. 把「逐字符算」与「逐字节算」两种结果都写进 `--self-test` / unittest 断言，
+     用 `wrong_ck != manual` 把这条坑固化成回归用例；
+  3. 用两条 S2 实机帧当锚点反查实现；
+  4. 演示帧一律用 `build_frame()` 生成，不再手写 CK；
+  5. 实测：`text_gateway.py --self-test` → `SELF_TEST PASS`；`unittest discover` → `Ran 44 tests OK`。
+
+- **一句话面试说辞**：「串口帧的 XOR 是按字节算的，中文是 UTF-8 多字节；我在 Python 侧先 encode 再逐字节异或，并拿项目实机跑通的 `$PING*10`、`$OK,PONG*3E` 反查实现，避免上层语言按 Unicode 码点算导致将来一接板子就全部校验失败。」
+
+### 本阶段诚实边界（写简历 / 面试别越线）
+
+- ✅ 能写：「自然语言 → 结构化动作指令的**意图解析层**，mock 实现 + 26 项单元测试通过；契约定死、后端可替换」。
+- ❌ 不能写：「接入了云端大模型」「自然语言控制机械臂已实现」「语音→动作闭环」「自动抓取」。
+- 模块**只输出结构化指令、不下发**；`source` 恒 `"mock"`；`params` 恒空（不猜数值）；枚举里故意没有 `NAV`（车体 / 导航是阶段 6，命中即 `unknown` + warning）；`CloudBackend` 是占位、`parse()` 抛 `NotImplementedError`，`LLM_API_KEY` 只走环境变量、绝不写进代码。
+- 当前真正能执行的是「人点画面 → `ArmIK` 逆解 → `$JOINT` 串口帧」这条**开环**链路；自动抓取、下降-闭合-抬起序列、视觉伺服闭环都还没做。
