@@ -25,7 +25,7 @@
   python3 asr.py --self-test                      # 纯逻辑自测，不联网
   python3 asr.py --wav /root/cap.wav              # mock 转文字
   python3 asr.py --wav /root/cap.wav --text "回初始位"   # mock 返回指定句
-  python3 asr.py --wav /root/cap.wav --backend whisper --model whisper-1
+  python3 asr.py --wav /root/cap.wav --backend whisper   # 默认硅基流动 SenseVoiceSmall
 """
 
 import abc
@@ -87,6 +87,24 @@ class MockBackend(AsrBackend):
         return self.fixed_text if self.fixed_text else "把杯子抓起来"
 
 
+_AUDIO_CTYPES = {
+    ".wav": "audio/wav",
+    ".mp3": "audio/mpeg",
+    ".m4a": "audio/mp4",
+    ".mp4": "audio/mp4",
+    ".flac": "audio/flac",
+    ".ogg": "audio/ogg",
+    ".webm": "audio/webm",
+    ".aac": "audio/aac",
+}
+
+
+def _content_type_for(path):
+    """按扩展名推断上传的 Content-Type；未知按 audio/wav。"""
+    ext = os.path.splitext(str(path))[1].lower()
+    return _AUDIO_CTYPES.get(ext, "audio/wav")
+
+
 class WhisperBackend(AsrBackend):
     """OpenAI 兼容的 ASR 后端：`POST {base}/audio/transcriptions`。
 
@@ -118,7 +136,8 @@ class WhisperBackend(AsrBackend):
             fields["language"] = self.language
 
         body, ctype = _multipart_body(
-            fields, "file", os.path.basename(wav_path), wav_bytes, "audio/wav")
+            fields, "file", os.path.basename(wav_path), wav_bytes,
+            _content_type_for(wav_path))
         url = self.base_url + "/audio/transcriptions"
         headers = {"Content-Type": ctype}
         if self.api_key:
@@ -219,9 +238,9 @@ def main():
     ap.add_argument("--backend", default="mock", choices=("mock", "whisper"),
                     help="mock=不联网假后端；whisper=OpenAI 兼容云端")
     ap.add_argument("--text", default="", help="mock 后端返回的固定句子")
-    ap.add_argument("--base-url", default="https://api.openai.com/v1",
+    ap.add_argument("--base-url", default="https://api.siliconflow.cn/v1",
                     help="OpenAI 兼容 base_url")
-    ap.add_argument("--model", default="whisper-1", help="ASR 模型名")
+    ap.add_argument("--model", default="FunAudioLLM/SenseVoiceSmall", help="ASR 模型名")
     ap.add_argument("--language", default=None, help="语言代码，如 zh；默认自动")
     ap.add_argument("--timeout", type=float, default=60.0, help="请求超时秒数")
     args = ap.parse_args()

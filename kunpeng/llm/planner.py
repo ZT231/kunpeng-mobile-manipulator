@@ -35,6 +35,7 @@ import dataclasses
 import json
 import os
 import sys
+import time
 import urllib.error
 import urllib.request
 import uuid
@@ -64,8 +65,10 @@ SYSTEM_PROMPT = (
     "ask(向用户提问)、done(结束任务)。规则：① 复杂指令先拆成多步，一步一步来；"
     "② 急停永远优先；③ 不确定目标位置/用户意图时用 ask 提问，不要瞎猜；"
     "④ 每次只调用你需要的那几个工具，看到工具结果再决定下一步；"
-    "⑤ 全部做完用 done 收尾并简述做了什么。搜索/移动/抓取/放置的执行器可能返回"
-    "“未就绪（模拟）”，你要据实继续或 ask。"
+    "⑤ navigate 的 direction 只能取 forward/backward/left/right/left_forward/"
+    "right_forward 之一；⑥ 抓取成功后必须先用 home 回到初始位，再用 ask 主动询问用户"
+    "下一步（例如放到哪里），等用户回答后再 place，最后 done 收尾；"
+    "⑦ 搜索/移动/抓取/放置的执行器可能返回“未就绪（模拟）”，你要据实继续或 ask。"
 )
 
 
@@ -91,7 +94,8 @@ TOOLS = [
                     "description": "方位，如“左前方/正前方/右侧”，可空"}},
         ["target"]),
     _fn("navigate", "让底盘移动一小段距离。",
-        {"direction": {"type": "string", "description": "方向，见系统约束"},
+        {"direction": {"type": "string",
+                       "description": "方向，只能取 forward/backward/left/right/left_forward/right_forward 之一"},
          "distance_cm": {"type": "number", "description": "移动距离，厘米"}},
         ["direction", "distance_cm"]),
     _fn("grasp", "抓取目标物体。",
@@ -178,9 +182,14 @@ def arbitrate(name, args):
 # ---------------------------------------------------------------------------
 # 执行器：身体动作当前为模拟，真实执行器通过 real_executors 注入
 # ---------------------------------------------------------------------------
-def execute(name, args, real_executors=None):
-    """执行一次已授权的工具调用，返回 (文本结果, 是否为 ask)。"""
+def execute(name, args, real_executors=None, mock_state=None):
+    """执行一次已授权的工具调用，返回 (文本结果, 是否为 ask)。
+
+    mock_state：模拟执行器共用的状态字典（如已搜索次数/是否已移动），
+    让 search 在“移动过一次后”返回“找到”，从而把整条 happy path 跑完。
+    """
     args = args or {}
+    st = mock_state if mock_state is not None else {}
     real = (real_executors or {}).get(name)
 
     if name == "ask":
@@ -203,8 +212,12 @@ def execute(name, args, real_executors=None):
         return "观察到候选：玩具熊猫 0.88、杯子 0.81、方块 0.75（模拟）", False
     if name == "search":
         t = args.get("target", "")
+        st["search"] = st.get("search", 0) + 1
+        if st.get("navigated", 0) > 0:
+            return "已找到 %s，位于机械臂抓取范围内（模拟）" % t, False
         return "未找到 %s，建议向左前方移动一小段后重试（模拟）" % t, False
     if name == "navigate":
+        st["navigated"] = st.get("navigated", 0) + 1
         return "已向 %s 移动 %.1f cm（模拟）" % (args.get("direction"), args.get("distance_cm", 0)), False
     if name == "grasp":
         return "已抓取 %s（模拟；真实抓取待总线舵机到货）" % args.get("target", ""), False
@@ -259,11 +272,14 @@ class OpenAiBackend(LlmBackend):
     """OpenAI 兼容 chat/completions（SiliconFlow / 阿里云百炼 / 智谱等）。"""
     name = "openai"
 
-    def __init__(self, base_url, model, api_key="", timeout=60.0):
+    def __init__(self, base_url, model, api_key="", timeout=120.0,
+                 retries=2, retry_backoff=2.0):
         self.base_url = base_url.rstrip("/")
         self.model = model
         self.api_key = api_key
         self.timeout = timeout
+        self.retries = max(0, int(retries))
+        self.retry_backoff = max(0.0, retry_backoff)
 
     def chat(self, messages, tools):
         body = json.dumps({"model": self.model, "messages": messages,
@@ -271,16 +287,24 @@ class OpenAiBackend(LlmBackend):
         headers = {"Content-Type": "application/json"}
         if self.api_key:
             headers["Authorization"] = "Bearer " + self.api_key
-        req = urllib.request.Request(self.base_url + "/chat/completions",
-                                     data=body, headers=headers, method="POST")
-        try:
-            with urllib.request.urlopen(req, timeout=self.timeout) as resp:
-                raw = resp.read().decode("utf-8", "replace")
-        except urllib.error.HTTPError as e:
-            detail = e.read().decode("utf-8", "replace")[:300] if e.fp else ""
-            raise RuntimeError("LLM 服务返回 HTTP %s：%s" % (e.code, detail))
-        except urllib.error.URLError as e:
-            raise RuntimeError("连不上 LLM 服务 %s（%s）" % (self.base_url, e.reason))
+
+        raw = None
+        for attempt in range(self.retries + 1):
+            req = urllib.request.Request(self.base_url + "/chat/completions",
+                                         data=body, headers=headers, method="POST")
+            try:
+                with urllib.request.urlopen(req, timeout=self.timeout) as resp:
+                    raw = resp.read().decode("utf-8", "replace")
+                break
+            except urllib.error.HTTPError as e:
+                detail = e.read().decode("utf-8", "replace")[:300] if e.fp else ""
+                raise RuntimeError("LLM 服务返回 HTTP %s：%s" % (e.code, detail))
+            except (urllib.error.URLError, TimeoutError, OSError) as e:
+                if attempt >= self.retries:
+                    raise RuntimeError("连不上或超时 LLM 服务 %s（%s）" % (self.base_url, e))
+                time.sleep(self.retry_backoff * (attempt + 1))
+        if raw is None:
+            raise RuntimeError("LLM 服务无响应 %s" % self.base_url)
 
         try:
             obj = json.loads(raw)
@@ -310,6 +334,7 @@ class Planner:
         self.apply = apply
         self.max_steps = max_steps
         self.messages = []
+        self.mock_state = {}
 
     # ---- 多轮对话入口 ----
     def run(self, user_text, resume=False):
@@ -352,7 +377,8 @@ class Planner:
                     result = "仲裁拒绝：%s" % v.reason
                     ask = False
                 else:
-                    result, ask = execute(tc.name, tc.arguments, self.real_executors)
+                    result, ask = execute(tc.name, tc.arguments, self.real_executors,
+                                          self.mock_state)
                     if tc.name in ("home", "estop", "resume") and self.apply:
                         result = result.replace("（dry-run）", "（已真下发）")
                 steps.append({"tool": tc.name, "args": tc.arguments,
@@ -401,7 +427,15 @@ def self_test():
     r3 = Planner(MockBackend(loop_script)).run("看")
     assert r3.status == "error", r3
 
-    _emit("SELF_TEST PASS（仲裁 + ReAct + 多轮续跑 + 超步保护 全验）")
+    # 5) 模拟 search 状态机：移动前“未找到”，移动后“找到”
+    st = {}
+    txt, _ = execute("search", {"target": "玩具熊猫"}, mock_state=st)
+    assert "未找到" in txt
+    execute("navigate", {"direction": "left_forward", "distance_cm": 30}, mock_state=st)
+    txt, _ = execute("search", {"target": "玩具熊猫"}, mock_state=st)
+    assert "已找到" in txt
+
+    _emit("SELF_TEST PASS（仲裁 + ReAct + 多轮续跑 + 超步保护 + 模拟搜索 全验）")
     return 0
 
 
@@ -416,7 +450,7 @@ def main():
     ap.add_argument("--base-url", default="https://api.siliconflow.cn/v1")
     ap.add_argument("--model", default="Qwen/Qwen3.8-27B")
     ap.add_argument("--apply", action="store_true", help="home/estop/resume 真下发（未接时仍 dry-run）")
-    ap.add_argument("--timeout", type=float, default=60.0)
+    ap.add_argument("--timeout", type=float, default=120.0)
     args = ap.parse_args()
 
     if args.self_test:

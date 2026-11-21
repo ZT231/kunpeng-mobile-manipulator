@@ -35,6 +35,9 @@
       --tts-backend siliconflow --tts-out-dir /root/tts
   # 单文件演练（不录音，读已有 WAV，全程 mock）：
   python3 voice_loop.py --wav /root/cap.wav
+  # 多轮演练（两个已有音频当两轮输入）：
+  python3 voice_loop.py --wavs 指令.m4a 回答.m4a --asr-backend whisper \
+      --llm-backend openai --tts-backend siliconflow --tts-out-dir .
 """
 
 import argparse
@@ -163,6 +166,8 @@ def build_parser():
     g0 = p.add_argument_group("音频来源")
     g0.add_argument("--record", type=int, default=0, help="每轮录 N 秒（0=不录；给 --wav 时忽略）")
     g0.add_argument("--wav", default=None, help="读单个 WAV，跑一轮后退出")
+    g0.add_argument("--wavs", nargs="+", default=None,
+                    help="读多个 WAV 依次当多轮输入（如：指令.m4a 回答.m4a）")
     g0.add_argument("--sink-host", default="0.0.0.0")
     g0.add_argument("--sink-port", type=int, default=9001)
     g0.add_argument("--sink-out", default="/root/cap_live.wav")
@@ -189,7 +194,7 @@ def build_parser():
 
     g4 = p.add_argument_group("执行")
     g4.add_argument("--apply", action="store_true", help="home/estop/resume 真下发")
-    g4.add_argument("--timeout", type=float, default=60.0)
+    g4.add_argument("--timeout", type=float, default=120.0)
     return p
 
 
@@ -225,7 +230,12 @@ def main():
         play_fn = None  # VoiceLoop 会用默认提示
 
     # 录音函数
-    if args.wav:
+    if args.wavs:
+        queue = list(args.wavs)
+
+        def record_fn():
+            return queue.pop(0) if queue else None
+    elif args.wav:
         used = {"done": False}
 
         def record_fn():
