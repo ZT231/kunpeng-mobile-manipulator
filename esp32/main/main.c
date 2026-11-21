@@ -44,7 +44,7 @@ static const char *TAG = "voice_main";
  * 【为什么先纯 ASCII】$ESTOP / $RESUME 走 voice_gateway 的
  *   special_text() 快速通道，不依赖中文编码，能先把「网络通不通」
  *   和「中文编码对不对」两个问题分开定位
- *   （详 → docs/ESP32-S3接入与阶段收尾路线.md 3.3 实证）。
+ *   （详 → docs/固件与ESP32开发.md 相关章节）。
  * ------------------------------------------------------------ */
 typedef struct {
     const char *payload;   /* '$' 与 '*' 之间的内容，交给 protocol_build_frame() */
@@ -64,7 +64,7 @@ static const link_frame_t s_link_frames[] = {
  *   ⇒ payload 共 4 + 12 = 16 字节，逐字节 XOR 的 CK = 0x61。
  * 【规范定义】C99 的 \ooo 是「八进制转义，最多 3 位」，长度固定，
  *   不像 \xNN 会一直吞后面的十六进制字符，拼接多字节时更安全。
- * 【对照】docs/上板验收-语音网关阶段2.md 里板端 printf 用的是同一串字节。 */
+ * 【对照】docs/KunPeng部署与语音网关上板验收.md 里板端 printf 用的是同一串字节。 */
 #define CN_HOME_PAYLOAD  "ASR,\345\233\236\345\210\235\345\247\213\344\275\215"
 
 /* 🔴 默认 0：中文帧在网关 --apply 时会真的下发 HOME、让臂回初始位。

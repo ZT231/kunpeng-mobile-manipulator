@@ -14,7 +14,7 @@
  *   真源：Core/Src/uart_protocol.c 的 proto_send_frame() / proto_parse_frame()。
  *   Python 侧对照：kunpeng/llm/text_gateway.py 的 xor_checksum()。
  *
- * 🔴 跨语言坑（docs/排障记录-LLM.md 第 2 条）：XOR 定义在**字节序列**上。
+ * 🔴 跨语言坑（docs/排障记录-服务端与IoT.md 第 2 条）：XOR 定义在**字节序列**上。
  *   C 的 char* 本来就是字节，天然对齐；Python 的 str 是 Unicode 码点，
  *   中文必须先 .encode("utf-8") 再逐字节算，否则将来接板子全被判 ERR,2。
  *
