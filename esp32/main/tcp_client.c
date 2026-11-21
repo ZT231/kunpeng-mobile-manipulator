@@ -44,7 +44,7 @@ int tcp_client_send(const char *host, uint16_t port, const char *frame,
     /* 先清零：recv 收到多少就用多少，别把上次的旧字节当成本次应答打印 */
     memset(reply, 0, reply_size);
 
-    /* ---------- 第 1 步：把 "10.160.120.1" 变成能喂给 socket 的地址 ----------
+    /* ---------- 第 1 步：把 "192.168.77.100" 变成能喂给 socket 的地址 ----------
      * 【概念】getaddrinfo() 是「地址翻译官」：给它主机字符串和端口，
      *   它回一串可直接用的地址结构。IP 字面量也走它，代码只需一套写法。
      * 【为什么不用 inet_addr()】后者只认 IPv4 点分十进制、不支持域名，

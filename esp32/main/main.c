@@ -1,5 +1,5 @@
 #include <string.h>       /* memset */
-#include <stdbool.h>      /* bool / true / false —— 用到就自己 include，别靠 wifi_sta.h 间接带进来 */
+#include <stdbool.h>      /* bool / true / false —— 用到就自己 include，别靠 wifi_ap.h 间接带进来 */
 
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
@@ -7,9 +7,10 @@
 #include "esp_err.h"
 
 #include "i2s_mic.h"
-#include "wifi_sta.h"
+#include "wifi_ap.h"
 #include "protocol.h"
 #include "tcp_client.h"
+#include "audio_tx.h"
 
 /* ============================================================
  * app_main —— ESP-IDF 的程序入口
@@ -21,14 +22,16 @@
  *   CONFIG_ESP_MAIN_TASK_STACK_SIZE 决定；函数里可以阻塞、可以起新任务。
  *
  * 🔴 诚实边界（每次上板前默念一遍）：
- *   本固件做「连 Wi-Fi + 采 PCM + 封帧 + 把纯 ASCII 帧经 TCP 发给鲲鹏网关」。
+ *   本固件做「开 SoftAP 热点 + 文本链路自检 + 连续采 PCM 经 TCP 上行」。
  *   - 仍然没有 WakeNet 唤醒、没有 ASR、没有语音转文字；
  *   - 仍然不直接驱动舵机、不碰 STM32、不改 .ioc；
- *   - 发的只是「链路自检帧」$ESTOP / $RESUME，网关 dry-run 也回 $OK，
- *     目的是证明「ESP32 → Wi-Fi → 鲲鹏网关 → 应答」这一段通了；
+ *   - 9000 端口发「链路自检帧」$ESTOP / $RESUME，网关 dry-run 回 $OK，
+ *     目的是证明「ESP32(SoftAP) → 局域网 → 鲲鹏网关(STA) → 应答」这段通了；
+ *   - 9001 端口连续上行 PCM（16kHz/16bit/单声道），鲲鹏 audio_sink.py 落 WAV；
  *   - 中文帧 $ASR,回初始位 默认关闭（SEND_CN_HOME_FRAME=0），
- *     因为网关 --apply 时它会真的让臂回初始位，明天联调前不许误触发；
- *   - **本固件未上板联调**：connect 成功与否取决于明天教室里的热点与网关 IP。
+ *     因为网关 --apply 时它会真的让臂回初始位，确认安全前不许误触发。
+ *   - ✅ 已实机验证：SoftAP 起来、鲲鹏(STA)接入、9000 文本帧往返、
+ *     I2S0 采到非零 PCM；9001 音频上行待鲲鹏侧起 audio_sink.py 后验收。
  * ============================================================ */
 
 static const char *TAG = "voice_main";
@@ -155,16 +158,16 @@ void app_main(void)
     ESP_LOGI(TAG, "==== ESP32-S3 语音入口骨架启动（含 TCP 上行自检） ====");
     ESP_LOGW(TAG, "只采音 / 只发链路自检帧；未接 WakeNet、未接 ASR、未直接驱动舵机");
 
-    /* ---------- 第 1 步：连 Wi-Fi ----------
-     * 【为什么先连】TCP 上行必须等拿到 IP；连不上也别直接 return，
-     *   让本地封帧自检 + I2S 采音自检照样跑，这样一根杜邦线没接好
-     *   或热点没开，都能单独定位，不互相掩盖。 */
-    esp_err_t err = wifi_sta_start();
-    bool net_ok = (err == ESP_OK) && wifi_sta_is_connected();
+    /* ---------- 第 1 步：开 SoftAP 热点 ----------
+     * 【为什么先开】TCP 上行要等鲲鹏作为 STA 连进来；开失败也别直接 return，
+     *   让本地封帧自检 + I2S 采音自检照样跑，这样热点没开或麦克风没接
+     *   都能单独定位，不互相掩盖。 */
+    esp_err_t err = wifi_ap_start();
+    bool net_ok = (err == ESP_OK) && wifi_ap_is_started();
     if (!net_ok) {
-        ESP_LOGE(TAG, "Wi-Fi 未连上，跳过 TCP 上行；本地封帧自检 + I2S 自检照跑");
+        ESP_LOGE(TAG, "SoftAP 启动失败，跳过 TCP 上行；本地封帧自检 + I2S 自检照跑");
     } else {
-        ESP_LOGI(TAG, "Wi-Fi OK, is_connected=1；网关目标 %s:%d",
+        ESP_LOGI(TAG, "SoftAP 已启动 192.168.77.1；网关目标 %s:%d",
                  GATEWAY_HOST, GATEWAY_PORT);
     }
 
@@ -184,32 +187,25 @@ void app_main(void)
         return;
     }
 
-    /* ---------- 第 5 步：循环读 PCM，每秒打印一次前 4 个采样 ----------
-     * 【概念】采样 = 某一瞬间声音的振幅，一个 int32_t 就是一个采样。
-     *   打印出来不是 0 / 不是恒定的常数，就说明麦克风真的在出数据。
-     * 【为什么 memset】数组是栈上分配的，不清零会带着上次的旧值；
-     *   若这次只读到 1 个采样，后面 3 个打印出来是垃圾，会误导排障。 */
-    int32_t samples[256];
-    int loop = 0;
-
-    while (1) {
-        memset(samples, 0, sizeof(samples));
-
-        int n = i2s_mic_read(samples, 256);
-        if (n > 0) {
-            ESP_LOGI(TAG, "[%03d] 读到 %d 个采样: %d %d %d %d",
-                     loop, n,
-                     (int)samples[0], (int)samples[1],
-                     (int)samples[2], (int)samples[3]);
-        } else {
-            ESP_LOGW(TAG, "[%03d] 没读到采样：查 BCLK/WS/DIN 接线、L/R 引脚、3.3V 供电", loop);
-        }
-
-        loop++;
-        /* vTaskDelay 让出 CPU，别用空 for 循环硬等（那会把一个核跑满） */
-        vTaskDelay(pdMS_TO_TICKS(1000));
+    /* ---------- 第 5 步：采音自检，确认麦在出数 ----------
+     * 【为什么先自检再交任务】麦没接 / L/R 悬空时，得让「硬件问题」
+     *   和「网络问题」分开暴露；这一步只读一批打印前 4 个采样。 */
+    int32_t probe[256];
+    int pn = i2s_mic_read(probe, 256);
+    if (pn > 0) {
+        ESP_LOGI(TAG, "采音自检：%d 个采样 %d %d %d %d",
+                 pn, (int)probe[0], (int)probe[1], (int)probe[2], (int)probe[3]);
+    } else {
+        ESP_LOGW(TAG, "采音自检：没读到采样，查 BCLK/WS/DIN 接线、L/R 引脚、3.3V 供电");
     }
 
-    /* 实际不会走到这里（while(1)）；留着是提醒：真要退出得先 i2s_mic_stop() */
-    /* i2s_mic_stop(); */
+    /* ---------- 第 6 步：启动 PCM 上行任务（TCP 9001） ---------- */
+    if (net_ok) {
+        err = audio_tx_start();
+        if (err != ESP_OK) {
+            ESP_LOGE(TAG, "音频上行任务启动失败");
+        }
+    } else {
+        ESP_LOGW(TAG, "SoftAP 未就绪，跳过音频上行；采音自检已单独完成");
+    }
 }

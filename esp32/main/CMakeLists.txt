@@ -16,9 +16,10 @@ idf_component_register(
     SRCS
         "main.c"
         "i2s_mic.c"
-        "wifi_sta.c"
+        "wifi_ap.c"
         "protocol.c"
         "tcp_client.c"
+        "audio_tx.c"
     INCLUDE_DIRS
         "."
     REQUIRES

@@ -5,10 +5,10 @@
 > 判据不变：**核心 = 必须能演示**。所以下面的缺口必须补齐，不许因为「它是核心」就写成已完成。
 > **硬件**：✅ 成品 ESP32-S3 开发板可直接使用（CH343 / N16R8 / Type-C / 已焊），另有 INMP441 I2S 麦模块、MAX98357A I2S 功放 + 3W 喇叭（均已焊排针，无需焊接）。
 > 自画核心板 / 扩展板**仍待焊**，用于最终装车集成，与成品板是两条并行的线，不冲突。
-> **软件**：🔶 **ESP-IDF 工程骨架已落盘（12 个文件，11-14 晚新增 TCP 上行层）；PC 整机 `idf.py build` 已通过，未烧录 / 未上板 / 未联调**。
-> 已有：Wi-Fi STA 连接、I2S 采音、`$ASR,...*CK` 封帧、**Wi-Fi TCP 上行鲲鹏网关**（`tcp_client.c/.h`，一次一连接收发一帧）。
+> **软件**：🔶 **ESP-IDF 工程骨架已落盘（14 个文件，含 `tcp_client.c/.h` TCP 上行层与 `audio_tx.c/.h` PCM 上行）；PC 整机 `idf.py build` 已通过，已烧录实机验证（SoftAP/TCP 9000/采音）**。
+> 已有：Wi-Fi SoftAP 热点、I2S 采音、`$ASR,...*CK` 封帧、**Wi-Fi TCP 上行鲲鹏网关**（`tcp_client.c/.h`，一次一连接收发一帧）。
 > **11-14 晚**：PC 上用现成 ESP-IDF v5.5.5 在纯 ASCII 副本 `D:\esp\s3_voice` 跑了 `idf.py set-target esp32s3`（**rc=0**）+ 整机 `idf.py build` **通过**（`Project build complete`、`BUILD_RC=0`、`tcp_client.c` 编译链接成功、产物 4 件齐全，回读记录见 `docs/明日回教室-ESP32照跑清单.md` 第一节）；
-> 🔴 **编译通过 ≠ 实机**：仍未烧录 / 未上板 / 未联调，档位仍 🔶，不许写「已接 ESP32 / 语音控制已实现」。
+> 🔴 **编译通过 ≠ 实机**：已烧录实机验证（SoftAP/TCP 9000/采音），档位仍 🔶，不许写「已接 ESP32 语音链路 / 语音控制已实现」。
 > **未写**：WakeNet 唤醒、命令词识别（MultiNet）、ST7789 显示、语音→动作序列、ESP32 遥测进 EMQX。
 > 🔴 **自检帧是写死的 `$ESTOP*5D` / `$RESUME*19` 纯 ASCII 快速通道**（网关 dry-run 也回 `$OK`，**默认固件不会让臂动**）；
 > 中文 `$ASR,回初始位*61` 已写好但由 `SEND_CN_HOME_FRAME=0` 默认关闭（`--apply` 下会真让臂回初始位，明天确认安全再开）。
@@ -39,10 +39,10 @@
 
 ESP32-S3 只做**最前端一件事：把人说的话变成一句文本**，再经 Wi-Fi/串口交给鲲鹏；不参与运动学解算、不直接驱动舵机。分工理由：ESP32 算力有限（双核 240MHz），但 Wi-Fi/BLE 与 I2S 麦克风接口最方便。
 
-**当前实现到哪一步**：鲲鹏侧已能把「一句文本」翻成结构化指令（`kunpeng/llm/intent_parser.py`），收帧服务 `kunpeng/robot/voice_gateway.py` **11-14 16:40 已上板 `--apply` 实机验收四层硬判据全绿**（但 `source` 恒 `mock`、没接 ESP32）。
+**当前实现到哪一步**：鲲鹏侧已能把「一句文本」翻成结构化指令（`kunpeng/llm/intent_parser.py`），收帧服务 `kunpeng/robot/voice_gateway.py` **11-14 16:40 已上板 `--apply` 实机验收四层硬判据全绿**（`source` 仍标 `mock`；ESP32 已接入并发链路自检帧）。
 ESP32 侧 11-14 晚补上了 **Wi-Fi TCP 上行层**（`tcp_client.c/.h` + `main.c` 自检帧改 `$ESTOP/$RESUME` 纯 ASCII 快速通道）：
-本机实证 C 侧封帧与 Python 侧逐字节一致、真网关应答正确（`PASS=24 FAIL=0`），整机 build 在 PC 上已启动（结论见清单）。
-🔴 **仍未上板联调**：ESP32 是否真能把帧发到教室热点下的鲲鹏，取决于明天的实际网络与网关 IP；
+本机实证 C 侧封帧与 Python 侧逐字节一致、真网关应答正确（`PASS=24 FAIL=0`），整机 build 在 PC 上已通过（结论见清单）。
+✅ **已上板实机联调（旧网段 192.168.4.x）**：ESP32 已把 `$ESTOP/$RESUME` 帧发到鲲鹏并收到 `$OK,ESTOP*75` / `$OK,RESUMED*75`；改为唯一网段 `192.168.77.x` 后待复验；
 **唤醒 / ASR / 语音→动作序列仍无代码**，发的只是写死的链路自检帧，不是「说话控制机械臂」。
 
 ## 三、硬件清单（分两组，别混）
@@ -74,11 +74,11 @@ ESP32 侧 11-14 晚补上了 **Wi-Fi TCP 上行层**（`tcp_client.c/.h` + `main
 
 | 步骤 | 做什么 | 状态 | 关键点 |
 |---|---|---|---|
-| 1 | ESP-IDF 工程骨架：`idf.py` 建工程、串口打印 + Wi-Fi 连接 | 🔶 **骨架已落盘（12 个文件，含 `tcp_client.c/.h`）**；`protocol.c` 本机 gcc 编译 + S2 实机锚点帧反查通过；**11-14 晚 PC 上整机 `idf.py build` 已通过**（`Project build complete` / `BUILD_RC=0` / 产物齐全，回读见 `docs/明日回教室-ESP32照跑清单.md` 第一节）**；**未烧录 / 未上板** | ✅ PC 已装 ESP-IDF v5.5.5（`D:\ESP32\Espressif`），须从 **ESP-IDF PowerShell 快捷方式**启动（Git Bash 会被拒）；工程须拷到 ASCII 路径；先确认 CH343 下载电路正常 |
-| 2 | INMP441 采音，I2S0 读原始 PCM，串口打印波形 | 🔶 驱动骨架已落盘（`i2s_std` 新 API），**未上板验证** | 先验证麦克风有数据，再谈识别；读出全 0 先查 L/R 引脚（接 GND = 左时隙） |
+| 1 | ESP-IDF 工程骨架：`idf.py` 建工程、串口打印 + Wi-Fi SoftAP 热点 | 🔶 **骨架已落盘（14 个文件，含 `tcp_client.c/.h` TCP 上行层与 `audio_tx.c/.h` 音频上行）**；`protocol.c` 本机 gcc 编译 + S2 实机锚点帧反查通过；**11-14 晚 PC 上整机 `idf.py build` 已通过**（`Project build complete` / `BUILD_RC=0` / 产物齐全，回读见 `docs/明日回教室-ESP32照跑清单.md` 第一节）**；**已烧录实机验证（SoftAP/TCP 9000/采音）** | ✅ PC 已装 ESP-IDF v5.5.5（`D:\ESP32\Espressif`），须从 **ESP-IDF PowerShell 快捷方式**启动（Git Bash 会被拒）；工程须拷到 ASCII 路径；先确认 CH343 下载电路正常 |
+| 2 | INMP441 采音，I2S0 读原始 PCM，串口打印波形 | 🔶 驱动骨架已落盘（`i2s_std` 新 API），**已实机验证采到非零 PCM** | 先验证麦克风有数据，再谈识别；读出全 0 先查 L/R 引脚（接 GND = 左时隙） |
 | 3 | ESP-SR / WakeNet 离线唤醒词 | 📋 无代码 | 模型放 Flash/PSRAM，`sdkconfig` 开 Octal PSRAM |
 | 4 | 唤醒后录音 → 在线 ASR 或本地命令词 | 📋 无代码 | 在线需 Wi-Fi + API Key |
-| 5 | 封好的帧 → Wi-Fi TCP 发鲲鹏收帧网关 | 🔶 **有代码未实机**：`tcp_client.c/.h` 已落盘、`main.c` 发 `$ESTOP/$RESUME` 自检帧；本机真网关实证 `PASS=24 FAIL=0`；**未上板联调** | **逐字节** XOR；中文帧用 C 八进制字节串写死（CK `61`）且默认关闭；鲲鹏网关须 `--host 0.0.0.0`；帧格式**语法层已对齐、语义层待明天实机对齐** |
+| 5 | 封好的帧 → Wi-Fi TCP 发鲲鹏收帧网关 | 🔶 **有代码未实机**：`tcp_client.c/.h` 已落盘、`main.c` 发 `$ESTOP/$RESUME` 自检帧；本机真网关实证 `PASS=24 FAIL=0`；**已实机（TCP 9000 往返 $OK）** | **逐字节** XOR；中文帧用 C 八进制字节串写死（CK `61`）且默认关闭；鲲鹏网关须 `--host 0.0.0.0`；帧格式**语法层已对齐、语义层待明天实机对齐** |
 | 6 | MAX98357A 回 TTS 提示音 | 📋 无代码 | I2S1 TX |
 
 ## 五、和现有代码的对接点
@@ -90,7 +90,7 @@ ESP32 侧 11-14 晚补上了 **Wi-Fi TCP 上行层**（`tcp_client.c/.h` + `main
 
 ## 六、当前目录结构（12 个工程文件 + 本 README = 13 个，11-14 晚补 TCP 上行层）
 
-> 口径说明：其它文档写「12 文件骨架」指**不含本 README 的工程文件**；11-15 完整检查时同步脚本实测 `esp32/` 共 **13 个文件**（含 README.md，不含 `build/` 产物），两者不矛盾。
+> 口径说明：其它文档写「14 文件骨架」指**不含本 README 的工程文件**（11-21 新增 `audio_tx.c/.h` 音频上行）；含 README.md 共 **15 个文件**（不含 `build/` 产物），两者不矛盾。
 
 ```
 esp32/
@@ -99,25 +99,25 @@ esp32/
 ├── sdkconfig.defaults         ← 默认配置（16MB Flash / Octal PSRAM / 1000Hz tick），一行未动
 └── main/
     ├── CMakeLists.txt         ← 组件注册：5 个 .c + REQUIRES 六个官方组件（含 lwip）
-    ├── main.c                 ← app_main：连 Wi-Fi → 本地封帧自检 → TCP 上行自检 → 启 I2S → 循环读 PCM
+    ├── main.c                 ← app_main：开 SoftAP 热点 → 本地封帧自检 → TCP 上行自检 → 启 I2S → 循环读 PCM
     ├── tcp_client.c / .h      ← 🆕 Wi-Fi TCP 上行鲲鹏网关（BSD socket，一次一连接）
     ├── i2s_mic.c / .h         ← INMP441 I2S0 RX 采 PCM（新 I2S 驱动）
-    ├── wifi_sta.c / .h        ← Wi-Fi STA 连接骨架（事件组等 IP；SSID/密码占位符明天本机改）
+    ├── wifi_ap.c / .h        ← Wi-Fi SoftAP 热点（固定 192.168.77.1；SSID/密码在 wifi_ap.h 改）
     └── protocol.c / .h        ← 统一帧 XOR 封包（与 STM32 对齐；只封帧，发送交给 tcp_client.c）
 ```
 
 > 排障记录统一放工程根 `docs/排障记录-ESP32.md`（与 S3b / IoT / LLM 三个模块一致，个人复习材料不进 Git）。
-> 🔴 **代码已落盘 ≠ 可用**：这些文件在 PC 上跑过本机实证与整机 build（结论见清单），但**从未烧进 ESP32、从未上板联调**。
+> 🔴 **代码已落盘 ≠ 可用**：这些文件在 PC 上跑过本机实证与整机 build（结论见清单），但**已烧录并实机验证（SoftAP/TCP 9000/采音）**。
 > 明天照 `docs/明日回教室-ESP32照跑清单.md` 跑完四层硬判据，才能把「链路」写成已验证；之后才逐步填 WakeNet / ASR。
 
 ## 七、诚实边界（🔴 面试不能越线）
 
 | ✅ 能说 | ❌ 不能说 |
 |---|---|
-| 「ESP32-S3 语音是三大支柱②（P0 核心，整体仍 🔶）；成品开发板 + 麦/功放/喇叭已可直接用，自画核心板仍待焊」 | 「语音控制已实现 / 已接 ESP32-S3」 |
+| 「ESP32-S3 语音是三大支柱②（P0 核心，整体仍 🔶）；成品开发板 + 麦/功放/喇叭已可直接用，自画核心板仍待焊」 | 「语音控制已实现 / 已接 ESP32-S3 语音链路」 |
 | 「鲲鹏侧收帧网关 11-14 16:40 已上板实机验收（38 项单测 + 四层硬判据）；`llm/` 44 项单元测试全绿」 | 「语音唤醒 / 离线 ASR / 语音→动作闭环 / 自动抓取」 |
 | 「统一帧用逐字节 XOR，与 STM32 固件对齐；ESP32 侧 `protocol.c` 与鲲鹏侧 Python 帧语法层本机逐字节一致」 | 「`$ASR` 帧已是实机协议 / 语义层已联调」 |
-| 「ESP-IDF 工程骨架已落盘 12 文件（含 Wi-Fi TCP 上行层），`protocol.c` 本机 gcc 编译并用 `$PING*10` / `$OK,PONG*3E` 反查通过；PC 上用现成 v5.5.5 整机 `idf.py build` 已通过（`Project build complete` / 产物齐全，仍未烧录）」 | 「已在 ESP32 上编译烧录成功 / 语音唤醒已实现 / 已接 ESP32 主链路 / 明天已能说话控制机械臂」 |
+| 「ESP-IDF 工程骨架已落盘 14 文件（含 Wi-Fi TCP 上行层），`protocol.c` 本机 gcc 编译并用 `$PING*10` / `$OK,PONG*3E` 反查通过；PC 上用现成 v5.5.5 整机 `idf.py build` 已通过（`Project build complete` / 产物齐全，已烧录实机）」 | 「已在 ESP32 上编译烧录成功 / 语音唤醒已实现 / 已接 ESP32 语音链路 / 明天已能说话控制机械臂」 |
 
 ---
 
@@ -143,10 +143,10 @@ esp32/
 ② 「申请通道」和「配时序」分开是官方分层，同一通道可换 Philips/PCM/TDM 而不重做 DMA；引脚宏集中一处，接线一改只动一个地方；24-bit 左对齐数据统一右移 8 位还原成有符号值。
 ③ enable 之前不配时序会读不到数；停的时候不先 `i2s_channel_disable()` 就 `i2s_del_channel()`，DMA 还在写内存会踩内存；24-bit 不右移会把振幅当成放大 256 倍的假数据。
 
-**`wifi_sta.c`（Wi-Fi STA）**
-① `nvs_flash_init()` → `esp_netif_init()` + `esp_event_loop_create_default()` → `esp_event_handler_instance_register()` 注册回调 → `esp_wifi_start()` → `xEventGroupWaitBits()` 阻塞等事件；用了事件组 EventGroup、回调 callback、`strncpy`、`{ 0 }` 结构体清零。
-② 用事件回调 + 事件组而不是 while 轮询全局变量，等待时任务睡眠让出 CPU；只认 `IP_EVENT_STA_GOT_IP` 才算连上（拿到 IP 才能通信）；`wifi_config_t = { 0 }` 先清零避免残留字节混进密码。
-③ 事件组若在注册回调之后才创建，回调里 `xEventGroupSetBits()` 会写空指针直接崩；把 `WIFI_EVENT_STA_CONNECTED` 当成「能通信」会过早发数据导致丢包。
+**`wifi_ap.c`（Wi-Fi SoftAP 热点）**
+① `nvs_flash_init()` → `esp_netif_init()` + `esp_event_loop_create_default()` → `esp_netif_create_default_wifi_ap()` → `esp_wifi_init()` → `esp_wifi_set_mode(WIFI_MODE_AP)` + `esp_wifi_set_config(WIFI_IF_AP, &wifi_config)` → `esp_wifi_start()`；`wifi_config_t` 用 `.ap` 填 SSID/密码/信道/最大连接/`WIFI_AUTH_WPA2_PSK`，`ssid_len` 用 `strlen` 显式给长度。
+② 用官方 `esp_netif_create_default_wifi_ap()` 一步先把 AP 网段配成官方默认 192.168.4.1/24，随后本工程在第 2.5 步主动改成唯一网段 192.168.77.1/24 并重启 DHCP，连进来的 STA 拿 192.168.77.x；AP 只负责把局域网搭起来，封帧转发仍由 `tcp_client.c` 负责，职责分离。
+③ 不先 `nvs_flash_init()` 就 `esp_wifi_init()` 会报射频校准数据未就绪；AP 密码短于 8 位时 `WIFI_AUTH_WPA2_PSK` 设置失败；鲲鹏静态地址若占 `.2` 会与手机从 ESP32 DHCP 池（`.2` 起发）抢地址，故取 `.100`。
 
 **`protocol.c`（统一帧封包）**
 ① 纯标准 C：`uint8_t` 逐字节 `^=`、`static const char HEX_DIGITS[]` 查表、`char *out` + `size_t out_size` 显式长度、手工拼帧并返回长度。
@@ -159,7 +159,7 @@ esp32/
 ③ **不这么写会出什么问题**：`main/CMakeLists.txt` 不补 `REQUIRES lwip` ⇒ 链接期 `undefined reference to getaddrinfo`；不设超时 ⇒ 断网时整机像死机；`send()` 不写循环 ⇒ TCP 是字节流、理论上可能只发一半；不 `close()` / `freeaddrinfo()` ⇒ 几十次后 fd 耗尽、`connect()` 失败会被误判成「Wi-Fi 掉了」；`recv()` 收满不留 `'\0'` ⇒ `%s` 打印越界；自检帧若还用 `$ASR,mic_ok*50` / `$ASR,home*63` ⇒ 网关一律 `$ERR,2*5B`（词表只有中文）；中文帧若忘了 `SEND_CN_HOME_FRAME=0`，在 `--apply` 网关下会**真的让臂回初始位**，属于误触发安全风险；网关忘了 `--host 0.0.0.0` ⇒ ESP32 从 Wi-Fi 连过来 `Connection refused`，极易被误判成热点问题。
 
 **`main.c` / `tcp_client.c` 11-15 完整检查后的 3 处最小加固**（一次性检查报告已按「不落盘一次性步骤」规则删除，结论直接记在这里）
-① **用了什么**：删掉 `main.c` 里全文没用到的 `<stdio.h>`；用到 `bool` 就自己 `#include <stdbool.h>`，不再靠 `wifi_sta.h` 间接带进来；两个 `setsockopt()` 的返回值用 `if (... != 0 || ... != 0)` 检查，失败时 `ESP_LOGW` 打一条警告。
+① **用了什么**：删掉 `main.c` 里全文没用到的 `<stdio.h>`；用到 `bool` 就自己 `#include <stdbool.h>`，不再靠 `wifi_ap.h` 间接带进来；两个 `setsockopt()` 的返回值用 `if (... != 0 || ... != 0)` 检查，失败时 `ESP_LOGW` 打一条警告。
 ② **为什么这么设计**：C 的头文件是**传递包含**，靠别的头顺带带进 `<stdbool.h>` 属于隐式依赖，以后换个 include 顺序就会莫名编不过；上面三行法已经写了「超时必须设」，那就必须验证超时**真的设上了**，否则 `setsockopt` 静默失败时现象仍是「整机死机」、却查不出原因 —— 代码要和注释自洽。
 ③ **不这么写会怎样**：未用 include 是无效代码，读者会以为用了 `printf` 白找一圈；隐式依赖是典型的「在我机器上能编」；超时保护形同虚设而串口只看到「卡住」，极易被误判成 Wi-Fi 掉了或网关没起。**这 3 处都不改功能、不改协议、不改帧字节**。
 **复验证据**：`gcc -std=c99 -Wall -Wextra -Werror` 零警告；当前源码同步到 ASCII 副本（13 文件 md5 全一致）后整机增量 `idf.py build` **`BUILD_RC=0`**，`[4/10] main.c.obj` + `[5/10] tcp_client.c.obj` 确实重编、链接出 `kunpeng_voice.bin` 803760 B；21 项静态/本机动态检查全绿。
@@ -184,7 +184,7 @@ New-Item -ItemType Directory -Force -Path D:\esp | Out-Null
 Copy-Item -Path "D:\简历\STM32项目\4.ESP32-S3项目\RoboticArm_Kunpeng\esp32" -Destination "D:\esp\s3_voice" -Recurse -Force
 ```
 
-> 之后所有命令与改动都在 **`D:\esp\s3_voice`** 副本里做（含 `wifi_sta.h` 的 `WIFI_SSID` / `WIFI_PASSWORD`：改成真实热点、**别提交 Git**；PC 与鲲鹏板连同一热点）。
+> 之后所有命令与改动都在 **`D:\esp\s3_voice`** 副本里做（含 `wifi_ap.h` 的 `AP_SSID` / `AP_PASSWORD`，当前 `Kunpeng-Robot` / `12345678`，正式联调可改、**别提交 Git**；鲲鹏作为 STA 以静态 192.168.77.100 接入 ESP32 热点）。
 > 三条命令各自带 `Set-Location`，**单条复制也能独立跑**，不必依赖上一条的会话状态；PS 5.1 无 `&&`，用 `;`。
 
 【PC · ESP-IDF PowerShell】
