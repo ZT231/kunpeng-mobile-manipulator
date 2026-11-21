@@ -469,6 +469,16 @@
               <FilePath>..\Core\Src\rfid.c</FilePath>
             </File>
             <File>
+              <FileName>chassis.c</FileName>
+              <FileType>1</FileType>
+              <FilePath>..\Core\Src\chassis.c</FilePath>
+            </File>
+            <File>
+              <FileName>i2c_probe.c</FileName>
+              <FileType>1</FileType>
+              <FilePath>..\Core\Src\i2c_probe.c</FilePath>
+            </File>
+            <File>
               <FileName>main.c</FileName>
               <FileType>1</FileType>
               <FilePath>../Core/Src/main.c</FilePath>

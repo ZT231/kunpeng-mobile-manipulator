@@ -82,6 +82,12 @@ void HAL_I2C_MspInit(I2C_HandleTypeDef* i2cHandle)
     __HAL_RCC_I2C1_CLK_ENABLE();
   /* USER CODE BEGIN I2C1_MspInit 1 */
 
+  /* 驱动板 I2C 是开漏、不带内部上拉（手册 v1.2 §2.1①：上拉由控制器提供）。
+     STM32 内部上拉约 30~50kΩ，100kHz + 20cm 线通常够用；
+     若示波器看 SDA 上升沿太慢或偶发 NACK，外接 4.7kΩ 到 3.3V（SCL/SDA 各一只）。
+     注意：PCA9685 与驱动板共用这条总线，加上拉对两者都有好处。 */
+  GPIO_InitStruct.Pull = GPIO_PULLUP;
+  HAL_GPIO_Init(GPIOB, &GPIO_InitStruct);
   /* USER CODE END I2C1_MspInit 1 */
   }
 }

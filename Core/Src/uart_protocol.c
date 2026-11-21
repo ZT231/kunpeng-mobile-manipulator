@@ -2,6 +2,7 @@
 #include "arm_control.h"
 #include "teach.h"
 #include "acs712.h"
+#include "chassis.h"
 #include "cmsis_os.h"
 #include <string.h>
 #include <stdio.h>
@@ -25,6 +26,11 @@ extern osMutexId_t arm_lock;
  *   $PING*XX\r\n
  *   $MOVE,0,1500*XX\r\n
  *   $JOINT,1500,1500,1500,1500,1500,1500*XX\r\n
+ *   $CAR,VEL,0.2,0,0*XX\r\n          (底盘前进 0.2m/s，500ms 心跳式)
+ *   $CAR,VEL,0.2,0,0,800*XX\r\n      (前进 0.2m/s，800ms 后自动停)
+ *   $CAR,STOP*XX\r\n
+ *   $CAR,ODOM*XX\r\n                 (回 $ODOM,x_mm,y_mm,yaw_deg,online*XX)
+ *   $CAR,RESET*XX\r\n
  * 响应格式：
  *   $OK[,<数据>]*XX\r\n
  *   $ERR,<code>*XX\r\n
@@ -277,6 +283,49 @@ static int parse_uint(const char **pp, uint32_t *val)
     return any;
 }
 
+/* 从 pp 指向的位置解析一个十进制浮点数（可选符号 + 可选小数点，
+ * 不支持科学计数法/十六进制）。成功返回 1 并把 pp 推进到数字之后；失败返回 0。
+ * 用于底盘 $CAR,VEL 的 vx/vy/wz 参数（m/s、rad/s）。 */
+static int parse_float(const char **pp, float *val)
+{
+    const char *p = *pp;
+    float sign = 1.0f;
+    float v = 0.0f;      /* 整数部分 */
+    float frac = 0.0f;   /* 小数部分累加 */
+    float scale = 0.1f;  /* 小数位权：0.1 / 0.01 / 0.001 ... */
+    int any = 0;
+
+    while (*p == ' ' || *p == ',') p++;
+
+    if (*p == '-') { sign = -1.0f; p++; }
+    else if (*p == '+') { p++; }
+
+    while (*p >= '0' && *p <= '9')
+    {
+        v = v * 10.0f + (float)(*p - '0');
+        p++;
+        any = 1;
+    }
+
+    if (*p == '.')
+    {
+        p++;
+        while (*p >= '0' && *p <= '9')
+        {
+            frac += (float)(*p - '0') * scale;
+            scale *= 0.1f;
+            p++;
+            any = 1;
+        }
+    }
+
+    if (!any) return 0;
+
+    *val = sign * (v + frac);
+    *pp = p;
+    return 1;
+}
+
 /* ---------- 命令处理 ---------- */
 
 /*
@@ -515,6 +564,112 @@ static void cmd_clearfault(void)
     proto_send_frame("OK");
 }
 
+/* ==================== 底盘命令 $CAR,... ==================== */
+
+/**
+  * @brief  $CAR,VEL,<vx>,<vy>,<wz>[,<ms>] —— 底盘速度（麦轮逆解）。
+  *         vx/vy 单位 m/s（+前 / +右）、wz 单位 rad/s（+逆时针俯视）。
+  *         给 ms 且 >0：跑 ms 后自动停；不给 ms 或 ms=0：持续跑，
+  *         固件 500ms 收不到新 VEL 会自动刹停（心跳式安全看门狗）。
+  *         本地仲裁量程：|vx|,|vy| ≤ 1.0m/s、|wz| ≤ 5.0rad/s、ms ≤ 60000。
+  */
+static void cmd_car_vel(const char *arg)
+{
+    float vx, vy, wz;
+    uint32_t ms = 0U;
+    int has_ms;
+
+    if (!parse_float(&arg, &vx)) { proto_send_frame("ERR,3"); return; }
+    if (!parse_float(&arg, &vy)) { proto_send_frame("ERR,3"); return; }
+    if (!parse_float(&arg, &wz)) { proto_send_frame("ERR,3"); return; }
+
+    if (vx < -1.0f || vx > 1.0f ||
+        vy < -1.0f || vy > 1.0f ||
+        wz < -5.0f || wz > 5.0f)
+    {
+        proto_send_frame("ERR,3");
+        return;
+    }
+
+    has_ms = parse_uint(&arg, &ms);
+    if (has_ms && ms > 60000U) { proto_send_frame("ERR,3"); return; }
+
+    /* 驱动板离线：如实回故障，绝不回 OK 装成功（否则上位机会以为车在动）。 */
+    if (!g_chassis.online) { proto_send_frame("ERR,5"); return; }
+
+    if (has_ms && ms > 0U)
+    {
+        CHS_SetVelocityMs(&g_chassis, vx, vy, wz, ms);
+    }
+    else
+    {
+        CHS_SetVelocity(&g_chassis, vx, vy, wz);
+    }
+
+    proto_send_frame("OK");
+}
+
+/**
+  * @brief  $CAR,STOP —— 立即刹停底盘。
+  */
+static void cmd_car_stop(void)
+{
+    (void)CHS_Stop(&g_chassis);
+    proto_send_frame("OK");
+}
+
+/**
+  * @brief  $CAR,ODOM —— 回读里程计与在线状态。
+  * @note   回 $ODOM,<x_mm>,<y_mm>,<yaw_deg>,<online>*CK（编码器积分值，取整）。
+  */
+static void cmd_car_odom(void)
+{
+    char buf[64];
+    float x, y, yaw;
+
+    CHS_GetOdometry(&g_chassis, &x, &y, &yaw);
+    (void)snprintf(buf, sizeof(buf), "ODOM,%ld,%ld,%ld,%u",
+                   (long)x, (long)y, (long)yaw, (unsigned)g_chassis.online);
+    proto_send_frame(buf);
+}
+
+/**
+  * @brief  $CAR,RESET —— 里程计清零（x/y/yaw 归 0，不清驱动板累计脉冲）。
+  */
+static void cmd_car_reset(void)
+{
+    CHS_ResetOdometry(&g_chassis);
+    proto_send_frame("OK");
+}
+
+/**
+  * @brief  $CAR,<子命令> —— 底盘命令分发：VEL / STOP / ODOM / RESET。
+  */
+static void cmd_car(const char *arg)
+{
+    char sub[8];
+    uint8_t i = 0U;
+    const char *p = arg;
+
+    while (*p != '\0' && *p != ',' && i < (sizeof(sub) - 1U))
+    {
+        sub[i++] = *p++;
+    }
+    sub[i] = '\0';
+    if (*p == ',') p++;      /* p 指向子命令参数 */
+
+    if (strcmp(sub, "VEL") == 0)
+        cmd_car_vel(p);
+    else if (strcmp(sub, "STOP") == 0)
+        cmd_car_stop();
+    else if (strcmp(sub, "ODOM") == 0)
+        cmd_car_odom();
+    else if (strcmp(sub, "RESET") == 0)
+        cmd_car_reset();
+    else
+        proto_send_frame("ERR,2");
+}
+
 /* 分发：frame_buf 中为去除 '$' 的完整命令串（"*" 已被截断为 '\0'） */
 static void proto_dispatch(void)
 {
@@ -607,6 +762,10 @@ static void proto_dispatch(void)
     else if (strcmp(cmd, "LOG") == 0)
     {
         cmd_log(arg != NULL ? arg : "");
+    }
+    else if (strcmp(cmd, "CAR") == 0)
+    {
+        cmd_car(arg != NULL ? arg : "");
     }
     else
     {
