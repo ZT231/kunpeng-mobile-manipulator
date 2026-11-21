@@ -70,3 +70,6 @@ Desktop.ini
 
 # 调试看图临时文件（摆位/棋盘现场照片，一次性产物，不进版本库）
 kunpeng/robot/look.jpg
+
+# 调试截图快照（_snap_check，一次性产物）
+kunpeng/vision/orbbec/_snap_check/

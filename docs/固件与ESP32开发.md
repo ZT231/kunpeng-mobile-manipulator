@@ -164,7 +164,7 @@ Set-Location D:\esp\s3_voice
 ```
 
 > 拷完应能看到 `CMakeLists.txt`、`sdkconfig.defaults`、`main\`。
-> 🔴 之后所有改动（含 `wifi_ap.h` 的 `AP_SSID` / `AP_PASSWORD`，当前 `Kunpeng-Robot` / `12345678`、**别提交 Git**）都在 **`D:\esp\s3_voice` 副本**里做，原工程不动。
+> 🔴 **源码以仓库内 `esp32/` 为准**，`D:\esp\s3_voice` 只是纯 ASCII 构建副本：每次改完 `esp32/main/` 源码都要**重拷到副本再 build**，否则烧的是旧代码。热点参数 `Kunpeng-Robot` / `12345678` 是演示默认值（已提交），正式部署前改成本地值。
 
 #### D. 首次 build（本机就能验，不用接板）
 
@@ -224,7 +224,7 @@ idf.py -p COM7 flash monitor
 | `idf.py` 不是 cmdlet / 找不到命令 | 没在 ESP-IDF 快捷方式窗口里；`Initialize-Idf.ps1` 没 dot-source |
 | CMake / Ninja 报路径含奇怪字符、找不到源文件 | 🔴 **中文工程路径没绕开** ⇒ 确认当前目录是 `D:\esp\s3_voice` |
 | `set-target` 报 Kconfig 未知项 | `sdkconfig.defaults` 的 `CONFIG_SPIRAM*` 命名差异 ⇒ 贴原始报错，按 v5.5.5 实际 Kconfig 订正 |
-| 热点没起来 | `main/wifi_ap.h` 里 `AP_SSID` / `AP_PASSWORD` 配错（当前 `Kunpeng-Robot` / `12345678`）⇒ 改后**别提交 Git**、重新 build；鲲鹏以 STA 接入该热点 |
+| 热点没起来 | `main/wifi_ap.h` 里 `AP_SSID` / `AP_PASSWORD` 配错（当前 `Kunpeng-Robot` / `12345678`）⇒ 改后重新 build；鲲鹏以 STA 接入该热点 |
 | `flash` 找不到端口 | 装 CH343 驱动；`-p COMx` 换设备管理器实际值；换一根**数据线**（很多线只能充电） |
 | monitor 全乱码 | 晶振 26MHz vs 40MHz（官方 hello_world 文档有此坑）；或波特率不匹配 |
 | I2S 读出来全 0 | 先查 INMP441 的 L/R 引脚（接 GND = 左时隙），别先怀疑代码 |
@@ -406,7 +406,7 @@ idf.py -p COM7 flash monitor
 > ✅ **明天回教室直接照跑的单行清单已单独落盘**：`docs/固件与ESP32开发.md`（确认 build 已通过 → 改热点 / 网关 IP → 起鲲鹏网关 `--host 0.0.0.0` → `flash monitor` → 四层硬判据 → 可选中文帧加试 → 记录表 / 失败分流）。
 > 🔴 **第一步的指令已单独落盘**：`docs/固件与ESP32开发.md`（**11-14 17:38 已订正为「环境已就位、直接 build」**：PC 上的 `D:\ESP32\Espressif` 就是完整 v5.5.5，不用再装；含启动方式、验版本、build / flash 命令、判据表、失败分流）。
 > 🔴 **不是装在鲲鹏板上**：ESP-IDF 是 PC 上的交叉编译/烧录工具链（USB 要摸到板载 CH343）；鲲鹏板只跑 `web_control.py` / `voice_gateway.py` 等运行时。
-> 🔴 **中文路径坑（必看）**：安装路径 `D:\ESP32\Espressif` 本身合规，但工程在 `D:\简历\STM32项目\...\esp32\` 含中文 ⇒ **先把 `esp32/` 拷到 `D:\esp\s3_voice` 再 build**，原工程不动；`esp32/README.md` 第十节已按此订正。
+> 🔴 **中文路径坑（必看）**：安装路径 `D:\ESP32\Espressif` 本身合规，但工程在 `D:\简历\STM32项目\...\esp32\` 含中文 ⇒ **先把 `esp32/` 拷到 `D:\esp\s3_voice` 再 build**（仓库源码不动，只改副本构建）；`esp32/README.md` 第十节已按此订正。
 > 🔴 **别在 Git Bash 里跑**：实测 `idf.py` 回 `MSys/Mingw is no longer supported` ⇒ 必须开 **ESP-IDF PowerShell / cmd 快捷方式**。
 
 #### 4.2 鲲鹏侧可粘贴命令（沿用 `docs/KunPeng部署与语音网关上板验收.md` 已实证写法，只多一个 `--host`）
@@ -553,7 +553,7 @@ python3 -u /root/kunpeng_vision/robot/voice_gateway.py --host 0.0.0.0 --port 900
 | **5** | ESP32 遥测进 EMQX（RSSI / 剩余堆 / 唤醒计数 / 识别成功数） | Grafana 新增 ESP32 面板，三条曲线随时间变化 | 阶段 1、MQTT client |
 | **6** | eKuiper 告警规则（RSSI < −70dBm、心跳超时 >10s） | 拔网线 / 走远，Grafana 告警面板变红；恢复后自动转绿 | 阶段 5 |
 
-> 🔴 **阶段 0 的路径前置（11-14 17:38 订正）**：ESP-IDF 环境**已就位、不用装**（PC `D:\ESP32\Espressif` = v5.5.5）；但工程目录 `D:\简历\STM32项目\...\esp32\` 含中文，官方构建系统明确不支持 ⇒ **先拷到 `D:\esp\s3_voice` 再 build**，原工程不动。必须从 **ESP-IDF PowerShell 快捷方式**启动，别用 Git Bash。完整指令 → `docs/固件与ESP32开发.md`。
+> 🔴 **阶段 0 的路径前置（11-14 17:38 订正）**：ESP-IDF 环境**已就位、不用装**（PC `D:\ESP32\Espressif` = v5.5.5）；但工程目录 `D:\简历\STM32项目\...\esp32\` 含中文，官方构建系统明确不支持 ⇒ **先拷到 `D:\esp\s3_voice` 再 build**（仓库源码不动，只改副本构建）。必须从 **ESP-IDF PowerShell 快捷方式**启动，别用 Git Bash。完整指令 → `docs/固件与ESP32开发.md`。
 
 **工作量粗估**：阶段 0~2 约 1 天（其中阶段 2 半天、可先行）；阶段 3~4 约 2~3 天（模型与 API 版本是主要不确定项）；阶段 5~6 约 1 天。
 

@@ -479,6 +479,11 @@
               <FilePath>..\Core\Src\i2c_probe.c</FilePath>
             </File>
             <File>
+              <FileName>servo_bus.c</FileName>
+              <FileType>1</FileType>
+              <FilePath>..\Core\Src\servo_bus.c</FilePath>
+            </File>
+            <File>
               <FileName>main.c</FileName>
               <FileType>1</FileType>
               <FilePath>../Core/Src/main.c</FilePath>
