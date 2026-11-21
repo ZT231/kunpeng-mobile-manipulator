@@ -245,7 +245,7 @@ auth:
 | 路线 | 服务端 | 端口/协议 | 状态 |
 |---|---|---|---|
 | **主链路（自研）** | `kunpeng/robot/voice_gateway.py` | TCP **9000** 文本帧 | ✅ 已实机（PC/板侧网关验收） |
-| 主链路音频上行 | `kunpeng/robot/audio_sink.py` | TCP **9001** PCM（32kHz/16bit/单声道） | 📋 未部署，待验收 |
+| 主链路音频上行 | `kunpeng/robot/audio_sink.py` | TCP **9001** PCM（16kHz/16bit/单声道） | ✅ 已部署实机（10s/320000B） |
 | 备选（小智生态） | xiaozhi-esp32-server | WebSocket 8000 + OTA | 📋 未部署 |
 
 - 网络固定口径：ESP32 SoftAP `192.168.77.1`，鲲鹏 STA 静态 `192.168.77.100`。
