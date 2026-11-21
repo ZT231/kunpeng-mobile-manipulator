@@ -434,7 +434,12 @@ def make_backend(kind, model, base_url, timeout):
     """
     if kind == "mock":
         return vd.MockBackend()
-    return vd.HttpBackend(base_url=base_url, model=model, timeout=timeout)
+    # 🔴 Key 只从环境变量读：云端 VLM（阿里云百炼/智谱等 OpenAI 兼容口）必须带
+    #    Authorization，本地 ollama 无需 Key 时留空即可。漏传会让云端 401，
+    #    而报错往往只写「HTTP 401」，容易误判成模型名拼错。
+    api_key = os.environ.get("VLM_API_KEY", "")
+    return vd.HttpBackend(base_url=base_url, model=model, api_key=api_key,
+                          timeout=timeout)
 
 
 def decide(instruction, detector_url, backend, timeout=8.0):
