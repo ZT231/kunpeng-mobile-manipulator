@@ -31,7 +31,7 @@
   # 真跑（key 已在环境变量）：
   python3 voice_loop.py --record 5 --apply \
       --asr-backend whisper --asr-model FunAudioLLM/SenseVoiceSmall \
-      --llm-backend openai --llm-model Qwen/Qwen3.8-27B \
+      --llm-backend openai --llm-model deepseek-ai/DeepSeek-V3.2 \
       --tts-backend siliconflow --tts-out-dir /root/tts
   # 单文件演练（不录音，读已有 WAV，全程 mock）：
   python3 voice_loop.py --wav /root/cap.wav
@@ -68,17 +68,17 @@ def _emit(text, newline=True):
 # 硅基流动默认值（与 asr/tts/planner 一致）
 SF_BASE = "https://api.siliconflow.cn/v1"
 ASR_MODEL = "FunAudioLLM/SenseVoiceSmall"
-LLM_MODEL = "Qwen/Qwen3.8-27B"
+LLM_MODEL = "deepseek-ai/DeepSeek-V3.2"
 
 
 class VoiceLoop:
     """多轮闭环：记录 pending_ask 状态，决定下一句喂 planner.run 还是 continue_turn。"""
 
     def __init__(self, asr_be, llm_backend, tts_be, record_fn,
-                 apply=False, play_fn=None):
+                 apply=False, play_fn=None, single_step=True):
         self.asr_be = asr_be
         self.tts_be = tts_be
-        self.planner = pl.Planner(llm_backend, apply=apply)
+        self.planner = pl.Planner(llm_backend, apply=apply, single_step=single_step)
         self.record_fn = record_fn
         self.play_fn = play_fn or (lambda wav: _emit("    （扬声器未接，音频已生成：%s）" % wav))
         self.pending_ask = False
@@ -182,6 +182,8 @@ def build_parser():
     g2.add_argument("--llm-backend", choices=("mock", "openai"), default="mock")
     g2.add_argument("--llm-base-url", default=SF_BASE)
     g2.add_argument("--llm-model", default=LLM_MODEL)
+    g2.add_argument("--multi-tool", action="store_true",
+                    help="允许 LLM 一次调用多个工具（省 token、更快；默认单步，走一步看一步）")
 
     g3 = p.add_argument_group("TTS")
     g3.add_argument("--tts-backend", choices=("mock", "siliconflow"), default="mock")
@@ -252,7 +254,7 @@ def main():
         return 1
 
     loop = VoiceLoop(asr_be, llm_be, tts_be, record_fn, apply=args.apply,
-                     play_fn=play_fn)
+                     play_fn=play_fn, single_step=not args.multi_tool)
     _emit("=" * 66)
     _emit("多轮语音闭环启动：ASR=%s  LLM=%s  TTS=%s" %
           (asr_be.name, llm_be.name, tts_be.name))

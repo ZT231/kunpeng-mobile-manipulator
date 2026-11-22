@@ -25,7 +25,7 @@
 用法（零第三方依赖）：
   python3 planner.py --self-test                     # 只验 ReAct 管道，不联网
   python3 planner.py --text "把左前方的玩具熊猫拿过来"  # mock 跑完整多步
-  python3 planner.py --text "..." --backend openai --model Qwen/Qwen3-8B \
+  python3 planner.py --text "..." --backend openai --model deepseek-ai/DeepSeek-V3.2 \
           --base-url https://api.siliconflow.cn/v1   # 真 LLM（需 LLM_API_KEY）
 """
 
@@ -64,12 +64,15 @@ SYSTEM_PROMPT = (
     "observe(观察画面)、search(搜索目标)、navigate(底盘移动)、grasp(抓取)、place(放置)、"
     "ask(向用户提问)、done(结束任务)。规则：① 复杂指令先拆成多步，一步一步来；"
     "② 急停永远优先；③ 不确定目标位置/用户意图时用 ask 提问，不要瞎猜；"
-    "④ 每次只调用你需要的那几个工具，看到工具结果再决定下一步；"
+    "{RULE4}"
     "⑤ navigate 的 direction 只能取 forward/backward/left/right/left_forward/"
     "right_forward 之一；⑥ 抓取成功后必须先用 home 回到初始位，再用 ask 主动询问用户"
     "下一步（例如放到哪里），等用户回答后再 place，最后 done 收尾；"
     "⑦ 搜索/移动/抓取/放置的执行器可能返回“未就绪（模拟）”，你要据实继续或 ask。"
 )
+
+RULE_SINGLE = "④ 每次只调用一个工具，看到它的结果再决定下一步；"
+RULE_MULTI = "④ 每次可调用一个或多个工具，看到结果再决定下一步；"
 
 
 # ---------------------------------------------------------------------------
@@ -328,19 +331,22 @@ class OpenAiBackend(LlmBackend):
 # Planner：ReAct 主循环
 # ---------------------------------------------------------------------------
 class Planner:
-    def __init__(self, backend, real_executors=None, apply=False, max_steps=MAX_STEPS):
+    def __init__(self, backend, real_executors=None, apply=False, max_steps=MAX_STEPS,
+                 single_step=True):
         self.backend = backend
         self.real_executors = real_executors or {}
         self.apply = apply
         self.max_steps = max_steps
+        self.single_step = single_step
         self.messages = []
         self.mock_state = {}
 
     # ---- 多轮对话入口 ----
     def run(self, user_text, resume=False):
+        rule = RULE_SINGLE if self.single_step else RULE_MULTI
         if not resume:
             self.messages = [
-                {"role": "system", "content": SYSTEM_PROMPT},
+                {"role": "system", "content": SYSTEM_PROMPT.replace("{RULE4}", rule)},
                 {"role": "user", "content": user_text},
             ]
         else:
@@ -360,18 +366,21 @@ class Planner:
             if not turn.tool_calls:
                 return PlannerResult(status="done", message=turn.content, steps=steps)
 
+            # 单步模式：一次只执行第一个工具，强制"看到结果再决定下一步"
+            calls = turn.tool_calls[:1] if self.single_step else turn.tool_calls
+
             # 记录 assistant 的工具调用（OpenAI 约定）
             tool_calls_json = [
                 {"id": "call_%s" % uuid.uuid4().hex[:8],
                  "type": "function",
                  "function": {"name": tc.name,
                               "arguments": json.dumps(tc.arguments, ensure_ascii=False)}}
-                for tc in turn.tool_calls
+                for tc in calls
             ]
             self.messages.append({"role": "assistant", "content": None,
                                   "tool_calls": tool_calls_json})
 
-            for i, tc in enumerate(turn.tool_calls):
+            for i, tc in enumerate(calls):
                 v = arbitrate(tc.name, tc.arguments)
                 if not v.ok:
                     result = "仲裁拒绝：%s" % v.reason
@@ -435,7 +444,17 @@ def self_test():
     txt, _ = execute("search", {"target": "玩具熊猫"}, mock_state=st)
     assert "已找到" in txt
 
-    _emit("SELF_TEST PASS（仲裁 + ReAct + 多轮续跑 + 超步保护 + 模拟搜索 全验）")
+    # 6) 单步开关：一次吐多个工具，单步只执行第一个，多工具全执行
+    r6 = Planner(MockBackend([LlmTurn(tool_calls=[
+        ToolCall("search", {"target": "玩具熊猫"}),
+        ToolCall("home", {})])]), single_step=True).run("找熊猫")
+    assert [s["tool"] for s in r6.steps] == ["search"], r6.steps
+    r7 = Planner(MockBackend([LlmTurn(tool_calls=[
+        ToolCall("search", {"target": "玩具熊猫"}),
+        ToolCall("home", {})])]), single_step=False).run("找熊猫")
+    assert [s["tool"] for s in r7.steps] == ["search", "home"], r7.steps
+
+    _emit("SELF_TEST PASS（仲裁 + ReAct + 多轮续跑 + 超步保护 + 模拟搜索 + 单步开关 全验）")
     return 0
 
 
@@ -448,8 +467,10 @@ def main():
     ap.add_argument("--text", default=None, help="用户指令（默认跑一段固定演示）")
     ap.add_argument("--backend", choices=("mock", "openai"), default="mock")
     ap.add_argument("--base-url", default="https://api.siliconflow.cn/v1")
-    ap.add_argument("--model", default="Qwen/Qwen3.8-27B")
+    ap.add_argument("--model", default="deepseek-ai/DeepSeek-V3.2")
     ap.add_argument("--apply", action="store_true", help="home/estop/resume 真下发（未接时仍 dry-run）")
+    ap.add_argument("--multi-tool", action="store_true",
+                    help="允许一次调用多个工具（省 token、更快；默认单步，走一步看一步）")
     ap.add_argument("--timeout", type=float, default=120.0)
     args = ap.parse_args()
 
@@ -464,7 +485,7 @@ def main():
         be = OpenAiBackend(args.base_url, args.model,
                            os.environ.get("LLM_API_KEY", ""), timeout=args.timeout)
 
-    p = Planner(be, apply=args.apply)
+    p = Planner(be, apply=args.apply, single_step=not args.multi_tool)
     _emit("=" * 66)
     _emit("用户指令：%s" % text)
     _emit("大脑后端：%s" % be.name)
