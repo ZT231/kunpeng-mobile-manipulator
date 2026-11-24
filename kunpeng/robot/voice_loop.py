@@ -18,8 +18,8 @@
   - asr.*                 语音 → 文字
   - planner.Planner       多步规划 + 仲裁 + 多轮续跑
   - tts.*                 文字 → 音频文件
-  扬声器回放：本文件只调用 tts 生成音频并打印文本；**播放**通过 --play-cmd 注入
-  （板上若装了 aplay/ffplay 可传入，未接扬声器就只看文本）。
+  扬声器回放：本文件调用 tts 生成音频；**播放**通过 --play-cmd 注入（11-22 起会**真执行**，
+  例：`aplay {}` 本地播放，或 `python3 tts_push.py --wav {} --host 192.168.77.1` 推给 ESP32 喇叭）。
 
 🔴 安全口径：
   1) 默认 dry-run：不加 --apply，home/estop/resume 只模拟，臂绝不动。
@@ -227,7 +227,14 @@ def main():
     play_fn = None
     if args.play_cmd:
         def play_fn(wav, cmd=args.play_cmd):
+            import shlex
+            import subprocess
+            argv = [part if part != "{}" else wav for part in shlex.split(cmd)]
             _emit("    （播放：%s）" % cmd.replace("{}", wav))
+            try:
+                subprocess.run(argv, check=False)
+            except FileNotFoundError as e:
+                _emit("    播放命令不可用：%s" % e)
     if play_fn is None:
         play_fn = None  # VoiceLoop 会用默认提示
 
