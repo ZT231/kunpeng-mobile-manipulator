@@ -11,6 +11,12 @@
  *
  * 位置单位：0~1000 ↔ 0~240°，1 单位 = 0.24°
  *
+ * ⚠️ 无机械限位（J1 HTS-35H 实测）：
+ *    控制行程 0~1000（240°）；电位器可读范围实际到 ~1200（越程余量 ≈48°，实测最高 1198）；
+ *    越过 ~1200 是轨道缺口，回读变成**负数**（0xFFFF = -1，按无符号看就是"6 万多"）。
+ *    因此：命令目标统一钳到安全软限位 SB_POS_SAFE_MIN/MAX（10~990）；
+ *    回读按有符号解析：0~1200 是真实读数，负数（缺口）作废、保持上一有效值。
+ *
  * ⚠️ 电压域警告：LX-224 非 HV 版工作电压 6~8.4V，严禁挂 11.1V 母线；
  *    LX-224HV / HTS-35H / HTD-45H 才是 9~12.6V。上电前逐颗看丝印/标签。
  */
@@ -28,11 +34,19 @@ extern "C" {
 
 #define SB_JOINT_NUM            6U
 
-/* 总线舵机所在串口与方向脚（半双工） */
-extern UART_HandleTypeDef huart3;
-#define SB_UART_HANDLE          huart3          /* TODO: 改成你实际使用的串口 */
+/* 总线舵机串口与方向脚（半双工）
+ * 本模块未加入 Keil 工程（等机械臂阶段再启用），以下为启用时的接线约定：
+ *   · USART3(PB10/PB11) 已被 uart_protocol.c 注册为第三控制源，
+ *     SB 启用时必须另选串口（如 USART6），不要直接抢占 huart3。
+ *   · PB1 当前空闲，可作收发器 DE；若走 HAL 硬件单线模式则不接 DE。 */
+/* 占位符故意不绑定现成句柄：huart3 已被 uart_protocol.c 注册为第三控制源，
+   直接绑过去会造成两个驱动抢同一个串口。启用本模块时必须在 CubeMX 新建
+   独立 UART（如 USART6），再把下面这行改成该句柄；未改之前编译/链接会报
+   未定义符号，这是有意为之的「防误用」闸门。 */
+extern UART_HandleTypeDef sb_uart_handle;
+#define SB_UART_HANDLE          sb_uart_handle
 #define SB_DE_PORT              GPIOB
-#define SB_DE_PIN               GPIO_PIN_1      /* TODO: 方向脚；用硬件单线模式时不接 */
+#define SB_DE_PIN               GPIO_PIN_1      /* 预留；硬件单线模式不接 */
 #define SB_USE_HW_HALFDUPLEX    0               /* 1=HAL 单线半双工，0=GPIO 控收发器 */
 
 /* 协议帧 */
@@ -64,6 +78,15 @@ extern UART_HandleTypeDef huart3;
 #define SB_POS_MIN              0U
 #define SB_POS_MID              500U
 #define SB_POS_MAX              1000U
+
+/* 读回可信上限（J1 实测最高约 1198，取整 1200）：
+   0~1000 控制行程、1000~1200 越程余量，两者都是真实读数；只有负值（轨道缺口）无效 */
+#define SB_POS_READ_MAX         1200U
+
+/* 安全软限位（J1 实测）：0 以下即进轨道缺口，1000 以上仅约 200 单位余量。
+   命令目标钳到 10~990，给闭环和机械误差留边，绝不主动开进死区。 */
+#define SB_POS_SAFE_MIN         10U
+#define SB_POS_SAFE_MAX         990U
 
 /* ---------------- 温度保护阈值（℃） ---------------- */
 #define SB_T_NORMAL_MAX         60U     /* 正常上限 */
@@ -97,6 +120,7 @@ extern UART_HandleTypeDef huart3;
 #define SB_ERR_OFFLINE         -4
 #define SB_ERR_FAULT_LOCK      -5
 #define SB_ERR_LIMIT           -6
+#define SB_ERR_POS_RANGE       -7    /* 帧正常，但位置为负（轨道缺口/死区），已保持上一有效值 */
 
 /* ---------------- 温度状态机 ---------------- */
 typedef enum {
@@ -155,7 +179,7 @@ int  SB_SetID(uint8_t old_id, uint8_t new_id);
 
 /* 把保护阈值写进舵机内部（掉电保存，写错会永久生效，先看手册） */
 int  SB_WriteTempLimit(uint8_t id, uint8_t temp_c);
-int  SB_WriteAngleLimit(uint8_t id, uint16_t min_pos, uint16_t max_pos);
+int  SB_WriteAngleLimit(uint8_t id, uint16_t min_pos, uint16_t max_pos);  /* 入参自动钳到 10~990 */
 int  SB_WriteVinLimit(uint8_t id, uint16_t min_mv, uint16_t max_mv);
 
 SB_TempState SB_GetTempState(const SB_Handle *h);

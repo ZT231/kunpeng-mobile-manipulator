@@ -17,6 +17,13 @@
  * 【温度策略】
  *   <60℃ 100% / 60~70℃ 70% / 70~80℃ 40% / ≥80℃ 锁停
  *   回落 <55℃ 且保持 30s 才能 SB_ClearFault() 复位到 70% 档
+ *
+ * 【位置安全（J1 HTS-35H 实测）】
+ *   无机械限位：0~1000=240° 控制行程；1000~1200 越程余量（真实读数，实测最高 1198）；
+ *   越过 ~1200 是轨道缺口，回读变负数（0xFFFF=-1）。驱动层：
+ *     命令目标钳到 10~990（SB_POS_SAFE_MIN/MAX）；
+ *     回读按有符号 16 位解析，0~1200 可信，负数（缺口）作废、保持上一有效值，
+ *     在线状态不受影响（有应答就是在线，缺口不算掉线）。
  */
 #include "servo_bus.h"
 #include <stdio.h>
@@ -174,6 +181,21 @@ static int sb_query(uint8_t id, uint8_t cmd,
     return sb_recv(id, cmd, data, data_max, data_len);
 }
 
+/* ---- 位置解析与有效性（无机械限位机种的死区防护） ---- */
+
+/* 位置按有符号 16 位解释：0xFFFF 就是 -1（舵机转进轨道缺口后的回读） */
+static int16_t sb_parse_pos16(const uint8_t *d)
+{
+    return (int16_t)((uint16_t)d[0] | ((uint16_t)d[1] << 8));
+}
+
+/* 回读有效性：0~1200 是真实读数（0~1000 控制行程、1000~1200 越程余量）；
+   负值 = 轨道缺口（死区），作废、保持上一有效值 */
+static int sb_pos_valid(int16_t p)
+{
+    return (p >= 0 && p <= (int16_t)SB_POS_READ_MAX);
+}
+
 /* ================= 降速折算 ================= */
 static uint16_t sb_scale_time(uint16_t time_ms)
 {
@@ -207,12 +229,15 @@ static void sb_poll_once(SB_Handle *h, uint8_t read_vin)
         SB_Joint *j = &h->j[i];
         uint8_t d[4], len = 0U;
 
-        /* 位置：CMD 28，返回 2 字节 0~1000 */
+        /* 位置：CMD 28，返回 2 字节；按有符号解析，负值（轨道缺口）作废 */
         len = 0U;
         if (sb_query(j->id, SB_CMD_POS_READ, NULL, 0U, d, sizeof(d), &len) == SB_OK && len >= 2U) {
-            j->pos = (uint16_t)(d[0] | ((uint16_t)d[1] << 8));
-            j->online = 1U;
-            j->err_cnt = 0U;
+            int16_t p = sb_parse_pos16(d);
+            j->online = 1U;             /* 有应答就是在线，缺口不算掉线 */
+            if (sb_pos_valid(p)) {
+                j->pos = (uint16_t)p;   /* 无效读数不覆盖，保持上一有效值 */
+                j->err_cnt = 0U;
+            }
         } else if (j->err_cnt < 250U) {
             j->err_cnt++;
             if (j->err_cnt >= SB_ERR_MAX) { j->online = 0U; }
@@ -308,8 +333,8 @@ void SB_Init(SB_Handle *h)
 
     for (i = 0U; i < SB_JOINT_NUM; i++) {
         h->j[i].id = (uint8_t)(i + 1U);
-        h->j[i].pos_min = SB_POS_MIN;
-        h->j[i].pos_max = SB_POS_MAX;     /* TODO: 新结构到货后按实测收紧 */
+        h->j[i].pos_min = SB_POS_SAFE_MIN;   /* 无机械限位机种：软限位 10~990 */
+        h->j[i].pos_max = SB_POS_SAFE_MAX;   /* TODO: 新结构到货后按实测再收紧 */
         h->j[i].target = SB_POS_MID;
     }
     h->st = SB_TEMP_NORMAL;
@@ -319,10 +344,14 @@ void SB_Init(SB_Handle *h)
 int SB_ReadPos(SB_Handle *h, uint8_t joint, uint16_t *pos)
 {
     uint8_t d[4], len = 0U;
+    int16_t p;
     if (!h || joint >= SB_JOINT_NUM || !pos) return SB_ERR_PARAM;
     if (sb_query(h->j[joint].id, SB_CMD_POS_READ, NULL, 0U, d, sizeof(d), &len) != SB_OK || len < 2U)
         return SB_ERR_RX;
-    *pos = (uint16_t)(d[0] | ((uint16_t)d[1] << 8));
+    p = sb_parse_pos16(d);
+    if (!sb_pos_valid(p))
+        return SB_ERR_POS_RANGE;    /* 死区读数：不覆盖 *pos，也不更新档案 */
+    *pos = (uint16_t)p;
     h->j[joint].pos = *pos;
     return SB_OK;
 }
@@ -371,6 +400,9 @@ int SB_MovePos(SB_Handle *h, uint8_t joint, uint16_t pos, uint16_t time_ms)
     if (h->fault)                    return SB_ERR_FAULT_LOCK;
 
     j = &h->j[joint];
+    /* 安全软限位优先：绝不主动开进电位器死区（0 以下即缺口） */
+    if (pos < SB_POS_SAFE_MIN) pos = SB_POS_SAFE_MIN;
+    if (pos > SB_POS_SAFE_MAX) pos = SB_POS_SAFE_MAX;
     if (pos < j->pos_min) pos = j->pos_min;
     if (pos > j->pos_max) pos = j->pos_max;
 
@@ -547,7 +579,10 @@ int SB_WriteTempLimit(uint8_t id, uint8_t temp_c)
 int SB_WriteAngleLimit(uint8_t id, uint16_t min_pos, uint16_t max_pos)
 {
     uint8_t par[4];
-    if (min_pos > max_pos || max_pos > 1000U) return SB_ERR_PARAM;
+    /* 写入是掉电保存的，钳到安全限位，防止把死区写进舵机内部 */
+    if (min_pos < SB_POS_SAFE_MIN) min_pos = SB_POS_SAFE_MIN;
+    if (max_pos > SB_POS_SAFE_MAX) max_pos = SB_POS_SAFE_MAX;
+    if (min_pos > max_pos) return SB_ERR_PARAM;
     par[0] = (uint8_t)(min_pos & 0xFFU);
     par[1] = (uint8_t)(min_pos >> 8);
     par[2] = (uint8_t)(max_pos & 0xFFU);
@@ -595,13 +630,14 @@ int SB_DumpRaw(SB_Handle *h, uint8_t joint)
 
     len = 0U;
     if (sb_query(id, SB_CMD_POS_READ, NULL, 0U, d, sizeof(d), &len) == SB_OK) {
-        uint16_t p = (len >= 2U) ? (uint16_t)(d[0] | ((uint16_t)d[1] << 8)) : 0U;
+        int16_t p = (len >= 2U) ? sb_parse_pos16(d) : 0;
         if (s_hook) {
-            (void)snprintf(line, sizeof(line), "$DBG,OK id=%u n=%u pos=%u",
-                           (unsigned)id, (unsigned)len, (unsigned)p);
+            (void)snprintf(line, sizeof(line), "$DBG,OK id=%u n=%u pos=%d%s",
+                           (unsigned)id, (unsigned)len, (int)p,
+                           sb_pos_valid(p) ? "" : " (DEADZONE)");
             s_hook(line);
         }
-        return SB_OK;
+        return sb_pos_valid(p) ? SB_OK : SB_ERR_POS_RANGE;
     }
     return SB_ERR_RX;
 }

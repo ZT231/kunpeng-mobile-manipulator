@@ -1,7 +1,4 @@
 ﻿#include "uart_protocol.h"
-#include "arm_control.h"
-#include "teach.h"
-#include "acs712.h"
 #include "chassis.h"
 #include "cmsis_os.h"
 #include <string.h>
@@ -11,11 +8,6 @@
  * 避免 PrintTask 周期打印与 ProtocolTask 发送响应帧按字符交错。 */
 extern osMutexId_t print_lock;
 
-/* arm_lock 定义于 freertos.c：机械臂状态互斥。
- * ProtocolTask 处理命令时持有（覆盖所有 Arm 与 Teach 接口调用点），
- * 与 ServoTask 的运动/Teach_Tick 更新互斥。 */
-extern osMutexId_t arm_lock;
-
 /*
  * UART 指令协议（v1）
  *
@@ -24,17 +16,20 @@ extern osMutexId_t arm_lock;
  *
  * 请求示例：
  *   $PING*XX\r\n
- *   $MOVE,0,1500*XX\r\n
- *   $JOINT,1500,1500,1500,1500,1500,1500*XX\r\n
  *   $CAR,VEL,0.2,0,0*XX\r\n          (底盘前进 0.2m/s，500ms 心跳式)
  *   $CAR,VEL,0.2,0,0,800*XX\r\n      (前进 0.2m/s，800ms 后自动停)
  *   $CAR,STOP*XX\r\n
  *   $CAR,ODOM*XX\r\n                 (回 $ODOM,x_mm,y_mm,yaw_deg,online*XX)
  *   $CAR,RESET*XX\r\n
+ *   $CAR,RAW,10,0,0,0*XX\r\n     (开环 10% 只转 A 轮，台架逐轮核对转向/接线；500ms 自动收油)
+ *   $CAR,WHEEL*XX\r\n                (回 $WHEEL,tA,sA,dA,...,tD,sD,dD*XX，单位 mm/s、‰)
+ *   $CAR,ENC*XX\r\n                  (回 $ENC,a,b,c,d*XX，原始累计计数，标定 3960 用)
+ *   $CAR,GAIN,700,900,0*XX\r\n       (在线改 KP/KI/KD，不写 Flash)
+ *   $CAR,CLRFAULT*XX\r\n             (清堵转故障并重新使能 STBY)
  * 响应格式：
  *   $OK[,<数据>]*XX\r\n
  *   $ERR,<code>*XX\r\n
- *     错误码（阶段 2 定版，与底盘 car_frame.c 统一）：
+ *     错误码（本项目统一）：
  *       1=帧/校验错误  2=未知命令  3=参数错误  4=状态禁止  5=设备故障(FAULT)
  */
 
@@ -44,10 +39,10 @@ extern osMutexId_t arm_lock;
 
 static const char HEX_DIGITS[] = "0123456789ABCDEF";
 
-/* 多控制源：最多 3 个串口（USART1=PC/OrangePi，USART2=蓝牙，USART3=WiFi） */
+/* 多控制源：最多 3 个串口（USART1=PC/OrangePi，USART2=蓝牙，USART3=预留） */
 static UART_HandleTypeDef *proto_huarts[PROTO_UART_MAX];
 static uint8_t proto_uart_count = 0U;
-/* 响应发回目标：最后收到 '$' 起始符的那个串口（谁命令谁收响应） */
+/* 响应发回目标：由 frame_hold_src 在解析前设置（谁命令谁收响应） */
 static UART_HandleTypeDef *proto_tx_huart = NULL;
 
 /* 周期遥测打印开关（默认关闭） */
@@ -81,21 +76,11 @@ static uint8_t frame_hold[PROTO_BUF_SIZE];     /* 完整帧保留缓冲（任务
 static uint16_t frame_hold_len = 0U;
 static volatile uint8_t frame_ready = 0U;      /* 1=一帧已就绪待任务解析 */
 
-/* ---------------- USART3 (WiFi) CIPSERVER 适配 ----------------
- * ESP 处于 CIPMUX=1 + CIPSERVER=1（非透传）：手机 TCP 数据以
- *   +IPD,<link>,<len>:<data...>
- * 前缀形式上报；STM32 应答需先发 AT+CIPSEND=<link>,<len> 并等 '>' 提示符，
- * 再发真数据。这两处与 USART1/USART2 不同，故单独处理。
- * 注意：第一条命令可带无 link 的旧式 +IPD,<len>:，这里按 CIPMUX 多连接
- * 的标准 +IPD,<link>,<len>: 解析（演示单手机连接，link 固定为 0）。 */
-static UART_HandleTypeDef *wifi_uart = NULL;     /* 记录 USART3 句柄 */
-static uint8_t  wifi_ipd_state = 0U;             /* 0=空闲 1=收头部 2=收数据 */
-static uint8_t  wifi_ipd_link = 0U;              /* 最近 +IPD 的 link id */
-static uint16_t wifi_ipd_len = 0U;               /* 期望的数据长度 */
-static uint16_t wifi_ipd_cnt = 0U;               /* 已收数据字节数 */
-static char     wifi_ipd_line[20];               /* "+IPD,l,l" 头部缓冲 */
-static uint8_t  wifi_ipd_line_len = 0U;
-static volatile uint8_t wifi_cipsend_wait_prompt = 0U; /* 1=等'>' */
+/* 帧来源串口：收帧时随帧记录，任务解析时再切 proto_tx_huart。
+   不能只用「最后收到 '$' 的串口」——PC 与蓝牙前后脚发命令时，
+   上一条应答会被发到后一个口。 */
+static UART_HandleTypeDef *frame_src = NULL;
+static UART_HandleTypeDef *volatile frame_hold_src = NULL;
 
 /* ---------- 发送辅助 ---------- */
 
@@ -143,90 +128,6 @@ static void proto_send_frame(const char *payload)
     else tx_pending = 1U;
 }
 
-/* ---------- USART3 (WiFi) 专用：+IPD/CIPSEND ---------- */
-
-/* 前向声明：wifi_ipd_parse 在本文件定义处(解析辅助一节)之后用到 */
-static int parse_uint(const char **pp, uint32_t *val);
-
-/* 解析 ipd 头部缓冲（内容形如 "IPD,0,10:"）。注意：wifi_rx_byte 的 state0
- * 收到 '+' 时只切状态、不存入 line，故 line 里不含 '+'，以 "IPD..." 开头。
- * 成功返回 1 并把 link/len 写入；失败返回 0。 */
-static int wifi_ipd_parse(void)
-{
-    const char *p = (const char *)wifi_ipd_line + 3U; /* 跳过 'I''P''D' */
-    uint32_t v;
-
-    if (strncmp((const char *)wifi_ipd_line, "IPD", 3U) != 0) return 0;
-    if (!parse_uint(&p, &v)) return 0;
-    wifi_ipd_link = (uint8_t)v;
-    if (!parse_uint(&p, &v)) return 0;
-    wifi_ipd_len = (uint16_t)v;
-    return 1;
-}
-
-/* 把 USART3 收到的 1 字节喂给 WiFi IPD 状态机：
- *   剥壳出的"真数据"（手机发来的 $CMD 帧）交由通用解析，其余文字被忽略。
- * 可从 ISR 调用。 */
-static void wifi_rx_byte(uint8_t b)
-{
-    if (wifi_ipd_state == 0U)
-    {
-        if (b == '+') { wifi_ipd_state = 1U; wifi_ipd_line_len = 0U; }
-        return; /* 其余（AT 回显等）忽略 */
-    }
-    if (wifi_ipd_state == 1U)
-    {
-        if (b == '\r' || b == '\n') { wifi_ipd_state = 0U; return; } /* 坏行 */
-        if (wifi_ipd_line_len < (uint8_t)sizeof(wifi_ipd_line) - 1U)
-        {
-            wifi_ipd_line[wifi_ipd_line_len++] = (char)b;
-        }
-        if (b == ':')
-        {
-            if (!wifi_ipd_parse() || wifi_ipd_len == 0U) { wifi_ipd_state = 0U; return; }
-            wifi_ipd_cnt = 0U;
-            wifi_ipd_state = 2U;
-        }
-        return;
-    }
-    /* state 2：接收 len 字节真数据 */
-    if (wifi_ipd_cnt < wifi_ipd_len)
-    {
-        if (b == '$' && wifi_uart != NULL) proto_tx_huart = wifi_uart;
-        UartProto_HandleByte(b);
-        wifi_ipd_cnt++;
-    }
-    if (wifi_ipd_cnt >= wifi_ipd_len) wifi_ipd_state = 0U;
-}
-
-/* USART3 发送：用 AT+CIPSEND 封装响应帧，等 ESP 返回 '>' 提示符后发真数据。 */
-static void wifi_send_tcp_frame(const uint8_t *data, uint16_t len)
-{
-    char cmd[32];
-    int n;
-    uint32_t t0;
-
-    if (wifi_uart == NULL) return;
-
-    n = snprintf(cmd, sizeof(cmd), "AT+CIPSEND=%u,%u\r\n",
-                 (unsigned)wifi_ipd_link, (unsigned)len);
-    if (n <= 0 || n >= (int)sizeof(cmd)) return;
-
-    wifi_cipsend_wait_prompt = 1U;
-    (void)HAL_UART_Transmit(wifi_uart, (uint8_t *)cmd, (uint16_t)n, 100);
-
-    /* 等 '>'（由 ISR 置位 wifi_cipsend_wait_prompt=0），最多 ~500ms。
-     * osDelay 让出 CPU，避免忙等饿死同/低优先级任务（PrintTask）。 */
-    t0 = HAL_GetTick();
-    while (wifi_cipsend_wait_prompt != 0U && (HAL_GetTick() - t0) < 500U)
-    {
-        osDelay(1);
-    }
-
-    if (data != NULL && len > 0U)
-        (void)HAL_UART_Transmit(wifi_uart, (uint8_t *)data, len, 300);
-}
-
 /* ---------- 帧完成保留（ISR → 任务交接） ---------- */
 
 /* ISR 收完一帧后调用：拷贝完整帧到 frame_hold 并置 frame_ready。
@@ -239,6 +140,7 @@ static void frame_complete(void)
 
     for (i = 0U; i <= (uint16_t)frame_len; i++) frame_hold[i] = frame_buf[i];
     frame_hold_len = frame_len;
+    frame_hold_src = frame_src;     /* 随帧保留来源，任务解析时再切应答目标 */
     frame_ready = 1U;
 }
 
@@ -273,7 +175,11 @@ static int parse_uint(const char **pp, uint32_t *val)
 
     while (*p >= '0' && *p <= '9')
     {
-        v = v * 10U + (uint32_t)(*p - '0');
+        uint32_t digit = (uint32_t)(*p - '0');
+        /* 溢出检查：先判再乘，避免 999999999999 回绕成一个小数后通过量程。
+           UINT32_MAX 的十进制是 4294967295，这里用等价的安全条件。 */
+        if (v > ((0xFFFFFFFFU - digit) / 10U)) return 0;
+        v = v * 10U + digit;
         p++;
         any = 1;
     }
@@ -328,148 +234,9 @@ static int parse_float(const char **pp, float *val)
 
 /* ---------- 命令处理 ---------- */
 
-/*
- * 冻结态（急停/故障）对应的错误码。
- * 大白话：机器不许动有两种情况——按了暂停（急停）和坏了（故障），
- *         回不同的码，上位机才知道该发 RESUME 还是 CLEARFAULT。
- * 规范：阶段 2 表 10b 定版——ERR,4=状态禁止(ESTOP)、ERR,5=设备故障(FAULT)。
- * 非冻结态返回 NULL；调用方只在冻结态下调用本函数。
- */
-static const char *frozen_err_code(void)
-{
-    return (Arm_GetState() == ARM_STATE_FAULT) ? "ERR,5" : "ERR,4";
-}
-
 static void cmd_ping(void)
 {
     proto_send_frame("OK,PONG");
-}
-
-static void cmd_state(void)
-{
-    char payload[PROTO_TX_SIZE];
-    char state_ch;
-    switch (Arm_GetState())
-    {
-        case ARM_STATE_MANUAL:   state_ch = 'M'; break;
-        case ARM_STATE_CMD:      state_ch = 'C'; break;
-        case ARM_STATE_RECORD:   state_ch = 'R'; break;
-        case ARM_STATE_PLAYBACK: state_ch = 'P'; break;
-        case ARM_STATE_ESTOP:    state_ch = 'E'; break;
-        case ARM_STATE_FAULT:    state_ch = 'F'; break;
-        default:                 state_ch = 'E'; break;
-    }
-
-    /*
-     * STATE 响应格式（阶段 1 追加 fault 字段）：
-     *   OK,S,<state>,<p0>,<p1>,<p2>,<p3>,<p4>,<p5>,<fault>
-     * fault 是末尾追加的故障码（0 = 无故障）。
-     * 🔴 为什么追加到末尾而不是插进中间：上位机 arm_host.py / web_control.py
-     *   都是按 parts[2] 取状态、parts[3:9] 取 6 路脉宽（精确切片）。追加到末尾
-     *   不改变既有字段位置，老解析器完全不受影响——协议演进向后兼容。
-     */
-    (void)snprintf(payload, sizeof(payload),
-                   "OK,S,%c,%u,%u,%u,%u,%u,%u,%u",
-                   state_ch,
-                   (unsigned)Arm_GetCurrent(0), (unsigned)Arm_GetCurrent(1),
-                   (unsigned)Arm_GetCurrent(2), (unsigned)Arm_GetCurrent(3),
-                   (unsigned)Arm_GetCurrent(4), (unsigned)Arm_GetCurrent(5),
-                   (unsigned)Arm_GetFault());
-    proto_send_frame(payload);
-}
-
-static void cmd_move(const char *arg)
-{
-    uint32_t ch = 0U;
-    uint32_t pulse = 0U;
-
-    if (!parse_uint(&arg, &ch)) { proto_send_frame("ERR,3"); return; }
-    if (!parse_uint(&arg, &pulse)) { proto_send_frame("ERR,3"); return; }
-
-    if (ch >= ARM_CHANNEL_COUNT || pulse > 2500U)
-    {
-        proto_send_frame("ERR,3");
-        return;
-    }
-
-    if (Arm_SetJointTarget((uint8_t)ch, (uint16_t)pulse))
-    {
-        proto_send_frame("OK");
-    }
-    else
-    {
-        proto_send_frame(frozen_err_code()); /* 冻结态：ESTOP→4 / FAULT→5 */
-    }
-}
-
-static void cmd_joint(const char *arg)
-{
-    uint16_t p[ARM_CHANNEL_COUNT];
-    uint32_t v = 0U;
-    uint8_t i;
-
-    for (i = 0U; i < ARM_CHANNEL_COUNT; i++)
-    {
-        if (!parse_uint(&arg, &v) || v > 2500U)
-        {
-            proto_send_frame("ERR,3");
-            return;
-        }
-        p[i] = (uint16_t)v;
-    }
-
-    if (Arm_SetAllTargets(p))
-    {
-        proto_send_frame("OK");
-    }
-    else
-    {
-        proto_send_frame(frozen_err_code()); /* 冻结态：ESTOP→4 / FAULT→5 */
-    }
-}
-
-static void cmd_rec(void)
-{
-    if (Arm_IsFrozen()) { proto_send_frame(frozen_err_code()); return; }
-    Teach_StartRecord();
-    proto_send_frame("OK");
-}
-
-static void cmd_recend(void)
-{
-    char payload[PROTO_TX_SIZE];
-
-    if (Arm_IsFrozen()) { proto_send_frame(frozen_err_code()); return; }
-    Teach_StopRecord();
-    (void)snprintf(payload, sizeof(payload), "OK,%u", (unsigned)Teach_GetPointCount());
-    proto_send_frame(payload);
-}
-
-static void cmd_play(void)
-{
-    if (Arm_IsFrozen()) { proto_send_frame(frozen_err_code()); return; }
-    if (Teach_GetPointCount() == 0U) { proto_send_frame("ERR,3"); return; } /* 无轨迹 */
-    Teach_StartPlayback();
-    proto_send_frame("OK");
-}
-
-static void cmd_tnum(void)
-{
-    char payload[PROTO_TX_SIZE];
-
-    (void)snprintf(payload, sizeof(payload), "OK,%u", (unsigned)Teach_GetPointCount());
-    proto_send_frame(payload);
-}
-
-static void cmd_clear(void)
-{
-    if (Arm_GetState() == ARM_STATE_RECORD || Arm_GetState() == ARM_STATE_PLAYBACK)
-    {
-        proto_send_frame("ERR,4");
-        return;
-    }
-    Teach_Clear();
-    proto_send_frame("OK");
 }
 
 static void cmd_log(const char *arg)
@@ -483,84 +250,6 @@ static void cmd_log(const char *arg)
     }
 
     UartProto_SetStreamLog((uint8_t)v);
-    proto_send_frame("OK");
-}
-
-/**
-  * @brief  $CUR —— 读 J6 夹爪舵机电流（单位 mA）。
-  * @note   回 $CUR,<mA>*CK。正值表示电流方向与 IP+ → IP- 一致。
-  *         这条就是「夹没夹住」的量化依据：空载约 100~300mA，
-  *         夹住物体后电流明显抬升，空夹到底最高（别久留，会堵转发热）。
-  */
-static void cmd_cur(void)
-{
-    char buf[32];
-    int32_t ma;
-    uint32_t mv;
-
-    ma = ACS712_Read_mA();
-    mv = ACS712_GetLast_mV();
-
-    /* 0 = 注入通道没配置成功（ACS712_Init 失败时留的标记）——
-       这种情况绝不能回 "CUR,0"，那会被当成「夹空了」。 */
-    if (mv == 0U)
-    {
-        proto_send_frame("CUR,NA");
-        return;
-    }
-
-    /* 到饱和阈值说明 ADC 已经封顶（>4.3A），这时候的 mA 没有意义。 */
-    if (mv >= ACS712_SATURATE_MV)
-    {
-        proto_send_frame("CUR,SAT");
-        return;
-    }
-
-    (void)snprintf(buf, sizeof(buf), "CUR,%ld", (long)ma);
-    proto_send_frame(buf);
-}
-
-/**
-  * @brief  $CURZ —— 把当前电流当零点（调用前舵机必须完全静止）。
-  * @note   回 $CURZ,<标零后立刻读到的mA>,Z<零点mV>*CK。
-  *         正常情况下 mA 应接近 0、零点应在 2400~2600 之间；
-  *         零点偏离这个范围说明接线或供电有问题（比如 VCC 没接 5V）。
-  *         为什么要手动标：ACS712 零点随温度/供电漂移，而且上电时
-  *         Arm_Init() 刚拉过臂，用那一刻的值当零点会整体偏低。
-  */
-static void cmd_curz(void)
-{
-    char buf[32];
-    int32_t ma;
-
-    ACS712_CalibrateZero();
-    ma = ACS712_Read_mA();
-    (void)snprintf(buf, sizeof(buf), "CURZ,%ld,Z%lu",
-                   (long)ma, (unsigned long)ACS712_GetZero_mV());
-    proto_send_frame(buf);
-}
-
-/**
-  * @brief  $FAULT —— 查询当前故障码。
-  * @note   回 $FAULT,<code>*CK（code=0 无故障，>0 为故障原因）。
-  *         和 STATE 里末尾那个 fault 字段是同一个值，这里给一条独立命令，
-  *         方便上位机在 FAULT 态下（STATE 已冻结、仍需查原因）单独问。
-  */
-static void cmd_fault(void)
-{
-    char buf[16];
-    (void)snprintf(buf, sizeof(buf), "FAULT,%u", (unsigned)Arm_GetFault());
-    proto_send_frame(buf);
-}
-
-/**
-  * @brief  $CLEARFAULT —— 清除故障锁存，回 HOME 保持。
-  * @note   仅 FAULT 态生效，回 $OK；非 FAULT 态也回 $OK（幂等，多调无害）。
-  *         与 $RESUME 严格区分：故障必须显式清除，不能拿解急停混过去。
-  */
-static void cmd_clearfault(void)
-{
-    Arm_ClearFault();
     proto_send_frame("OK");
 }
 
@@ -593,17 +282,26 @@ static void cmd_car_vel(const char *arg)
 
     has_ms = parse_uint(&arg, &ms);
     if (has_ms && ms > 60000U) { proto_send_frame("ERR,3"); return; }
+    if (!(vx == vx) || !(vy == vy) || !(wz == wz)) { proto_send_frame("ERR,3"); return; }
 
-    /* 驱动板离线：如实回故障，绝不回 OK 装成功（否则上位机会以为车在动）。 */
+    /* 底盘未初始化/已锁堵转故障：如实回 ERR,5，绝不用 OK 装成功。 */
     if (!g_chassis.online) { proto_send_frame("ERR,5"); return; }
 
     if (has_ms && ms > 0U)
     {
-        CHS_SetVelocityMs(&g_chassis, vx, vy, wz, ms);
+        if (CHS_SetVelocityMs(&g_chassis, vx, vy, wz, ms) != CHS_OK)
+        {
+            proto_send_frame("ERR,5");
+            return;
+        }
     }
     else
     {
-        CHS_SetVelocity(&g_chassis, vx, vy, wz);
+        if (CHS_SetVelocity(&g_chassis, vx, vy, wz) != CHS_OK)
+        {
+            proto_send_frame("ERR,5");
+            return;
+        }
     }
 
     proto_send_frame("OK");
@@ -634,7 +332,7 @@ static void cmd_car_odom(void)
 }
 
 /**
-  * @brief  $CAR,RESET —— 里程计清零（x/y/yaw 归 0，不清驱动板累计脉冲）。
+  * @brief  $CAR,RESET —— 里程计清零（x/y/yaw 归 0，不清编码器累计计数）。
   */
 static void cmd_car_reset(void)
 {
@@ -643,11 +341,154 @@ static void cmd_car_reset(void)
 }
 
 /**
-  * @brief  $CAR,<子命令> —— 底盘命令分发：VEL / STOP / ODOM / RESET。
+  * @brief  $CAR,RAW,<a>,<b>,<c>,<d> —— 开环占空比直驱（台架接线/转向核对）。
+  *         范围 ±30（单位 %），负值反转；对应 A 左前/B 右前/C 左后/D 右后。
+  *         注意：RAW 是「原始」占空比，不乘 WDIR，方便逐轮看电机真实转向。
+  *         500ms 内没有新的 RAW 会自动收油（与 VEL 同一个看门狗）。
+  */
+static void cmd_car_raw(const char *arg)
+{
+    float a, b, c, d;
+
+    if (!parse_float(&arg, &a) || !parse_float(&arg, &b) ||
+        !parse_float(&arg, &c) || !parse_float(&arg, &d))
+    {
+        proto_send_frame("ERR,3");
+        return;
+    }
+
+    if (!(a == a) || !(b == b) || !(c == c) || !(d == d))
+    {
+        proto_send_frame("ERR,3");
+        return;
+    }
+
+    if (a < -30.0f || a > 30.0f || b < -30.0f || b > 30.0f ||
+        c < -30.0f || c > 30.0f || d < -30.0f || d > 30.0f)
+    {
+        proto_send_frame("ERR,3");
+        return;
+    }
+
+    if (!g_chassis.online) { proto_send_frame("ERR,5"); return; }
+
+    if (CHS_SetPwmRaw(&g_chassis,
+                      (int8_t)a, (int8_t)b, (int8_t)c, (int8_t)d) != CHS_OK)
+    {
+        proto_send_frame("ERR,5");
+        return;
+    }
+
+    proto_send_frame("OK");
+}
+
+/**
+  * @brief  $CAR,WHEEL —— 四轮遥测：目标/实测（mm/s）+ 最近下发占空比（‰）。
+  *         回 $WHEEL,tA,sA,dA,tB,sB,dB,tC,sC,dC,tD,sD,dD*CK（共 12 个整数）。
+  *         调 PID 时用它看「目标有没有跟上、哪一轮拖后腿」。
+  */
+static void cmd_car_wheel(void)
+{
+    char    buf[96];
+    int     n = 0;
+    uint8_t i;
+
+    n = snprintf(buf, sizeof(buf), "WHEEL");
+    if (n < 0) { proto_send_frame("ERR,5"); return; }
+
+    for (i = 0U; i < CHS_W_NUM; i++)
+    {
+        float   tgt = 0.0f;
+        float   spd = 0.0f;
+        int16_t duty = 0;
+        int     w;
+
+        CHS_GetWheelState(&g_chassis, i, &tgt, &spd, &duty);
+
+        /* 不用 %f（MicroLIB 浮点 printf 不可用），统一放大成 mm/s 整数 */
+        w = snprintf(buf + n, sizeof(buf) - (size_t)n,
+                     ",%d,%d,%d",
+                     (int)(tgt * 1000.0f), (int)(spd * 1000.0f), (int)duty);
+        if (w < 0) { proto_send_frame("ERR,5"); return; }
+        n += w;
+    }
+
+    proto_send_frame(buf);
+}
+
+/**
+  * @brief  $CAR,ENC —— 四路编码器原始累计计数（上电以来，未乘方向宏）。
+  *         回 $ENC,a,b,c,d*CK。台架标定用：手转某轮正好一圈，看该路是否
+  *         增加 3960（11 线 × 90 减速比 × 4 倍频）；对不上就改 CHS_ENC_LINES。
+  */
+static void cmd_car_enc(void)
+{
+    char buf[64];
+
+    (void)snprintf(buf, sizeof(buf), "ENC,%ld,%ld,%ld,%ld",
+                   (long)g_chassis.w[CHS_W_A].enc_total,
+                   (long)g_chassis.w[CHS_W_B].enc_total,
+                   (long)g_chassis.w[CHS_W_C].enc_total,
+                   (long)g_chassis.w[CHS_W_D].enc_total);
+    proto_send_frame(buf);
+}
+
+/**
+  * @brief  $CAR,GAIN,<kp>,<ki>,<kd> —— 在线改速度环增益（不写 Flash，重启恢复宏）。
+  *         调参顺序：KP/KI 先 0 只留前馈 → 加 KP 到不抖 → 加 KI 消静差。
+  */
+static void cmd_car_gain(const char *arg)
+{
+    float kp, ki, kd;
+
+    if (!parse_float(&arg, &kp) || !parse_float(&arg, &ki) || !parse_float(&arg, &kd))
+    {
+        proto_send_frame("ERR,3");
+        return;
+    }
+    if (!(kp == kp) || !(ki == ki) || !(kd == kd)) { proto_send_frame("ERR,3"); return; }
+
+    if (kp < 0.0f || kp > 5000.0f ||
+        ki < 0.0f || ki > 5000.0f ||
+        kd < 0.0f || kd > 2000.0f)
+    {
+        proto_send_frame("ERR,3");
+        return;
+    }
+
+    if (!g_chassis.online) { proto_send_frame("ERR,5"); return; }
+
+    if (CHS_SetGains(&g_chassis, kp, ki, kd) != CHS_OK)
+    {
+        proto_send_frame("ERR,3");
+        return;
+    }
+
+    proto_send_frame("OK");
+}
+
+/**
+  * @brief  $CAR,CLRFAULT —— 清锁存堵转故障并重新使能 STBY。
+  *         清完后车不会自己动，必须重新下发 VEL；故障没清就别回 OK。
+  */
+static void cmd_car_clrfault(void)
+{
+    if (CHS_ClearFault(&g_chassis) != CHS_OK)
+    {
+        proto_send_frame("ERR,5");
+        return;
+    }
+
+    proto_send_frame("OK");
+}
+
+/**
+  * @brief  $CAR,<子命令> —— 底盘命令分发：
+  *         VEL / STOP / ODOM / RESET / RAW / WHEEL / ENC / GAIN / CLRFAULT。
   */
 static void cmd_car(const char *arg)
 {
-    char sub[8];
+    char sub[12];
     uint8_t i = 0U;
     const char *p = arg;
 
@@ -666,6 +507,16 @@ static void cmd_car(const char *arg)
         cmd_car_odom();
     else if (strcmp(sub, "RESET") == 0)
         cmd_car_reset();
+    else if (strcmp(sub, "RAW") == 0)
+        cmd_car_raw(p);
+    else if (strcmp(sub, "WHEEL") == 0)
+        cmd_car_wheel();
+    else if (strcmp(sub, "ENC") == 0)
+        cmd_car_enc();
+    else if (strcmp(sub, "GAIN") == 0)
+        cmd_car_gain(p);
+    else if (strcmp(sub, "CLRFAULT") == 0)
+        cmd_car_clrfault();
     else
         proto_send_frame("ERR,2");
 }
@@ -686,78 +537,10 @@ static void proto_dispatch(void)
     {
         cmd_ping();
     }
-    else if (strcmp(cmd, "STATE") == 0)
-    {
-        cmd_state();
-    }
-    else if (strcmp(cmd, "HOME") == 0)
-    {
-        if (Arm_IsFrozen()) { proto_send_frame(frozen_err_code()); return; }
-        Arm_CommandHome();
-        proto_send_frame("OK");
-    }
     else if (strcmp(cmd, "STOP") == 0)
     {
-        Arm_CommandStop();
+        (void)CHS_Stop(&g_chassis);
         proto_send_frame("OK");
-    }
-    else if (strcmp(cmd, "RESUME") == 0)
-    {
-        /* FAULT 态不能用 RESUME 解除，必须走 CLEARFAULT，回 ERR,5（设备故障）。
-         * 否则会「回 OK 但实际不动作」——静默失效，上位机会误以为已恢复。 */
-        if (Arm_GetState() == ARM_STATE_FAULT) { proto_send_frame("ERR,5"); return; }
-        Arm_CommandResume();
-        proto_send_frame("OK");
-    }
-    else if (strcmp(cmd, "MANUAL") == 0)
-    {
-        if (Arm_IsFrozen()) { proto_send_frame(frozen_err_code()); return; }
-        Arm_CommandManual();
-        proto_send_frame("OK");
-    }
-    else if (strcmp(cmd, "MOVE") == 0)
-    {
-        cmd_move(arg != NULL ? arg : "");
-    }
-    else if (strcmp(cmd, "JOINT") == 0)
-    {
-        cmd_joint(arg != NULL ? arg : "");
-    }
-    else if (strcmp(cmd, "CUR") == 0)
-    {
-        cmd_cur();
-    }
-    else if (strcmp(cmd, "CURZ") == 0)
-    {
-        cmd_curz();
-    }
-    else if (strcmp(cmd, "FAULT") == 0)
-    {
-        cmd_fault();
-    }
-    else if (strcmp(cmd, "CLEARFAULT") == 0)
-    {
-        cmd_clearfault();
-    }
-    else if (strcmp(cmd, "REC") == 0)
-    {
-        cmd_rec();
-    }
-    else if (strcmp(cmd, "RECEND") == 0)
-    {
-        cmd_recend();
-    }
-    else if (strcmp(cmd, "PLAY") == 0)
-    {
-        cmd_play();
-    }
-    else if (strcmp(cmd, "TNUM") == 0)
-    {
-        cmd_tnum();
-    }
-    else if (strcmp(cmd, "CLEAR") == 0)
-    {
-        cmd_clear();
     }
     else if (strcmp(cmd, "LOG") == 0)
     {
@@ -792,8 +575,10 @@ static void proto_parse_frame(void)
         }
     }
 
-    /* 需要至少 "*" + 2 位校验 */
-    if (!has_star || (uint8_t)(star + 2U) >= frame_len)
+    /* 需要至少 "*" + 2 位校验；两位必须都是十六进制，
+       否则 hex_to_nib 会把非法字符当 0，可能让错误校验码蒙混过关。 */
+    if (!has_star || (uint8_t)(star + 2U) >= frame_len ||
+        !is_hex(frame_buf[star + 1U]) || !is_hex(frame_buf[star + 2U]))
     {
         proto_send_frame("ERR,3");
         return;
@@ -847,7 +632,6 @@ void UartProto_Init(UART_HandleTypeDef *huart)
     {
         HAL_NVIC_SetPriority(USART3_IRQn, 5, 0);
         HAL_NVIC_EnableIRQ(USART3_IRQn);
-        wifi_uart = huart; /* 记录 WiFi 句柄，供 CIPSEND 发送使用 */
     }
 
     if (HAL_UART_Receive_IT(huart, &rx_byte[idx], 1U) != HAL_OK)
@@ -907,8 +691,7 @@ void UartProto_Process(void)
     uint8_t idx;
 
     /* 1. 取走 ISR 收好的帧并解析分发。
-     * 命令处理整体从 ISR 迁到本任务（ISR 只收字节入队），并且处理全程持有
-     * arm_lock，与 ServoTask 的运动/Teach 状态操作互斥。 */
+     * 命令处理整体从 ISR 迁到本任务（ISR 只收字节入队）。 */
     __disable_irq();
     if (frame_ready != 0U)
     {
@@ -916,13 +699,16 @@ void UartProto_Process(void)
         for (i = 0U; i <= frame_hold_len; i++) frame_buf[i] = frame_hold[i];
         /* 解析长度以保留帧为准，防解析期间 ISR 改写全局 frame_len */
         frame_len = (uint8_t)frame_hold_len;
+        if (frame_hold_src != NULL) proto_tx_huart = frame_hold_src;
         frame_ready = 0U;
-        __enable_irq();
-        /* 命令处理持有 arm_lock：与 ServoTask 的 Arm_Update/Teach_Tick/按键/RFID
-         * 状态操作互斥，保证 target_pulse/arm_state/teach_* 无任务间竞态。 */
-        osMutexAcquire(arm_lock, osWaitForever);
+
+        /* 关键：不能在解析前开中断。frame_buf 是 ISR 的收帧缓冲，
+           一旦提前 __enable_irq()，下一帧的 '$' 会立刻改写 frame_buf，
+           而 proto_parse_frame()/proto_dispatch() 还在读同一块内存，
+           表现为偶发校验错、命令被截断。命令处理本身只做内存操作和
+           短临界区，不会阻塞，因此把解析放在临界区里是安全的。 */
         proto_parse_frame();
-        osMutexRelease(arm_lock);
+        __enable_irq();
     }
     else
     {
@@ -942,8 +728,7 @@ void UartProto_Process(void)
     }
 
     /* 真正发送待发响应帧（命令处理已移入本任务，ISR 不再写发送缓冲）。
-     * USART1/USART2 直接发送；USART3(WiFi) 处于 CIPSERVER 非透传，
-     * 用 AT+CIPSEND 封装后发送（见 wifi_send_tcp_frame）。
+     * 三个串口统一直接发送。
      * 双缓冲：发完活动槽后检查备用槽，有则搬运继续。
      * 竞态规避：
      *   a)搬运(tx_buf2→tx_buf) b)发送前(tx_pending置0/tx_busy置1)
@@ -967,25 +752,17 @@ void UartProto_Process(void)
         tx_busy = 1U;
         __enable_irq();
 
-        if (proto_tx_huart->Instance == USART3)
+        /* 三个串口统一直接发送。目标为 huart1 时与 PrintTask 的 printf
+         * 共用 print_lock 互斥，避免响应帧插入周期打印中间。 */
+        if (proto_tx_huart->Instance == USART1)
         {
-            /* WiFi：CIPSERVER 非透传，用 CIPSEND 封装后发送（会阻塞等 '>'） */
-            wifi_send_tcp_frame(tx_buf, tx_len);
+            osMutexAcquire(print_lock, osWaitForever);
+            HAL_UART_Transmit(proto_tx_huart, tx_buf, tx_len, 50);
+            osMutexRelease(print_lock);
         }
         else
         {
-            /* USART1/USART2：直接发送。目标为 huart1 时与 PrintTask/ServoTask
-             * 的 printf 共用 print_lock 互斥，避免响应帧插入周期打印中间。 */
-            if (proto_tx_huart->Instance == USART1)
-            {
-                osMutexAcquire(print_lock, osWaitForever);
-                HAL_UART_Transmit(proto_tx_huart, tx_buf, tx_len, 50);
-                osMutexRelease(print_lock);
-            }
-            else
-            {
-                HAL_UART_Transmit(proto_tx_huart, tx_buf, tx_len, 50);
-            }
+            HAL_UART_Transmit(proto_tx_huart, tx_buf, tx_len, 50);
         }
 
         __disable_irq();
@@ -1018,27 +795,11 @@ void HAL_UART_RxCpltCallback(UART_HandleTypeDef *huart)
     }
     if (idx >= proto_uart_count) return;
 
-    if (huart->Instance == USART3)
+    if (rx_byte[idx] == '$')
     {
-        /* USART3(WiFi)：'$' 会经 +IPD 剥壳，在 wifi_rx_byte 内部更新 proto_tx_huart；
-         * 这里只处理 CIPSEND 的 '>' 提示符与 IPD 解析。 */
-        if (wifi_cipsend_wait_prompt != 0U && rx_byte[idx] == '>')
-        {
-            wifi_cipsend_wait_prompt = 0U;
-        }
-        else
-        {
-            wifi_rx_byte(rx_byte[idx]);
-        }
+        frame_src = huart; /* 记录本帧来源，解析后把响应发回这里 */
     }
-    else
-    {
-        if (rx_byte[idx] == '$')
-        {
-            proto_tx_huart = huart; /* 响应发回命令来源串口 */
-        }
-        UartProto_HandleByte(rx_byte[idx]);
-    }
+    UartProto_HandleByte(rx_byte[idx]);
 
     if (HAL_UART_Receive_IT(huart, &rx_byte[idx], 1U) != HAL_OK)
     {

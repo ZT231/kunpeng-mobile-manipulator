@@ -1,32 +1,23 @@
-﻿/* USER CODE BEGIN Header */
+/* USER CODE BEGIN Header */
 /**
   ******************************************************************************
   * @file           : main.c
-  * @brief          : STM32F407 + PCA9685 机械臂控制
-  *                   6 路 WH148 电位器 -> 6 路舵机，20ms 平滑更新
+  * @brief          : STM32F407 底盘控制（2×TB6612 + 4×JGB37-520 麦轮）
+  *                   三路 UART 协议（USART1 PC / USART2 蓝牙 / USART3 预留）
   ******************************************************************************
   */
 /* USER CODE END Header */
 /* Includes ------------------------------------------------------------------*/
 #include "main.h"
 #include "cmsis_os.h"
-#include "adc.h"
-#include "dma.h"
-#include "i2c.h"
 #include "usart.h"
 #include "gpio.h"
 
 /* Private includes ----------------------------------------------------------*/
 /* USER CODE BEGIN Includes */
-#include "pca9685.h"
-#include "acs712.h"
-#include "potentiometer.h"
-#include "arm_control.h"
 #include "uart_protocol.h"
 #include "bt.h"
 #include "wifi.h"
-#include "teach.h"
-#include "rfid.h"
 #include <stdio.h>
 #include <string.h>
 /* USER CODE END Includes */
@@ -90,60 +81,20 @@ int main(void)
 
   /* Initialize all configured peripherals */
   MX_GPIO_Init();
-  MX_DMA_Init();
-  MX_I2C1_Init();
   MX_USART1_UART_Init();
   MX_USART2_UART_Init();
   MX_USART3_UART_Init();
-  MX_ADC1_Init();
   /* USER CODE BEGIN 2 */
-  if (PCA9685_Init(&hi2c1) != HAL_OK)
-  {
-    printf("PCA9685 init failed\r\n");
-    Error_Handler();
-  }
-
-  /* 控制核心：计算 HOME 位并上电输出安全位 */
-  Arm_Init();
-
-  /* ACS712 电流传感器（J6 单路）：配置 ADC1 注入通道 PA6/IN6。
-     🔴 放在 Pot_Init() **之前**：此时 ADC 还没启动，改写注入序列绝对安全；
-        放之后虽然一般也能配，但那时 ADC 已由 HAL_ADC_Start_DMA 连续转换，
-        少一层不确定就少一个坑。
-     注入读取发生在 $CUR/$CURZ 命令里，那时 ADC 早已被 Pot_Init 使能，能正常触发。
-     零点不在这里标：Arm_Init() 刚把臂拉到 HOME，此刻电流还没回零，
-     标了会把「拉臂电流」当成零点。要用 $CURZ 命令在静止时手动标。 */
-  if (ACS712_Init() != HAL_OK)
-  {
-    printf("ACS712 init FAILED (check PA6 / ADC1 injected channel)\r\n");
-  }
-
-  /* 电位器 DMA 采样启动并预热滑动窗口 */
-  Pot_Init(&hadc1);
-
-  /* UART 指令协议：使能串口中断接收（USART1=PC/OrangePi，USART2=蓝牙，USART3=WiFi） */
+  /* UART 指令协议：使能串口中断接收（USART1=PC/OrangePi，USART2=蓝牙，USART3=预留） */
   UartProto_Init(&huart1);
   BT_Init(&huart2);
   WIFI_Init(&huart3);
 
-  /* RC522 射频卡：初始化 GPIO 软件 SPI（版本校验失败会打印但不阻塞后续流程） */
-  if (RFID_Init() == HAL_OK)
-  {
-    printf("RC522 RFID init OK\r\n");
-  }
-  else
-  {
-    printf("RC522 RFID init FAILED (check wiring/PB0,PB12~PB15)\r\n");
-  }
-
-  /* 示教回放模块：清空轨迹缓冲 */
-  Teach_Init();
-
-  printf("Robot arm ready. Hold HOME (idle, wait CMD).\r\n");
-  printf("Protocol: $CMD*ck\\r\\n (PING/STATE/HOME/STOP/RESUME/MANUAL/MOVE/JOINT/REC/RECEND/PLAY/TNUM/CLEAR/FAULT/CLEARFAULT)\r\n");
+  printf("Chassis ready. (2xTB6612 + 4xJGB37-520 + 80mm mecanum)\r\n");
+  printf("Protocol: $CMD*ck\\r\\n (PING/LOG/CAR:VEL/STOP/ODOM/RESET/RAW/WHEEL/ENC/GAIN/CLRFAULT)\r\n");
 
   /* 注：此后交由 FreeRTOS 调度器接管。
-   * 原 20ms 舵机任务 / 5ms 协议任务 / 3000ms 打印任务 见 freertos.c。 */
+   * 底盘任务 / 协议任务 / 打印任务 见 freertos.c。 */
   /* USER CODE END 2 */
 
   /* Init scheduler */
@@ -164,9 +115,9 @@ int main(void)
     /* USER CODE BEGIN 3 */
     /* 控制已移交 FreeRTOS 调度器（osKernelStart 后永不返回），
      * 主循环仅作空转占位。具体任务见 freertos.c：
-     *   - StartServoTask   20ms 舵机/按键/示教/刷卡
-     *   - StartProtocolTask   5ms 串口协议响应
-     *   - StartPrintTask   3000ms 状态打印 */
+     *   - StartProtocolTask   串口协议响应
+     *   - StartPrintTask   周期状态打印
+     *   - StartChassisTask   底盘 20ms 控制 */
   }
   /* USER CODE END 3 */
 }

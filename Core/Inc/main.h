@@ -59,51 +59,58 @@ void Error_Handler(void);
 /* Private defines -----------------------------------------------------------*/
 #define KEY0_Pin GPIO_PIN_4
 #define KEY0_GPIO_Port GPIOE
-#define RC522_RST_Pin GPIO_PIN_0
-#define RC522_RST_GPIO_Port GPIOB
-#define RC522_CS_SDA_Pin GPIO_PIN_12
-#define RC522_CS_SDA_GPIO_Port GPIOB
-#define SCK_Pin GPIO_PIN_13
-#define SCK_GPIO_Port GPIOB
-#define MISO_Pin GPIO_PIN_14
-#define MISO_GPIO_Port GPIOB
-#define MOSI_Pin GPIO_PIN_15
-#define MOSI_GPIO_Port GPIOB
 
 /* USER CODE BEGIN Private defines */
 
-/* 电位器控制参数（ADC 边界 POT_ADC_MAX 在 potentiometer.h 中定义） */
-#define SERVO_STEP_US  25U     /* 每 20ms 最大步进，调大就快 */
-
-/* 每路舵机的脉宽实测标定上下限（us，按机械臂实际行程标定） */
-#define SERVO_J1_MIN  800U    /* 基座：左右各约90度 */
-#define SERVO_J1_MAX  2300U
-#define SERVO_J2_MIN  750U    /* 大臂：机械臂顺时针90°，逆时针90° */
-#define SERVO_J2_MAX  2150U
-#define SERVO_J3_MIN  520U    /* 小臂：实测 520(逆110°)~2500(顺130°) */
-#define SERVO_J3_MAX  2500U
-#define SERVO_J4_MIN  500U    /* 腕部俯仰：软限位 500~1850（另行收窄留安全余量） */
-#define SERVO_J4_MAX  1850U   /* 物理实测端点 520~2500 仍记在 arm_params.json，勿覆盖 */
-#define SERVO_J5_MIN  500U    /* 腕部旋转：MG996R，顺时针70°，逆时针82° */
-#define SERVO_J5_MAX  2500U
-#define SERVO_J6_MIN  900U   /* 夹爪：900=张开极限；软限位上限 2000（另行收窄留夹持余量） */
-#define SERVO_J6_MAX  2000U  /* 物理实测闭合端点 2100 仍记在 arm_params.json / 标定记录，勿覆盖 */
-
-/* 每路舵机的「初始位」脉宽（us）。
- * 大白话：上电瞬间、以及收到 HOME 命令时，六路舵机各自要摆到的那个安全姿态
- *         （折叠收拢、重心靠近基座，不是一条直线）。
- * 规范定义：Arm_Init() 直接写入 PCA9685 的开环位置指令，同时是
- *          Arm_CommandHome() / Arm_CommandResume() 的目标值。
- * ⚠️ 注意区分「初始位」与「标定零位」：标定零位是该关节 0° 对应的脉宽，
- *    记录在 kunpeng/robot/arm_params.json 的 pulse_mid / map 中点，供逆解算角度用。
- *    两者不是一回事 —— 不要拿这里的值去改 arm_params.json，会破坏运动学映射。
- */
-#define SERVO_J1_INIT  1580U
-#define SERVO_J2_INIT  1900U
-#define SERVO_J3_INIT  2400U
-#define SERVO_J4_INIT  700U
-#define SERVO_J5_INIT  1450U
-#define SERVO_J6_INIT  1500U
+/* ============================ 引脚分配总表 ============================
+ * 本表是固件引脚的唯一权威来源，与 RoboticArm_Kunpeng.ioc + chs_tb6612.h 同步。
+ * 封装 F407VET6 / LQFP100：可用 GPIO 共 82 个
+ *   PA0~PA15 / PB0~PB15 / PC0~PC15 / PD0~PD15 / PE0~PE15 / PH0~PH1
+ * 已占用 32 个 · 结构禁用 1 个 · 净空闲 49 个。
+ *
+ * ── 一、CubeMX 管理（.ioc 内 13 条，改这里必须同步改 .ioc）────────────
+ *   PA9      USART1_TX   AF7      PC 上位机 / 统一调试口    115200 8N1
+ *   PA10     USART1_RX   AF7
+ *   PD5      USART2_TX   AF7      HC-05 蓝牙              115200 8N1
+ *   PD6      USART2_RX   AF7
+ *   PB10     USART3_TX   AF7      预留第三控制源（当前未接）  115200 8N1
+ *   PB11     USART3_RX   AF7
+ *   PA13     SWDIO               SWD 调试（禁止改作他用）
+ *   PA14     SWCLK               SWD 调试（禁止改作他用）
+ *   PH0      OSC_IN              HSE 8MHz 晶振
+ *   PH1      OSC_OUT             HSE 8MHz 晶振
+ *   PE4      KEY0      输入上拉   板载按键，当前固件未读取（预留）
+ *
+ * ── 二、底盘驱动（chs_tb6612.c 运行期配置，.ioc 不管理，21 条）────────
+ *   PD12~PD15   TIM4_CH1~CH4   AF2   四路 20kHz PWM（A/B/C/D 轮）
+ *   PC0 / PC1   AIN1 / AIN2           A 左前方向
+ *   PC2 / PC3   BIN1 / BIN2           B 右前方向
+ *   PC10/PC11   AIN1 / AIN2           C 左后方向（模块 2）
+ *   PC12/PC13   BIN1 / BIN2           D 右后方向（模块 2）
+ *   PE8         STBY                  两块 TB6612 并联使能
+ *   PB4 / PB5   TIM3_CH1/CH2   AF2    编码器 A（左前）
+ *   PA15/ PB3   TIM2_CH1/CH2   AF1    编码器 B（右前；JTAG 脚，SWD 模式下可用）
+ *   PC6 / PC7   TIM8_CH1/CH2   AF3    编码器 C（左后）
+ *   PE9 / PE11  TIM1_CH1/CH2   AF1    编码器 D（右后）
+ *
+ * ── 三、禁止占用（3 处，占用会导致无法烧录或无法启动）────────────────
+ *   PA13 / PA14   SWD，占用即失去下载/调试
+ *   PH0  / PH1    HSE 晶振
+ *   PB2           BOOT1 strap，部分核心板带下拉/跳线帽
+ *
+ * ── 四、净空闲（49 个，按端口列出）──────────────────────────────────
+ *   PA0~PA8, PA11, PA12                              11 个
+ *   PB0, PB1, PB6~PB9, PB12~PB15                     10 个
+ *   PC4, PC5, PC8, PC9, PC14, PC15                    6 个
+ *   PD0~PD4, PD7~PD11                                10 个
+ *   PE0~PE3, PE5~PE7, PE10, PE12~PE15                12 个
+ *
+ *   ⚠️ 上表是「芯片级」可用集：开发板板载 LED / 按键 / SD 卡 / USB 会额外
+ *      占脚，接线前先用万用表或原理图确认该脚是否已被板载外设使用。
+ *   ⚠️ PC14 / PC15 驱动能力弱（约 3mA），只适合低速信号，不驱动 LED。
+ *   ⚠️ PB6 / PB7 现完全空闲（I2C1 外设已从 .ioc 移除）；将来做 I2C 扩展
+ *      可直接 AF 到 I2C1，无需改线序。
+ * ==================================================================== */
 
 /* USER CODE END Private defines */
 

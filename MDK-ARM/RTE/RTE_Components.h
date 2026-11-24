@@ -3,8 +3,8 @@
  * Auto generated Run-Time-Environment Component Configuration File
  *      *** Do not modify ! ***
  *
- * Project: 'Robotic arm vision' 
- * Target:  'Robotic arm vision' 
+ * Project: 'RoboticArm_Kunpeng' 
+ * Target:  'RoboticArm_Kunpeng' 
  */
 
 #ifndef RTE_COMPONENTS_H
