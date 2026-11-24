@@ -1,50 +1,69 @@
-# 六自由度机械臂视觉抓取系统（STM32F407 + FreeRTOS）
+# 移动抓取机器人 · STM32F407 底盘固件（FreeRTOS）
 
-基于 STM32F407VET6 的六自由度机械臂平台，配合 KunPeng Pro（openEuler）边缘端与网页控制台，
-打通 **视觉识别 → 平面坐标解算 → 逆运动学 → 串口下发 → 状态回读** 链路。
+> ⚠️ **代码现状（2026-11-24 收口）**：STM32 固件已完成大清理，彻底移除「固定工位机械臂」的全部旧代码——
+> PCA9685(PWM 舵机) / RC522(RFID) / 电位器(ADC+DMA) / 示教回放 / ACS712(电流) / 安全监控 / I2C1 / ADC1 / DMA。
+> 当前固件只保留：**底盘**（2×TB6612 + 4×JGB37-520 麦轮 + 编码器，`chs_tb6612.c`/`chassis.c`）、
+> **三路 UART 协议**（USART1 PC / USART2 蓝牙 / USART3 预留，三路共用 `uart_protocol.c` 同一套代码）、
+> 总线舵机骨架（`servo_bus.c/h`）文件保留在 `Core/Src`，**未加入 Keil 工程**（等机械臂阶段再启用）。`.ioc` 已同步移除 I2C1/ADC1/DMA。
+> 下文提及机械臂/舵机/RFID/示教/电流/手眼标定的内容均为**历史记录**（代码已删），仅作面试参考。
+
+基于 STM32F407VET6 的移动底盘 + 三路串口协议固件，配合 KunPeng Pro（openEuler）边缘端与 ESP32-S3 语音入口，
+构建「云-边-端移动操作平台」的底层执行单元。
 
 > 🔴 **项目定位（2026-11-14 定稿）**：本目录即简历上的**第四个完整项目** ——
 > 在**前三个项目**（`1.Smart car` 智能小车 / `2-1.Robotic arm vision` 机械臂视觉 /
 > `3.C++ 跨平台串口协议引擎`）的基础上，加入**鲲鹏开发板 + ESP32-S3 + IoT 可观测性闭环**，
-> 整合为「云-边-端移动操作平台」。项目 2、3 早已合并进本工程，2026-11-14 把项目 1 的
-> 底盘以「拷贝 + 加统一帧层」的方式补进 `car/`，最后一块拼图到位。
+> 整合为「云-边-端移动操作平台」。2026-11-23 底盘升级为 **2×TB6612FNG + 4×JGB37-520
+> (1:90) + 80mm 麦轮**，代码并入 `Core/` 的 `chs_tb6612.c` / `chassis.c`；旧 `car/`
+> 拷贝工程已移除（原件在 `1.Smart car` 目录，可随时回退对照）。
 > 完整映射表、CubeMX 结论与简历说辞见 **`docs/00-项目总览与硬数据速查.md`**。
-> 🔴 **本次没有改任何 `.ioc`**：小车是 Keil+SPL 工程、机械臂是 CubeMX+HAL 工程，
-> 按两个 MCU 节点各自保留、靠 `$<CMD>*CK` 统一帧通信（详见该文档第四节）。
+> 🔴 **2026-11-24 已改 `.ioc`**：删除 I2C1 / ADC1 / DMA 三个外设，现只保留 7 个 IP
+> （FREERTOS / NVIC / RCC / SYS / USART1 / USART2 / USART3）；引脚 13 条
+> （含 TIM6 时基、SWD、KEY0，`Mcu.IPNb=7` / `Mcu.PinsNb=13`）。
+> 底盘 `chs_tb6612.c` 自己开 TIM1/2/3/4/8 与 GPIO，不动 CubeMX 已配的 USART/SWD。
+> CubeMX 重新生成后，若 `chs_tb6612.c` / `chassis.c` / `uart_protocol.c` / `bt.c` / `wifi.c`
+> 被移出 Keil 工程，需手动加回（`servo_bus.c` 当前故意不在工程内）。
 
 > 固件：Keil MDK（CubeMX 生成框架 + 手写模块）｜ 边缘端 / 上位机：Python + OpenCV + Flask
 >
-> 🔴 **状态口径（2026-11-08 收口）**：本 README 混有「旧 STM32 单板项目能力」与「当前 Kunpeng 云-边-端工程已实证能力」两代内容。
-> 三档划分与**可直接用于简历的正文**，以 `docs/面试与简历材料.md` 为准：
+> 🔴 **状态口径（2026-11-24 收口）**：本 README 混有「旧 STM32 单板项目能力」与「当前 Kunpeng 云-边-端工程已实证能力」两代内容。
+> 三档划分：
 > ✅ 已实机实证 / 🔶 代码已有但未实机验证或未接入主链路 / 📋 纯规划占位。
-> 下文凡标 🔶 / 📋 的功能**不得写成已完成**。
+> 下文凡标 🔶 / 📋 的功能**不得写成已完成**。原 `docs/面试与简历材料.md` 已删除（2026-11-24）。
 
 ---
 
 ## 主要功能
 
-### ✅ 当前 Kunpeng 工程已实机实证
+### ✅ 当前 STM32 固件（底盘）：Rebuild 0 Error / 0 Warning（Code=24400）；未实机上电
 
-- **串口闭环**：USART1（PA9/PA10，115200 8N1）自定义帧 `$<CMD>[,<ARG>...]*<CK>\r\n`（XOR 校验、2 位大写 HEX），
-  `PING` / `STATE` / `HOME` / `JOINT` 实机通过（`$PING*10` → `$OK,PONG*3E`；`STATE` 回读六路实际脉宽与源码初始位一致）。
-- **六路舵机安全执行**：PCA9685（I2C1 PB6/PB7，50Hz）驱动六路，逐轴软限位 clamp + 25µs/20ms 斜坡限速；
-  `main.h` / `web_control.py` / `docs/末端执行器-舵机标定与限力夹持.md` 三方数值同步。
+- **底盘驱动**：2×TB6612FNG + 4×JGB37-520(1:90) + 80mm 麦轮；TIM4 20kHz PWM（PD12~PD15）+
+  8 根 DIR（PC0~3/PC10~13）+ PE8 并联 STBY；四路定时器编码器（TIM1/TIM2/TIM3/TIM8）4 倍频测速；
+  麦轮逆解 + PID + 里程计，20ms 固定节拍（`CHS_Tick`）。
+- **串口协议**：USART1（PA9/PA10，115200 8N1）自定义帧 `$<CMD>[,<ARG>...]*<CK>\r\n`（XOR 校验、2 位大写 HEX），
+  命令集 `PING / LOG / CAR:VEL / STOP / ODOM / RESET / RAW / WHEEL / ENC / GAIN / CLRFAULT`。
+- **多通道**：USART1（PC 上位机）/ USART2（HC-05 蓝牙）/ USART3（预留第三控制源）三路完全对等，复用同一套帧协议，无模块专用封装。ESP32-S3 语音节点走 Wi-Fi TCP 连鲲鹏，不占用 STM32 串口。
+
+### 🔶 上位机 / 边缘端（鲲鹏）历史能力（不在 STM32 固件内）
+
 - **边缘视觉服务**：`detector_service.py` :8080 跑 YOLOv8n + MJPEG 推流 / `/detections` / `/health`；
   B 方案抽帧推理 + C 方案 V4L2/MJPG 采集优化后，实测约 **26.6 FPS**（原 6.8 FPS）。
 - **网页控制台 + 点选抓取**：`web_control.py` :5000 内嵌单页，滑杆控六路、1s 状态回填、
-  点画面取点 → 平面约束单目定位 → `ArmIK` 解六路脉宽 → 软限位检查 → `JOINT` 下发 → `STATE` 回读；
+  点画面取点 → 平面约束单目定位 → `ArmIK` 解六路脉宽 → `JOINT` 下发 → `STATE` 回读；
   标定参数常驻面板 + 浏览器本地预设（保存 / 切换 / 删除）。
 - **板内 IoT 可观测性闭环（1.2b）**：`iot/` 真实串口遥测 → MQTT → EMQX → eKuiper → InfluxDB → Grafana，
   四容器板上跑通、Grafana 六路 `j1~j6` 曲线已出（16:07 `records_in=records_out=59` / `exceptions=0`）；
   `deploy.sh` 动态重绑 firewalld trusted zone、`telemetry_bridge.py` 发布端拦 null 点；收口 `e6cd194`。
   🔴 只叫「可观测性闭环」，不是云端 IoT、不增抓取能力。
+- ⚠️ 上述上位机脚本里的 `$JOINT` / `$STATE` / `$HOME` 命令，**当前 STM32 固件已不再处理**
+  （机械臂代码已删）；脚本保留作历史/面试材料，接入前需重写协议层。
 
 ### 🔶 旧 STM32 单板项目已有，当前 Kunpeng 工程未重新实机复验
 
-> 旧版演示脚本与视觉测试程序已移除（`vision_old/`）；判据收进 `docs/联调验收清单.md` 第二部分（V1~V7，命令不可照跑）。
+> 旧版演示脚本与视觉测试程序已移除（`vision_old/`）；对应验收文档已于 2026-11-24 删除。
 
 - **视觉引导抓取（旧版）**：USB 摄像头 HSV 颜色阈值 + 轮廓检测识别目标，四点 Homography 完成像素→毫米换算，平面几何逆运动学解算 6 路舵机脉宽；按目标形状自适应夹爪方向（沿边抓取），远目标自动前倾扩臂（上限 45°）。
-- **多通道控制**：串口（PC 上位机）/ 蓝牙（HC-05）/ WiFi（ESP-01S）/ RFID（RC522）四通道复用同一套 `$CMD*CK\r\n` 协议（XOR 校验）。代码在 `Core/Src/bt.c`、`wifi.c`；RC522 当前未接芯片（`version 0xFF`）。
+- **多通道控制（历史）**：串口（PC 上位机）/ 蓝牙（HC-05）/ WiFi（ESP-01S）/ RFID（RC522）四通道复用同一套 `$CMD*CK\r\n` 协议（XOR 校验）。当前保留 `bt.c`（USART2 蓝牙）与 `wifi.c`（USART3 预留口，无模块专用逻辑）；RC522 驱动已随机械臂代码删除。
 - **模式状态机**：MANUAL（电位器手控）/ CMD（待命）/ RECORD（示教录制）/ PLAYBACK（回放）/ ESTOP（急停）五态；急停冻结输出，仅 RESUME 可解除。
 - **示教回放**：上位机 REC 采集轨迹，PLAY 一键回放。
 
@@ -53,13 +72,13 @@
 | 部件 | 型号 / 说明 |
 |---|---|
 | 主控 | STM32F407VET6 |
-| 舵机驱动 | PCA9685（I2C，16 路 50Hz PWM） |
-| 底盘电机驱动 | 松甲四路编码器驱动模块（I2C 0x51，AT8236×4 + 板载 MCU，闭环速度/编码器回读） |
-| 底盘电机 | 编码器 TT 马达 金属轴 1:90 ×4 + 80mm 麦轮（4680 计数/转，18.6 计数/mm） |
-| 电位器 | 6 路 ADC 采样（DMA 循环 + 滑动平均 + 回滞死区） |
-| 摄像头 | USB 摄像头（上位机 OpenCV 处理） |
-| 无线 | ESP-01S（WiFi）、HC-05（蓝牙） |
-| 刷卡 | RC522（GPIO 软件 SPI） |
+| 底盘电机驱动 | 2× TB6612FNG（TIM4 20kHz PWM，8 根 DIR，PE8 并联 STBY） |
+| 底盘电机 | JGB37-520 直流减速编码器电机 1:90 ×4 + 80mm 黑色麦轮 + 6mm 金属联轴器（11 线 AB 霍尔，4 倍频 3960 计数/转，15.75 计数/mm） |
+| 编码器接口 | TIM1/TIM2/TIM3/TIM8 四路正交，4 倍频；TIM2 为 32 位 |
+| 无线 | HC-05（蓝牙，USART2）；ESP32-S3（Wi-Fi TCP 独立节点，不接 STM32 串口） |
+
+> 完整引脚分配（占用 32 / 结构禁用 1 / 净空闲 49）见 `docs/硬件清单与接线.md` 的「3.1 引脚分配总表」；
+> 代码侧同一份表在 `Core/Inc/main.h`，底盘部分展开在 `Core/Inc/chs_tb6612.h`。
 
 ## 软件架构
 
@@ -67,26 +86,28 @@
 
 | 任务 | 周期 | 优先级 | 栈 | 职责 |
 |---|---|---|---|---|
-| `StartServoTask` | 20ms | High | 4096 | 电位器/按键/RFID 采集、示教、`Arm_Update()` 刷新 6 路舵机 |
-| `StartProtocolTask` | 5ms | Normal | 2048 | 解析 UART 帧、分发命令、执行运动 |
-| `StartPrintTask` | 3s | Low | 2048 | 周期遥测打印 |
-| `StartSafetyTask` | 200ms | Low | 2048 | 过流检测（ACS712 采样跨 20ms，独立任务不拖慢舵机）→ `Arm_ReportFault` |
-| `StartChassisTask` | 20ms | Normal | 2048 | 四路编码器读取 + 麦轮逆解 + 里程计 + 速度下发（🔶 Keil 编译 0/0，**未实机**） |
+| `StartProtocolTask` | 5ms 轮询 | Normal | 2048 | 解析 UART 帧、分发命令（PING/LOG/CAR 系列） |
+| `StartPrintTask` | 3s | Low | 2048 | 周期打印底盘里程计/在线状态 |
+| `StartChassisTask` | 20ms | Normal | 2048 | 四路编码器读取 + 麦轮逆解 + PID + 里程计 + 速度下发 |
 
-- **中断只收字节**：ISR 内仅做单字节接收与帧状态机，命令解析与执行全部放在任务上下文（中断优先级 5，匹配 `configLIBRARY_MAX_SYSCALL_INTERRUPT_PRIORITY`）。
-- **三把互斥锁**：`arm_lock`（机械臂状态）、`print_lock`（串口输出）、`i2c_lock`（I2C1 总线，PCA9685 0x40 与底盘驱动板 0x51 共用）；锁序固定 `arm_lock → i2c_lock`，ChassisTask 只拿 `i2c_lock`，不反向嵌套。加 `i2c_lock` 的原因：ServoTask 与 ChassisTask 同为 20ms，若不加锁会长期同相抢占 HAL 句柄（`HAL_BUSY`）→ 表现为「车一动，机械臂像卡住」。
+- **中断只收字节**：ISR 内仅做单字节接收与帧状态机，命令解析与执行全部放在任务上下文。
+- **一把互斥锁**：`print_lock`（串口输出互斥，PrintTask 与 ProtocolTask 共用）。底盘 PID/里程计只在 ChassisTask 单任务内更新，无跨任务竞态。
 - **协议帧格式**：`$<CMD>[,<ARG>...]*<CK>\r\n`，`CK` = CMD 字段（`$` 与 `*` 之间）所有字节的 XOR，2 位大写十六进制；响应 `$OK[,<数据>]` / `$ERR,<code>`。
 - **双缓冲应答**：活动槽 + 备用槽，临界区保护，保证连发命令的应答不丢失。
 
-### 阶段 1 安全监控（safety 模块 + FAULT 状态机，2026-11-19 新增）
+### 阶段 1 安全监控（历史，2026-11-24 已随机械臂代码删除）
 
-> 🔶 代码已落盘，**未上板编译/实机验证**（本地无 Keil，需回教室编译）。IWDG 与断链保护按决策延后，本阶段只做了「FAULT 状态机 + 过流急停」两项无砖级风险的纯软件改造。
+> 🔴 `arm_control.c` / `safety.c` / `acs712.c` 已整批删除，当前固件**没有** ACS712 过流急停、`ARM_STATE_FAULT`、`$FAULT/$CLEARFAULT` 或 `StartSafetyTask`。
+> 现在只剩底盘自己的堵转保护：`CHS_FAULT_STALL`（给油 300ms 编码器不走 → 拉低 STBY 并锁存），见 `chassis.c` 的 `chs_latch_stall()`。
+> 下面这段描述只作为面试时的历史设计记录，**不要照着它去找当前代码**：
+>
+> - 旧方案用 `arm_control.h` 的五态机 + `safety.c` 独立任务读 ACS712，连续 3 次超 800mA 锁 `FAULT`；`STATE` 末尾追加 fault 字段以兼容老上位机 `parts[3:9]` 切片。
+> - 结论仍然成立：急停（可恢复）与故障（需人工诊断）必须分开；保护逻辑不能散落在各命令里，否则漏一处就是「急停不住」。
 
-- **① 用了什么语法/设计**：`arm_control.h` 状态机枚举新增 `ARM_STATE_FAULT`；`arm_control.c` 加 `static uint8_t fault_code`（故障码锁存）+ `state_is_frozen()`（把「急停或故障」的冻结判断收敛成一个函数）+ `Arm_ReportFault/ClearFault/GetFault/IsFrozen` 四个接口；新增 `safety.h/safety.c`（`Safety_Tick()` 读 ACS712、连续 3 次超 800mA 才触发）；`uart_protocol.c` 加 `$FAULT`/`$CLEARFAULT` 命令、STATE 响应末尾追加 fault 字段；`freertos.c` 加 `StartSafetyTask`。
-- **② 为什么这么设计**：急停像「按暂停」、故障像「机器亮红灯」，必须分开——故障需人工诊断后才能复位，不能被 RESUME 一句话带过去。过流检测放**独立低优先级任务**是因为 `ACS712_Read_mA()` 跨 PWM 周期采样会阻塞约 20ms，塞进 20ms 的舵机任务会把刷新拖慢一倍。STATE 的 fault 字段**追加到末尾**（而非插中间）是为了向后兼容 `arm_host.py`/`web_control.py` 的 `parts[3:9]` 精确切片解析。
-- **③ 不这么写会出什么问题**：若把 ESTOP/FAULT 混成一个态，过流异常会被 RESUME 带过 = 保护形同虚设；若在 `Arm_Update`/各 Command 里各自写 `==ESTOP || ==FAULT`，漏一处就是「急停不住」的安全漏洞；若 STATE 把 fault 插进字段中间，老上位机解析直接崩。
+## 三大核心支柱（2026-11-13 历史定位；机械臂链已删除）
 
-## 三大核心支柱（项目定位定稿，2026-11-13）
+> 🔴 **下面是旧「云-边-端移动操作平台」的完整构想，不是当前固件能力。** STM32 端的 PCA9685 / `$JOINT` / `$MOVE` / `STATE` 代码已于 2026-11-24 删除；
+> `kunpeng/robot`、`kunpeng/web` 里的 Python 脚本仍保留，但接当前固件前必须重写协议层。看当前能力请以本节顶部的「代码现状」和 `docs/00-项目总览…` 为准。
 
 > 🔴 **「核心必备」的唯一判据 = 能演示 + 能讲清边界。** 三根支柱缺一不可：
 > 任何一根只能按实际情况标 ✅ / 🔶 / 📋，**不允许因为「它是核心」就写成已完成**。
@@ -114,18 +135,22 @@ ESP32-S3 听语音 → 鲲鹏意图解析 + `ArmIK` 算 6 路脉宽 → 串口 `
 
 | 环节 | 状态 |
 |---|---|
-| STM32 固件（协议 + 六路舵机 + 软限位 + 斜坡） | ✅ 实机通过：`$PING*10` → `$OK,PONG*3E`，`STATE` 回读六路脉宽 |
+| STM32 固件（底盘 + 协议） | ✅ Rebuild 0 Error / 0 Warning（Code=24400 / RO=1016 / RW=212 / ZI=20860）；`PING`、`$CAR/$ODOM` 等**尚未实机验证** |
 | 鲲鹏 YOLOv8 识别 + MJPEG 推流 | ✅ 板上实测约 26.6 FPS（B 抽帧推理 + C V4L2/MJPG 采集优化后） |
-| 鲲鹏网页控制台 + 点选抓取 | ✅ 5000 单页：滑杆控 6 路、点选→IK→`JOINT`→`STATE`、标定参数常驻面板 + 本地预设 |
-| **支柱③** `iot/` 可观测性闭环 | ✅ 真实串口遥测 → MQTT → EMQX → eKuiper → InfluxDB → Grafana，四容器板上跑通、Grafana 六路曲线已出；收口 `e6cd194`。🔶 缺口：未覆盖 ESP32-S3 节点、eKuiper 无告警规则（🔴 不是云端 IoT / 不增抓取能力） |
-| 手眼标定（眼在手，AX=XB） | ✅ **已实标**（12 组姿态）：`resid` 16.7mm→**1.60mm**、`axis_cond` 0.519、`|t|`=16.7cm≈L3、棋盘不动 P 极差 0.30/0.51/0.36cm。`s`=0.7549 已实测拆分（相机侧 9.5% + J1 map 伪折点 21%，🔶 已定位未修）。**A+ 眼在手点选链路代码已有（`--eye-in-hand`），🔶 未用实标 X 实机验证** |
+| 鲲鹏网页控制台 + 点选抓取（历史） | 🔶 Python 脚本还在，但 STM32 的 `$JOINT/$STATE` 已删除；接当前固件前必须重写协议层 |
+| **支柱③** `iot/` 可观测性闭环（历史） | 🔶 旧六舵机遥测链路曾跑通（四容器 + Grafana `j1~j6` 曲线）；**STM32 固件已删舵机/机械臂代码，当前没有六路关节遥测**，需改成底盘 `$CAR,ODOM/WHEEL` 遥测后才能复用；ESP32 节点、eKuiper 告警仍未接 |
+| 手眼标定（眼在手，AX=XB） | 🔶 **历史能力**（12 组姿态实标，`resid` 16.7mm→**1.60mm**、`axis_cond` 0.519、`|t|`=16.7cm≈L3）；机械臂代码已于 2026-11-24 删除，`kunpeng/robot/handeye_calib.py` 仍保留 |
 | 蓝牙 / WiFi / RFID 多通道、示教回放 | 🔶 旧项目源码已有，当前工程未重新实机复验（RC522 当前未接） |
 | `kunpeng/llm/` 意图解析 + 离线文本入口网关 + **VLM 决策层** | 🔶 `intent_parser.py` + `text_gateway.py`，44 项 unittest 全绿；🆕 `vlm_decider.py`（阶段 6 / P2）8 组自测过 —— **模型只选编号、不输出坐标**，越界编号拒绝执行。**均只输出决策、不下发**、未接真模型 / 未接主链路；`$ASR` 帧是建议草案 |
 | **支柱②** ESP32-S3 语音入口 | 🔶 **P0 核心在办**：IDF 骨架 **14 文件**（11-14 晚补 `tcp_client.c/.h` Wi-Fi TCP 上行层、`main.c` 自检帧改 `$ESTOP/$RESUME`、中文帧 `SEND_CN_HOME_FRAME=0` 闸门；11-21 再补 `audio_tx.c/.h` PCM 上行），本机帧/网关语义实证 **`PASS=24 FAIL=0`**、PC 上整机 `set-target`（rc=0）+ `idf.py build` **已通过**（`BUILD_RC=0` / `Project build complete` / 产物齐全，证据见 `docs/固件与ESP32开发.md`）；✅ **已烧录实机验证**（SoftAP/TCP 9000 往返 $OK/采音非零；9001 音频上行待验收）。待补：WakeNet 唤醒、命令词识别、ESP32 遥测进 EMQX。✅ 硬件就绪（成品板 CH343/N16R8 + INMP441 + MAX98357A + 3W 喇叭）。👉 **11-14 用户重排优先级后本项排第一**，C 侧 `protocol.c` 封帧已与鲲鹏侧逐字节 5/5 一致，路线见 `docs/固件与ESP32开发.md` |
 | **支柱② 鲲鹏侧收帧服务（B 项 / 阶段 2）** | ✅ **11-14 16:40 上板 `--apply` 实机验收通过**：`kunpeng/robot/voice_gateway.py` 已落盘 + **38 项 unittest 全绿** + 四层硬判据全绿（假帧驱动臂回初始位、`PICK` 被拒、急停冻结/恢复）；独立进程不改 `web_control.py`、不直连串口，只经 `/api/cmd` 下发固件原生 `HOME/STOP/RESUME`；✅ **ESP32 已接入并实机发 `$ESTOP/$RESUME` 自检帧**（TCP 9000 往返 $OK）；🔴 `$ASR` 语义层仍待 ESP-SR 命令词落地后对齐，`source` 恒 `mock`。记录见 `docs/KunPeng部署与语音网关上板验收.md`，排障见 `docs/排障记录-服务端与IoT.md` |
 | 双 STM32 分工、双相机 6D 位姿、LLM 规划、OTA、云端 IoT、数字孪生 | 📋 纯规划，**无代码** |
 
-> 状态口径与可直接投递的简历正文见 `docs/面试与简历材料.md`；写简历 / 面试时的红线见 `docs/排障记录-固件与ESP32.md`「本阶段诚实边界」。
+> 🔴 **读表提醒**：上表中凡涉及 PCA9685 / `$JOINT` / `$MOVE` / `$STATE` / `$HOME` / `$RESUME` / `$ESTOP` 的“✅/🔶”都是 **2026-11-24 之前的历史实证**。
+> 当前 STM32 固件只认 `$PING/$LOG/$CAR,VEL/$CAR,STOP/$CAR,ODOM/$CAR,RESET/$CAR,RAW/$CAR,WHEEL/$CAR,ENC/$CAR,GAIN/$CAR,CLRFAULT/$STOP`，**没有** `$ESTOP/$RESUME/$HOME/$JOINT/$MOVE/$STATE`；
+> `kunpeng/web`、`kunpeng/robot`、`voice_gateway.py` 的机械臂命令不能直接驱动当前固件，ESP32 的 `$ESTOP/$RESUME` 自检帧也必须改；当前底盘急停用 `$CAR,STOP` 或 `$STOP`。
+
+> 写简历 / 面试时的红线见 `docs/排障记录-固件与ESP32.md`「本阶段诚实边界」（原 `docs/面试与简历材料.md` 已删除，2026-11-24）。
 
 ## 目录结构
 
@@ -134,13 +159,14 @@ STM32 / 鲲鹏 / ESP32-S3 三块板的代码与全部文档都收在这一个文
 
 ```
 RoboticArm_Kunpeng/
-├── Robotic arm vision.ioc       CubeMX 工程文件（打开它即可重新生成代码）
+├── RoboticArm_Kunpeng.ioc     CubeMX 工程文件（打开它即可重新生成代码）
 ├── Core/                        ★STM32 固件源码（CubeMX 标准结构，勿改目录名）
-│   ├── Inc/  Src/               main / usart / bt / wifi / uart_protocol /
-│   │                            pca9685 / arm_control / teach / freertos 等
-│   ├── Drivers/                 ST HAL 库（ST 官方）
-│   ├── Middlewares/             FreeRTOS + CMSIS（官方）
-│   └── MDK-ARM/                 Keil 工程（Robotic arm vision.uvprojx）
+│   ├── Inc/                     头文件：main / usart / bt / wifi / uart_protocol /
+│   │                            freertos / chs_tb6612 / chassis / servo_bus
+│   └── Src/                     源文件：与 Inc 同名成对
+├── Drivers/                     ST HAL 库（ST 官方）
+├── Middlewares/                 FreeRTOS + CMSIS（官方）
+├── MDK-ARM/                     Keil 工程（RoboticArm_Kunpeng.uvprojx）
 ├── kunpeng/                     ★鲲鹏 KunPeng Pro 边缘端（openEuler + Python）
 │   ├── vision/                          YOLOv8 识别链路
 │   │   ├── stage1_yolov8.py     旧版识别主程序（双后端 + --imgsz 320 约 7FPS）
@@ -159,27 +185,19 @@ RoboticArm_Kunpeng/
 │   │   └── test_voice_gateway.py 🆕 网关回归考卷：38 项 unittest，不动臂不联网
 │   ├── web/                     ✅ web_control.py 网页遥控（Flask + 滑杆 + 点选抓取）
 │   ├── llm/                     🔶 意图解析 + VLM 决策层（vlm_decider.py 只选编号不输出坐标，8 组自测过）
-│   ├── car/                     🆕 car_gateway.py 底盘统一帧网关（串口 / TCP / dry-run，🔶 未接主链路）
 │   └── docs/                    stage1_README.md 识别部署说明、A档执行计划
-├── car/                         🆕 项目 1 底盘合并（STM32F407ZE / Keil+SPL）：统一帧 `$CAR,...*CK` + 14 项 host 单测；🔶 未上板，见 car/README.md
 ├── esp32/                       ★支柱② ESP32-S3 语音入口（P0 核心）：14 文件骨架（含 11-14 晚新增 tcp_client.c/.h Wi-Fi TCP 上行）；成品板已可用、软件已烧录、链路已实机；口径见 esp32/README.md
 ├── iot/                         ✅ 板内可观测性闭环（EMQX→eKuiper→InfluxDB→Grafana + 真实串口遥测）：已实证，收口 e6cd194
 ├── protocol_engine_cpp/         项目 3：C++ 跨平台串口协议引擎（243 断言，三方协议金标准）
-└── docs/                        全部文档（14 份，2026-11-21 整理）
+└── docs/                        全部文档（8 份，2026-11-24 清理旧机械臂专题）
     ├── 00-项目总览与硬数据速查.md  项目定位 / 四项目整合 / 全部硬数据（口径唯一来源）
     ├── 硬件清单与接线.md          买什么 / 多少钱 / 怎么接，含 BOM 核对与供电
+    ├── 底盘-TB6612与JGB37-520-接线、固件与调试.md  现行底盘唯一口径：接线 / 烧录 / $CAR 调试
     ├── 焊接与上电检查.md          焊接顺序 / 上电流程 / 黄金测试点 / 异常速查
-    ├── 末端执行器-舵机标定与限力夹持.md  6 舵机脉冲表与限位 + ACS712 限力
-    ├── 视觉-DaBai DCW 与精度目标.md  相机驱动/参数/全功能测试 + 精度天花板
-    ├── 手眼标定与一车全载抓取.md  AX=XB 标定全过程 / 误差分析 / 车载落地
     ├── 固件与ESP32开发.md        IDF 环境 / 接入路线 / 核心化 / 照跑清单
     ├── 排障记录-固件与ESP32.md    固件、串口、ESP32、S3b 的坑
     ├── 排障记录-服务端与IoT.md    语音网关、IoT 遥测、LLM 层的坑
-    ├── KunPeng部署与语音网关上板验收.md  板卡局限 / 部署 / 上板验收 / eKuiper 草案
-    ├── 联调验收清单.md           串口 57 项 + 视觉 V1~V7 判据
-    ├── 能力边界与对标（幻尔LanderPi）.md  能做/不能做 / 18 张截图对标 / 三档路线
-    ├── 面试与简历材料.md          陈述稿 / 复习提纲 / 简历条目
-    └── 可行性与落地路线.md        选型取舍 / 三条路线
+    └── KunPeng部署与语音网关上板验收.md  板卡局限 / 部署 / 上板验收 / eKuiper 草案
 ```
 
 > **命名约定**：`Core / Drivers / Middlewares / MDK-ARM` 是 CubeMX + Keil 的**强制约定目录名**
@@ -189,7 +207,7 @@ RoboticArm_Kunpeng/
 ## 快速开始
 
 ### 1. 固件
-Keil 打开 `MDK-ARM/Robotic arm vision.uvprojx` 编译下载。
+Keil 打开 `MDK-ARM/RoboticArm_Kunpeng.uvprojx` 编译下载。
 
 ### 2. 鲲鹏端（上位机 / 视觉 / 网页）
 把 `kunpeng/` 整个目录拷到开发板（openEuler 22.03），在板上执行：
@@ -222,21 +240,18 @@ python3 kunpeng/robot/handeye_calib.py solve --samples samples.json --out handey
 > 正确顺序：`refk_samples.py samples.json --out samples_fkfix.json` → `solve --samples samples_fkfix.json`
 > （`refk` 幂等，会自检并打印「位置改动 0.0000cm」「X轴·L3 = +1.0000」）。
 
-> 旧「眼在外 + PC 上位机」版本（Homography 单应标定）已移除；判据收进 `docs/联调验收清单.md` 第二部分（V1~V7），
+> 旧「眼在外 + PC 上位机」版本（Homography 单应标定）已移除；原验收文档（`联调验收清单.md`）已于 2026-11-24 删除，
 > 原程序已删除、命令不可照跑。
-
-> WiFi 热点 SSID/密码在 `Core/Src/wifi.c` 的 `WIFI_AP_SSID` / `WIFI_AP_PASS` 中配置。
-> 仓库中已置为占位符（`YOUR_SSID` / `YOUR_PASSWORD`），运行前请改成自己的。
 
 ## 本人负责的模块
 
 本项目固件由 CubeMX 生成外设框架，以下模块为本人手写实现：
 
-- **自定义 UART 指令协议**：帧状态机、XOR 校验、双缓冲应答、多串口路由，以及 WiFi `+IPD` 上报 / `AT+CIPSEND` 封包的专用适配。
-- **机械臂运动控制**：斜坡限速、逐轴软限位、`Arm_Update()` 20ms 刷新、五态状态机与急停逻辑。
-- **FreeRTOS 三任务架构与两把互斥锁**设计（任务划分、优先级、栈大小、锁序）。
-- **驱动与功能模块**：PCA9685 驱动、电位器 ADC+DMA 采样滤波、示教录制/回放。
-- **视觉抓取链路**（鲲鹏端 Python）：YOLOv8n 目标检测、眼在手手眼标定（AX=XB）、六自由度逆解算脉宽、串口发帧与网页遥控。
+- **自定义 UART 指令协议**：帧状态机、XOR 校验、双缓冲应答、USART1/2/3 三路对等路由（同一套代码，无模块专用分支）。
+- **四轮麦轮底盘控制（当前主线）**：2×TB6612FNG 双路驱动、4×JGB37-520(1:90) 正交编码器、TIM4 20kHz PWM、麦轮逆/正解、20ms 速度环、梯形限加速、里程计、500ms 指令超时与 300ms 堵转保护。
+- **FreeRTOS 多任务架构**设计（当前三任务 + 一把 `print_lock`；早期五任务/三把锁版本含舵机与安全任务，2026-11-24 已随机械臂代码清理）。
+- **驱动与功能模块（历史，代码已删）**：PCA9685 驱动、电位器 ADC+DMA 采样滤波、示教录制/回放、RC522、ACS712 过流保护。
+- **视觉抓取链路（鲲鹏端 Python，历史）**：YOLOv8n 目标检测、眼在手手眼标定（AX=XB）、六自由度逆解算脉宽、串口发帧与网页遥控；STM32 端协议已删，接入前需重写。
 
 > **第三方代码声明**：`Drivers/`（ST HAL）、`Middlewares/`（FreeRTOS、CMSIS）为 ST / FreeRTOS 官方库，非本人编写。
 
@@ -262,24 +277,6 @@ python3 kunpeng/robot/handeye_calib.py solve --samples samples.json --out handey
 - **① 用了什么语法**：`argparse` 的 `--radial-fix` 收三种写法（`auto` / `0` / 一个数字），解析成一个「要么是 `None` 表示交给服务端默认、要么是具体浮点」的变量，再决定要不要往 JSON 里塞这个键；服务端把修正抽成纯函数 `_radial_fix_xy(x, y, k)`，系数 `_EYE_RADIAL_K` 放模块级、用 `--radial-fix` 启动参数 + 函数内 `global` 覆盖；返回体额外回 `x_raw / y_raw / radial_k / radial_shift` 四个字段，让「改了多少」可查。
 - **② 为什么这么设计**：修正只乘**半径**、不碰方位角 —— 因为物理原因就是「光轴俯仰角错了 δ」，射线沿自身方向前后滑，横向不受影响（`交点位移 ≈ depth·tanδ / sinα`）；用系数型而不是固定偏移，是让 r 小时修正量自动趋近 0，不会把近处的点硬推远。位置选在 **API 出口**而不是 `handeye_geometry.localize`，是因为 localize 是标定链的一环（`refk_samples` / `AX=XB` 都走它），往里塞经验系数会把 X 污染得说不清；放出口则网页点选 / `eye_check` / `pick_pipeline` 一起受益，还能用 `radial_fix=0` 当场对比。
 - **③ 不这么写会出什么问题**：① 把系数塞进 localize → 以后每次重算标定都带一个来路不明的缩放，X 一旦被重解就和历史数据对不上；② 用固定偏移 → r=10cm 处也硬加 3cm，近处直接过冲；③ 只改 x/y 不给 `x_raw` → 同一块棋盘前后两次坐标差 3cm 根本没法追溯，而这正是当初卡了两天的现象；④ **`do_hover` 的净空闸门继续用常数 `SAG_DZ` → 远端「报 1.12cm 净空、实际只剩 0.2cm」照样放行**（30cm 那次就这么擦到纸的）。现在闸门按力矩臂折算并取 `max(常数, 折算)`，宁可误拒也不放行。
-
-**模块 D：`car/car_frame.c` + `kunpeng/car/car_gateway.py`（底盘统一帧，A 项，2026-11-14）**
-
-- **① 用了什么语法**：协议层用 `static` 私有状态 + 四态 `switch` 状态机逐字节成帧、`enum` 给动作命名、
-  `struct` 打包命令、**函数指针**（`car_on_command_fn` / `car_send_fn`）把「发应答」「动电机」两个回调注册进来；
-  自己写 `parse_u32()` 而不用 `atoi`；Python 侧用 `argparse` 的 `add_mutually_exclusive_group` 让
-  `--port/--tcp/--dry-run` 三选一，`with` 自动关串口、`%02X` 格式化 XOR 校验和。
-- **② 为什么这么设计**：协议层**不 include `stm32f4xx.h`**，硬件动作靠回调注入 ⇒ 在 PC 上用 gcc
-  就能编译跑 14 项单元测试，不必每改一次协议就烧板子；帧语法直接沿用机械臂 `uart_protocol.c`
-  的 `$<CMD>[,<ARG>...]*<CK>\r\n`，两个 MCU 节点共用一套句子才叫「统一帧」。网关做成**独立进程**，
-  不碰已实机验收的 `web_control.py`。固件侧把量程仲裁（时长 ≤5000ms / PWM ≤999）放在本地，
-  落实「LLM 只能提议、本地仲裁器才授权」。
-- **③ 不这么写会出什么问题**：把 `BT_SendStr` / `Car_Forward` 写进协议层 ⇒ 无法主机测试、两套协议难复用；
-  用 `delay_ms(800)` 做动作时长 ⇒ 800ms 内收不到 `$CAR,STOP`，急停喊不住、避障循迹被卡住（改用 `millis()` 时间戳轮询）；
-  不区分「帧模式 / 单字符模式」⇒ 帧 `$CAR,FWD,...` 里的 `F` 会被老蓝牙协议误当成「前进」；
-  不给定长缓冲上限 ⇒ 串口灌垃圾字节写爆数组，裸机没有 OS 保护直接跑飞。
-- 🔴 **本次没改 `.ioc`**：小车是 Keil+SPL、机械臂是 CubeMX+HAL，按两个节点各自保留工程、
-  靠统一帧通信；改成单板才需要动 CubeMX，但会重生成代码 + 重烧甩臂、破坏已验收链路。详见 `docs/00-项目总览与硬数据速查.md` 第四节。
 
 **模块 E：`kunpeng/robot/voice_gateway.py`（鲲鹏侧语音入口网关，B 项 / 阶段 2，2026-11-14）**
 
@@ -308,7 +305,7 @@ python3 kunpeng/robot/handeye_calib.py solve --samples samples.json --out handey
 按模块记录开发中实际遇到、并已解决的问题，附根因分析。
 
 > S3b 阶段（鲲鹏视觉服务 + 网页控制台）的排障记录按「现象 → 排查过程 → 根因 → 解决 → 一句话面试说辞」
-> 五段式单独维护在 `docs/排障记录-固件与ESP32.md`；本节 16 条是固件 / 旧 PC 上位机阶段的历史记录。
+> 五段式单独维护在 `docs/排障记录-固件与ESP32.md`；本节 14 条是固件 / 旧 PC 上位机阶段的历史记录。
 
 **RFID（RC522）**
 
@@ -319,11 +316,6 @@ python3 kunpeng/robot/handeye_calib.py solve --samples samples.json --out handey
 **蓝牙（HC-05）**
 
 - **手机连接后频繁掉线，指令无响应**：模块直接由 STM32 3.3V 引脚供电，建链瞬间电流不足导致射频复位；另有一批克隆模块设备名非标准、固件不兼容。改为独立稳压 5V 供电并共地，AT 模式配置波特率 115200、8N1、名称 ARM-BT、密码 1234，EN/KEY 拉低断电重启进入透传模式后才可收发。
-
-**WiFi（ESP-01S）**
-
-- **TCP 服务器模式下客户端收不到 UART→TCP 数据**：CIPSERVER（CIPMUX=1）与透传模式（CIPMODE=1）在克隆固件上不能共存，且非透传下 UART→TCP 不会自动发生；固定 CIPMODE=0 + AT+CIPSEND 包封转发，命令间必须等待 'OK'/'ready' 应答（AT+RST 要等 'ready' 而非首个 'OK'），不能用固定延时，否则命令丢失。
-- **CIPMUX/CIPSERVER 掉电丢失**：克隆模块 flash 不保存配置；上电后由 STM32 主循环重新配置，不依赖模块自身保存。
 
 **机械臂标定与逆运动学**
 
@@ -366,4 +358,4 @@ python3 kunpeng/robot/handeye_calib.py solve --samples samples.json --out handey
 ## 仓库说明
 
 - **已脱敏**：WiFi 热点 SSID/密码为占位符，蓝牙名称/密码等演示参数不含真实凭据。
-- **已在 `.gitignore` 排除**：Keil 构建产物与备份副本（`MDK-ARM/Robotic arm vision/`、`*.uvoptx`、`*.0000` 等）、CMSIS DSP 官方示例（`Drivers/CMSIS/DSP/Examples/`）、Python 缓存与第三方手册解包文本。
+- **已在 `.gitignore` 排除**：Keil 构建产物（`MDK-ARM/RoboticArm_Kunpeng/`、`*.uvoptx`、`*.0000` 等）、CMSIS DSP 官方示例（`Drivers/CMSIS/DSP/Examples/`）、Python 缓存与第三方手册解包文本。
