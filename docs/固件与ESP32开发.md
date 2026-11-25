@@ -317,7 +317,7 @@ idf.py -p COM7 flash monitor
 | 3 | 最后才进 ESP-SR 命令词（唯一有技术不确定性的一段） | ❌ | 📋 |
 | 4 | IoT 补 ESP32 节点遥测 + eKuiper 告警规则 | ❌ | 🔶 |
 | 5 | ACS712 / J6 限力夹持（📋 方案已出，独立于主线） | ⚠️ 要接线 + 标定 | 📋 |
-| **6（最后）** | **底盘实机验收**：Rebuild `RoboticArm_Kunpeng.uvprojx` → ST-LINK 烧 **F407VE** → 跑第五节最小判据 | ✅ **必须烧** | 🔶 Rebuild 0/0 通过（Code=24400），未烧录实机 |
+| **6（最后）** | **底盘实机验收**：Rebuild `RoboticArm_Kunpeng.uvprojx` → ST-LINK 烧 **F407VE** → 跑第五节最小判据 | ✅ **必须烧** | 🔶 Rebuild 0/0 通过（Code=24440），未烧录实机 |
 
 ---
 
