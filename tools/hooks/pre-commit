@@ -1,0 +1,49 @@
+#!/bin/sh
+# ---------------------------------------------------------------------------
+# 提交前编码检查（pre-commit hook）
+#
+# 作用
+#   阻止把「Core/ 下缺 UTF-8 BOM 的 .c/.h」或「被存成 GBK/ANSI 的文件」提交进库，
+#   从源头杜绝 Keil 中文注释乱码复发。
+#
+# 安装（每个新克隆的仓库执行一次即可）
+#   git config core.hooksPath tools/hooks
+#
+# 临时跳过（不建议）
+#   git commit --no-verify
+#
+# 注意
+#   本文件必须保持 LF 换行，否则 Git Bash 会报 "bad interpreter"。
+#   .gitattributes 已用 `tools/hooks/*  text eol=lf` 固定这一点。
+# ---------------------------------------------------------------------------
+
+# 输出中文到 Git Bash 的控制台时，避免 Python 因 locale 抛 UnicodeEncodeError
+PYTHONIOENCODING=utf-8
+PYTHONUTF8=1
+export PYTHONIOENCODING PYTHONUTF8
+
+# 依次尝试 python / python3 / py（Windows 上通常有 python 或 py）
+PY=""
+for c in python python3 py; do
+    if command -v "$c" >/dev/null 2>&1; then
+        PY="$c"
+        break
+    fi
+done
+
+if [ -z "$PY" ]; then
+    echo "[pre-commit] 未找到 python，跳过编码检查（请自行确认编码合规）"
+    exit 0
+fi
+
+"$PY" tools/check_encoding.py
+rc=$?
+
+if [ "$rc" -ne 0 ]; then
+    echo ""
+    echo "[pre-commit] 编码检查未通过，提交已被拦下。"
+    echo "[pre-commit] 自动修复：python tools/check_encoding.py --fix"
+    echo "[pre-commit] 确需跳过：git commit --no-verify"
+fi
+
+exit $rc

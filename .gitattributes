@@ -5,3 +5,5 @@
 *.py   text eol=lf
 *.sh   text eol=lf
 *.md   text eol=lf
+# Git 钩子脚本无 .sh 后缀，必须显式锁 LF，否则 Git Bash 报 "bad interpreter"
+tools/hooks/* text eol=lf

@@ -207,6 +207,24 @@ RoboticArm_Kunpeng/
 > （`.ioc` 必须与 `Core`、`Drivers` 同级，Keil 工程内 100% 使用 `../Core/...` 相对路径），
 > 改名会让 CubeMX 和 Keil 都找不到文件，因此保持原名——这不是"没改"，是**不能改**。
 
+## 开发约定
+
+### 1. 源码编码（防 Keil 中文注释乱码）
+
+**规矩：`Core/` 下参与 Keil 编译的 `.c/.h` 一律存成 UTF-8 with BOM；`.py` / `.md` / `.cpp` 等其余文件存 UTF-8 无 BOM。**
+
+- **为什么**：Keil uVision 打开「UTF-8 无 BOM」的文件时，会按 ANSI(GB2312) 解码，中文注释直接变乱码；带 BOM 才会被自动识别为 UTF-8。反过来，GitHub 网页、VS Code、ESP-IDF、Python 全部按 UTF-8 渲染——若把源码转成 GB2312，**仓库网页上的中文会全部乱码**。所以结论是「**全仓库统一 UTF-8，只给 Keil 源码加 BOM**」，不采用 GB2312。
+- **怎么固化**：仓库根 `.editorconfig` 已写好规则——VS Code 新建/编辑 `*.c`、`*.h` 自动存成 UTF-8 with BOM + CRLF；`*.py`、`*.md` 存 UTF-8 + LF；`*.cpp`、`*.hpp` 存 UTF-8 + LF。与 `.gitattributes` 里的 `eol=crlf` / `eol=lf` 一一对应。
+- **怎么检查**（提交前跑一次，0 违规再 commit）：
+  ```bash
+  python tools/check_encoding.py          # 只检查；有违规会列出文件并以退出码 1 结束
+  python tools/check_encoding.py --fix    # 顺带把 Core/ 下缺 BOM 的 .c/.h 自动补上
+  ```
+  覆盖 `Core/`、`esp32/`、`protocol_engine_cpp/`、`docs/`、`kunpeng/`、`iot/`、`tools/` 与根目录散文件，跳过 `Drivers/`、`Middlewares/`、`MDK-ARM/`。
+- **提交前自动拦截**：钩子脚本 `tools/hooks/pre-commit` 已入库。**每个新克隆的仓库执行一次** `git config core.hooksPath tools/hooks` 即可生效，之后每次 `git commit` 都会先跑上面这项检查，不合规**直接拦下**（报出具体文件名；`python tools/check_encoding.py --fix` 修好再提交，确需跳过用 `git commit --no-verify`）。钩子文件必须保持 LF，`.gitattributes` 已用 `tools/hooks/*  text eol=lf` 固定，否则 Git Bash 会报 `bad interpreter`。
+- **新建文件**：`.c/.h` **不要用 Keil 的 `File → New`**（它按当前 GB2312 设置存盘，正好是乱码那一类），一律在 VS Code 里新建；用 Keil 改完已有文件保存后，也建议再跑一次检查。
+- 历史：2026-11-25 由 commit `6fca0b3` 一次性给 15 个源文件补的 BOM（`uart_protocol.c` 原本就带），编译结果 `Code=24440` 与补 BOM 前**完全一致**，说明 BOM 不影响 ARMCC 生成代码。
+
 ## 快速开始
 
 ### 1. 固件
