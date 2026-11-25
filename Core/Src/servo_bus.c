@@ -1,4 +1,4 @@
-/**
+﻿/**
  * servo_bus.c  —  幻尔总线舵机驱动 + 温度轮询/阈值保护
  * 配套 servo_bus.h；STM32F407VET6 + HAL + FreeRTOS
  *

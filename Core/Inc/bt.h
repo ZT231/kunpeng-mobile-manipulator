@@ -1,4 +1,4 @@
-#ifndef __BT_H__
+﻿#ifndef __BT_H__
 #define __BT_H__
 
 #ifdef __cplusplus

@@ -1,4 +1,4 @@
-#ifndef __UART_PROTOCOL_H__
+﻿#ifndef __UART_PROTOCOL_H__
 #define __UART_PROTOCOL_H__
 
 #ifdef __cplusplus

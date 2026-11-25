@@ -1,4 +1,4 @@
-/* ================= USART3 第三控制源（预留） =================
+﻿/* ================= USART3 第三控制源（预留） =================
  *
  * USART3 底层驱动（huart3：PB10=TX、PB11=RX，115200 8N1、无流控）手写在
  * usart.c 的 USER CODE 区；USART3_IRQHandler 在 stm32f4xx_it.c 的 USER CODE 区实现。
