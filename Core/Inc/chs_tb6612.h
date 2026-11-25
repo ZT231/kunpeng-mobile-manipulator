@@ -9,11 +9,16 @@
  *   STM32F4 每个通用/高级定时器只有【一个】正交编码器接口，固定占用
  *   CH1/CH2（TI1/TI2）。CH3/CH4 不参与正交解码。四路必须用四个定时器：
  *     A 左前 → TIM3_CH1/CH2  (PB4/PB5,  AF2)
- *     B 右前 → TIM2_CH1/CH2  (PA15/PB3, AF1)
+ *     B 右前 → TIM2_CH1/CH2  (PA5/PB3,  AF1)
  *     C 左后 → TIM8_CH1/CH2  (PC6/PC7,  AF3)
  *     D 右后 → TIM1_CH1/CH2  (PE9/PE11, AF1)
- *   TIM2 的 PA15/PB3 是 JTAG 的 TDI/TDO；本工程调试用 SWD（PA13/PA14），
- *   把这两个脚改 AF1 不影响 SWD 下载/调试，但请勿再把调试口切回 JTAG。
+ *   PB3/PB4/PB5 与板载 W25Q16（SPI1：CLK/MISO/MOSI）及 NRF24L01 排座共用；
+ *   本文件在初始化时把 W25Q16 的 CS（PB0）配成推挽输出高，FLASH 全程不选中，
+ *   三条线才可避免“FLASH 抢 MISO/灌 CLK”的总线冲突。
+ *   编码器由 TB6612 板 MOTOR 座的 3.3V 供电，A/B 输出为 3.3V 逻辑，与 W25Q16
+ *   的 3.3V 电平兼容，无需拆 FLASH 或加钳位；只要 FLASH CS(PB0) 保持高即可。
+ *   PA5 在本板为空闲 GPIO（NRF 的 SPI1_SCK 实际在 PB3），可直接当编码器 B CH1。
+ *   调试必须用 SWD（PA13/PA14）；PB4/PB3 复用后不能再切回 JTAG。
  *
  * 🔴 引脚为什么避开 PB2：
  *   PB2 = BOOT1 strap，部分核心板焊了下拉/跳线帽，不建议当普通输出。
@@ -33,7 +38,7 @@ extern "C" {
 #include "main.h"
 #include <stdint.h>
 
-/* ==================== 本模块占用引脚（21 条） ====================
+/* ==================== 本模块占用引脚（22 条：底盘 21 + 板载 FLASH CS 1） ====================
  * 全部由 CHS_TB_Init() 运行期配置，不经过 CubeMX（.ioc 不含这些脚）。
  *
  *   PWM（TIM4，APB1 定时器时钟 84MHz，ARR=4199 → 20kHz）
@@ -43,16 +48,19 @@ extern "C" {
  *   DIR（8 根 GPIO 推挽输出，低速；模块 1 = A/B，模块 2 = C/D）
  *     PC0  AIN1 ┐ A 左前         PC2  BIN1 ┐ B 右前
  *     PC1  AIN2 ┘                PC3  BIN2 ┘
- *     PC10 AIN1 ┐ C 左后         PC12 BIN1 ┐ D 右后
- *     PC11 AIN2 ┘（模块 2）       PC13 BIN2 ┘（模块 2）
+ *     PB12 AIN1 ┐ C 左后         PB14 BIN1 ┐ D 右后
+ *     PB13 AIN2 ┘（模块 2）       PB15 BIN2 ┘（模块 2）
  *
  *   STBY（1 根）
  *     PE8 → 两块 TB6612 的 STBY 并联；高 = 使能，低 = 待机（H 桥全关）
  *
+ *   板载 SPI FLASH 隔离（1 根，非底盘）
+ *     PB0 → W25Q16_CS，推挽输出高；禁止板载 FLASH 选中
+ *
  *   编码器（4 个定时器各一路正交；AF 输入 + 内部上拉）
- *     A  PB4 / PB5   ← TIM3_CH1/CH2  AF2
- *     B  PA15/ PB3   ← TIM2_CH1/CH2  AF1（JTAG 的 TDI/TDO，SWD 模式可释放）
- *     C  PC6 / PC7   ← TIM8_CH1/CH2  AF3
+ *     A  PB4 / PB5   ← TIM3_CH1/CH2  AF2（与 W25Q16 MISO/MOSI 共用，CS(PB0) 已拉高）
+ *     B  PA5 / PB3   ← TIM2_CH1/CH2  AF1（PB3 与 W25Q16 CLK/NRF SCK 共用；PA5 空闲）
+ *     C  PC6 / PC7   ← TIM8_CH1/CH2  AF3（SDIO_D6/D7，4 位 SD 不用）
  *     D  PE9 / PE11  ← TIM1_CH1/CH2  AF1
  *
  * 与固件其它外设零重叠：USART1(PA9/PA10)、USART2(PD5/PD6)、
@@ -83,7 +91,10 @@ typedef enum {
 #define CHS_TB_PWM_ARR              4199U
 
 /* ==================== DIR（8 根，模块 1=A/B，模块 2=C/D） ==================== */
-/* 全部放在 GPIOC 的空闲脚，同一端口也方便把 8 根 DIR 排成一条线。 */
+/* 模块 1（A/B）用 PC0~PC3，模块 2（C/D）用 PB12~PB15：
+   两块 TB6612 各自 4 根连续排列。PB12~PB15 在本板是 TFT 触摸屏 SPI2
+   （T_CS/T_SCK/T_MISO/T_MOSI），不插 TFT 时是普通 GPIO；同时避开
+   PC10~PC12（SDIO_D2/D3/CK）和 PC13。 */
 #define CHS_TB_DIR_A_PORT           GPIOC
 #define CHS_TB_DIR_A_PIN1           GPIO_PIN_0      /* AIN1 */
 #define CHS_TB_DIR_A_PIN2           GPIO_PIN_1      /* AIN2 */
@@ -92,13 +103,13 @@ typedef enum {
 #define CHS_TB_DIR_B_PIN1           GPIO_PIN_2      /* BIN1 */
 #define CHS_TB_DIR_B_PIN2           GPIO_PIN_3      /* BIN2 */
 
-#define CHS_TB_DIR_C_PORT           GPIOC
-#define CHS_TB_DIR_C_PIN1           GPIO_PIN_10     /* AIN1（模块 2 的 A 通道） */
-#define CHS_TB_DIR_C_PIN2           GPIO_PIN_11     /* AIN2 */
+#define CHS_TB_DIR_C_PORT           GPIOB
+#define CHS_TB_DIR_C_PIN1           GPIO_PIN_12     /* AIN1（模块 2 的 A 通道） */
+#define CHS_TB_DIR_C_PIN2           GPIO_PIN_13     /* AIN2 */
 
-#define CHS_TB_DIR_D_PORT           GPIOC
-#define CHS_TB_DIR_D_PIN1           GPIO_PIN_12     /* BIN1（模块 2 的 B 通道） */
-#define CHS_TB_DIR_D_PIN2           GPIO_PIN_13     /* BIN2 */
+#define CHS_TB_DIR_D_PORT           GPIOB
+#define CHS_TB_DIR_D_PIN1           GPIO_PIN_14     /* BIN1（模块 2 的 B 通道） */
+#define CHS_TB_DIR_D_PIN2           GPIO_PIN_15     /* BIN2 */
 
 /* ==================== STBY（两块并联 → PE8） ==================== */
 /* TB6612 STBY 内部 200kΩ 下拉，悬空=待机；必须主动拉高才出力。
@@ -116,11 +127,13 @@ typedef enum {
 #define CHS_TB_ENC_A_PIN2           GPIO_PIN_5
 #define CHS_TB_ENC_A_AF             GPIO_AF2_TIM3
 
-/* B：TIM2_CH1/CH2 → PA15/PB3（AF1，JTAG 的 TDI/TDO；SWD 调试可释放） */
+/* B：TIM2_CH1/CH2 → PA5/PB3（AF1）
+   PA5 在本板为空闲 GPIO（NRF 的 SPI1_SCK 实际在 PB3）；
+   PB3 是板载 W25Q16 的 CLK 兼 NRF 排座 SCK，需 FLASH CS(PB0) 保持高。 */
 #define CHS_TB_ENC_B_TIM            TIM2
 #define CHS_TB_ENC_B_PERIOD         0xFFFFFFFFU
 #define CHS_TB_ENC_B_PORT1          GPIOA
-#define CHS_TB_ENC_B_PIN1           GPIO_PIN_15
+#define CHS_TB_ENC_B_PIN1           GPIO_PIN_5
 #define CHS_TB_ENC_B_PORT2          GPIOB
 #define CHS_TB_ENC_B_PIN2           GPIO_PIN_3
 #define CHS_TB_ENC_B_AF             GPIO_AF1_TIM2
@@ -142,6 +155,14 @@ typedef enum {
 #define CHS_TB_ENC_D_PORT2          GPIOE
 #define CHS_TB_ENC_D_PIN2           GPIO_PIN_11
 #define CHS_TB_ENC_D_AF             GPIO_AF1_TIM1
+
+/* ==================== 板载 SPI FLASH 隔离（1 根，非底盘 21 条） ==================== */
+/* 本板 W25Q16（SPI1）：CS=PB0、CLK=PB3、MISO=PB4、MOSI=PB5。
+   编码器 A/B 复用 PB3/PB4/PB5 时，必须把 CS(PB0) 拉高，否则 FLASH 会被选中，
+   MISO(PB4) 与编码器 A 抢线、CLK(PB3) 被编码器 B 灌时钟。
+   （PB0 板上已带 R20=10K 上拉，此处仍主动配输出高，双保险。） */
+#define CHS_TB_FLASH_CS_PORT        GPIOB
+#define CHS_TB_FLASH_CS_PIN         GPIO_PIN_0
 
 /* ==================== 返回值 ==================== */
 #define CHS_TB_OK                   0

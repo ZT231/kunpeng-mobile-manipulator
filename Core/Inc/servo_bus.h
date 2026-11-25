@@ -34,11 +34,13 @@ extern "C" {
 
 #define SB_JOINT_NUM            6U
 
-/* 总线舵机串口与方向脚（半双工）
+/* 总线舵机串口与方向脚（经 Waveshare Bus Servo Adapter (A) 转接）
  * 本模块未加入 Keil 工程（等机械臂阶段再启用），以下为启用时的接线约定：
  *   · USART3(PB10/PB11) 已被 uart_protocol.c 注册为第三控制源，
  *     SB 启用时必须另选串口（如 USART6），不要直接抢占 huart3。
- *   · PB1 当前空闲，可作收发器 DE；若走 HAL 硬件单线模式则不接 DE。 */
+ *   · 转接板拨到 A 档（UART~SERVO），板内已完成 UART↔单线总线方向切换，
+ *     主机侧用【全双工 UART】按丝印 TX/RX 同名相接即可，不需要 DE 方向脚；
+ *     PB1 的 DE 是早期面向裸 RS485 收发器的预留，接 Waveshare 转接板时不使用。 */
 /* 占位符故意不绑定现成句柄：huart3 已被 uart_protocol.c 注册为第三控制源，
    直接绑过去会造成两个驱动抢同一个串口。启用本模块时必须在 CubeMX 新建
    独立 UART（如 USART6），再把下面这行改成该句柄；未改之前编译/链接会报
@@ -46,8 +48,8 @@ extern "C" {
 extern UART_HandleTypeDef sb_uart_handle;
 #define SB_UART_HANDLE          sb_uart_handle
 #define SB_DE_PORT              GPIOB
-#define SB_DE_PIN               GPIO_PIN_1      /* 预留；硬件单线模式不接 */
-#define SB_USE_HW_HALFDUPLEX    0               /* 1=HAL 单线半双工，0=GPIO 控收发器 */
+#define SB_DE_PIN               GPIO_PIN_1      /* 预留；接 Waveshare 转接板时不用 */
+#define SB_USE_HW_HALFDUPLEX    0               /* 1=HAL 单线半双工，0=GPIO 控收发器（两者均为旧收发器方案） */
 
 /* 协议帧 */
 #define SB_HEAD0                0x55U

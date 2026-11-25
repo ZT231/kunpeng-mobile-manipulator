@@ -1,9 +1,10 @@
 /**
  * chs_tb6612.c — 底盘底层：2×TB6612FNG + 4×JGB37-520(1:90) 霍尔编码器
  * ----------------------------------------------------------------------------
- * 只碰三样东西：
+ * 只碰四样东西：
  *   ① TIM4 CH1~CH4：20kHz PWM，CCR 0~4199；
- *   ② GPIO：8 根 DIR（每轮 IN1/IN2）+ 1 根 STBY（两块并联）；
+ *   ② GPIO：8 根 DIR（每轮 IN1/IN2）+ 1 根 STBY（两块并联）
+ *      + 1 根板载 W25Q16 CS（PB0，常高隔离）；
  *   ③ TIM1/TIM2/TIM3/TIM8：各自一个正交编码器接口，4 倍频计数。
  *
  * 所有硬件写操作只允许在 ChassisTask（20ms 任务）里调用；
@@ -157,7 +158,18 @@ int CHS_TB_Init(void)
     gi.Alternate = 0U;
     HAL_GPIO_Init(CHS_TB_STBY_PORT, &gi);
 
-    /* ---- ④ 8 根 DIR 输出（推挽、低速即可；TB6612 输入是高阻 CMOS） ---- */
+    /* ---- ④ 板载 W25Q16 CS：先写高再配输出，FLASH 全程不选中 ----
+       本板 FLASH 的 CLK/MISO/MOSI = PB3/PB4/PB5，与编码器 A/B 共用；
+       CS(PB0) 一旦为低，FLASH 会驱动 MISO(PB4)，编码器 A 计数必乱。 */
+    HAL_GPIO_WritePin(CHS_TB_FLASH_CS_PORT, CHS_TB_FLASH_CS_PIN, GPIO_PIN_SET);
+    gi.Pin       = CHS_TB_FLASH_CS_PIN;
+    gi.Mode      = GPIO_MODE_OUTPUT_PP;
+    gi.Pull      = GPIO_NOPULL;
+    gi.Speed     = GPIO_SPEED_FREQ_LOW;
+    gi.Alternate = 0U;
+    HAL_GPIO_Init(CHS_TB_FLASH_CS_PORT, &gi);
+
+    /* ---- ⑤ 8 根 DIR 输出（推挽、低速即可；TB6612 输入是高阻 CMOS） ---- */
     gi.Mode  = GPIO_MODE_OUTPUT_PP;
     gi.Pull  = GPIO_NOPULL;
     gi.Speed = GPIO_SPEED_FREQ_LOW;
@@ -167,7 +179,7 @@ int CHS_TB_Init(void)
         HAL_GPIO_Init(s_dir_port[i], &gi);
     }
 
-    /* ---- ⑤ 四路 PWM 引脚：PD12~PD15，AF2，推挽，最高速 ---- */
+    /* ---- ⑥ 四路 PWM 引脚：PD12~PD15，AF2，推挽，最高速 ---- */
     gi.Pin       = (uint16_t)(CHS_TB_PWM_PIN_A | CHS_TB_PWM_PIN_B |
                               CHS_TB_PWM_PIN_C | CHS_TB_PWM_PIN_D);
     gi.Mode      = GPIO_MODE_AF_PP;
@@ -176,7 +188,7 @@ int CHS_TB_Init(void)
     gi.Alternate = CHS_TB_PWM_AF;
     HAL_GPIO_Init(CHS_TB_PWM_PORT, &gi);
 
-    /* ---- ⑥ 四路编码器引脚：AF 输入，内部上拉（编码器多为集电极开路/推挽） ---- */
+    /* ---- ⑦ 四路编码器引脚：AF 输入，内部上拉（编码器多为集电极开路/推挽） ---- */
     for (i = 0U; i < CHS_TB_NUM; i++)
     {
         gi.Pin       = s_enc_pin[i].pin1;
@@ -190,7 +202,7 @@ int CHS_TB_Init(void)
         HAL_GPIO_Init(s_enc_pin[i].port2, &gi);
     }
 
-    /* ---- ⑦ TIM4：20kHz PWM，四路 CCR 先清 0 ---- */
+    /* ---- ⑧ TIM4：20kHz PWM，四路 CCR 先清 0 ---- */
     s_pwm.Instance               = CHS_TB_PWM_TIM;
     s_pwm.Init.Prescaler         = 0U;
     s_pwm.Init.CounterMode       = TIM_COUNTERMODE_UP;
@@ -214,7 +226,7 @@ int CHS_TB_Init(void)
         if (HAL_TIM_PWM_Start(&s_pwm, s_pwm_ch[i]) != HAL_OK) return CHS_TB_ERR_TIM;
     }
 
-    /* ---- ⑧ 四路编码器 ---- */
+    /* ---- ⑨ 四路编码器 ---- */
     for (i = 0U; i < CHS_TB_NUM; i++)
     {
         if (tb_enc_init(i) != 0) return CHS_TB_ERR_TIM;
