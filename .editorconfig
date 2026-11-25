@@ -1,0 +1,25 @@
+# EditorConfig —— 统一源码编码与换行，防止 Keil 中文注释乱码复发
+# 说明：Keil uVision 对"UTF-8 无 BOM"的文件按 ANSI(GB2312) 解码，中文注释会变乱码；
+#      带 BOM 则能被自动识别为 UTF-8。因此参与 Keil 编译的 .c/.h 必须带 BOM。
+# 参考：https://editorconfig.org
+root = true
+
+[*]
+charset = utf-8
+insert_final_newline = true
+trim_trailing_whitespace = false
+
+# Keil 工程源码：UTF-8 with BOM + CRLF（与 .gitattributes 的 *.c/*.h eol=crlf 对齐）
+[*.{c,h}]
+charset = utf-8-bom
+end_of_line = crlf
+
+# 脚本与文档：UTF-8 无 BOM + LF（Python 不推荐 BOM；Markdown/Shell 同理）
+[*.{py,sh,md}]
+charset = utf-8
+end_of_line = lf
+
+# C++ 协议引擎：UTF-8 无 BOM + LF（GCC/Clang 侧，不进 Keil）
+[*.{cpp,hpp,cc}]
+charset = utf-8
+end_of_line = lf
