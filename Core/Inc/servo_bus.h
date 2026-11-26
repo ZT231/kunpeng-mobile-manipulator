@@ -29,6 +29,7 @@ extern "C" {
 
 #include "main.h"
 #include "usart.h"      /* huart3：本模块绑定的串口句柄（USART3 已改为舵机专用） */
+#include "cmsis_os.h"   /* osMutexId_t：总线互斥锁（防止多任务并发抢 UART） */
 #include <stdint.h>
 
 /* ==================== 配置区（按实机改这里） ==================== */
@@ -218,6 +219,12 @@ uint8_t      SB_GetPeakTemp(const SB_Handle *h, uint8_t joint);
 int          SB_ClearFault(SB_Handle *h);
 
 void SB_SetReportHook(void (*fn)(const char *line));
+
+/* 注入总线互斥锁（RTOS mutex）。freertos.c 里 osMutexNew 之后调用一次：
+   ArmTask（运动/轮询）与 ProtocolTask（$ARM,STOP/RESUME/READ/TEMP/VIN）都会
+   阻塞收发 USART3，必须串行化，否则急停帧可能撞上 HAL_BUSY 被静默丢弃。
+   锁为 NULL 时退化为无锁（仅限单线程调试），正常 FreeRTOS 运行必须注入。 */
+void SB_SetBusLock(osMutexId_t lock);
 
 #ifdef __cplusplus
 }

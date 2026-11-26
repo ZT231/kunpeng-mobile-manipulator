@@ -536,7 +536,8 @@ static void cmd_car(const char *arg)
   *         子命令：POS（六轴同步）/ J（单轴）/ HOME / STOP / RESUME /
   *                 READ / TEMP / VIN / CLRFAULT。
   *         POS/J/HOME 只「投递作业」立刻回 OK，真正运动由 ArmTask 执行（见 arm_robot.h）；
-  *         READ/TEMP/VIN 是阻塞短查询（每轴一帧，最长约 50ms），在本任务里直接取回。
+  *         STOP/RESUME/READ/TEMP/VIN 在本任务里短阻塞执行（≤约 50ms），
+  *         靠 servo_bus 内部的 arm_bus_lock 与 ArmTask 串行化，不会抢 UART 丢帧。
   *         ARM_Exec 返回非 0 时按统一错误码回 $ERR,<code>。
   */
 static void cmd_arm(const char *arg)

@@ -47,6 +47,7 @@ static GPIO_TypeDef       *s_de_port = NULL;
 static uint16_t            s_de_pin = 0U;
 static void              (*s_hook)(const char *line) = NULL;
 static uint8_t             s_scale = SB_SCALE_NORMAL;
+static osMutexId_t         s_bus_lock = NULL;   /* 总线互斥锁，见 SB_SetBusLock */
 
 /* ================= 底层 ================= */
 
@@ -74,11 +75,13 @@ static uint8_t sb_chk(const uint8_t *buf, uint8_t n)
 }
 #endif
 
-/* 组帧发送：LEN = 3 + plen */
+/* 组帧发送：LEN = 3 + plen。整段（组帧→发送→换向余量）在总线锁内执行，
+   避免与 SB_MoveStop/轮询等在另一个任务里并发抢 UART 导致 HAL_BUSY 丢帧。 */
 static int sb_send(uint8_t id, uint8_t cmd, const uint8_t *par, uint8_t plen)
 {
     uint8_t f[SB_FRAME_MAX];
     uint8_t n = 0U, i, lenv;
+    HAL_StatusTypeDef st;
 
     if (!s_uart) return SB_ERR_PARAM;
     if ((uint16_t)plen + 6U > SB_FRAME_MAX) return SB_ERR_PARAM;
@@ -96,17 +99,19 @@ static int sb_send(uint8_t id, uint8_t cmd, const uint8_t *par, uint8_t plen)
     n++;
 #endif
 
+    if (s_bus_lock) (void)osMutexAcquire(s_bus_lock, osWaitForever);
+
     sb_de_tx();
-    if (HAL_UART_Transmit(s_uart, f, n, SB_TX_TIMEOUT_MS) != HAL_OK) {
-        sb_de_rx();
-        return SB_ERR_TX;
-    }
+    st = HAL_UART_Transmit(s_uart, f, n, SB_TX_TIMEOUT_MS);
     sb_de_rx();
     HAL_Delay(1);                  /* 换向余量 */
-    return SB_OK;
+
+    if (s_bus_lock) (void)osMutexRelease(s_bus_lock);
+
+    return (st == HAL_OK) ? SB_OK : SB_ERR_TX;
 }
 
-/* 收响应：参数个数 = LEN - 3 */
+/* 收响应：参数个数 = LEN - 3。整段接收状态机在总线锁内执行。 */
 static int sb_recv(uint8_t want_id, uint8_t want_cmd,
                    uint8_t *data, uint8_t data_max, uint8_t *data_len)
 {
@@ -114,8 +119,12 @@ static int sb_recv(uint8_t want_id, uint8_t want_cmd,
     uint8_t id = 0U, lenv = 0U, cmd = 0U, got = 0U, par = 0U;
     uint8_t sum = 0U, chk = 0U;
     uint32_t t0;
+    int result = SB_ERR_RX;
 
     if (!s_uart) return SB_ERR_PARAM;
+
+    if (s_bus_lock) (void)osMutexAcquire(s_bus_lock, osWaitForever);
+
     t0 = HAL_GetTick();
 
     while ((HAL_GetTick() - t0) < SB_RX_TIMEOUT_MS) {
@@ -168,15 +177,20 @@ static int sb_recv(uint8_t want_id, uint8_t want_cmd,
         }
 #endif
             if (data_len) *data_len = got;
-            if (id == want_id && cmd == want_cmd) return SB_OK;
+            if (id == want_id && cmd == want_cmd) { result = SB_OK; }
             st = 0U; id = 0U; lenv = 0U; cmd = 0U; got = 0U; par = 0U; sum = 0U;
             break;
         default:
             st = 0U;
             break;
         }
+
+        if (result == SB_OK) break;
     }
-    return SB_ERR_RX;
+
+    if (s_bus_lock) (void)osMutexRelease(s_bus_lock);
+
+    return result;
 }
 
 static int sb_query(uint8_t id, uint8_t cmd,
@@ -323,6 +337,11 @@ static void sb_temp_fsm(SB_Handle *h)
 void SB_SetReportHook(void (*fn)(const char *line))
 {
     s_hook = fn;
+}
+
+void SB_SetBusLock(osMutexId_t lock)
+{
+    s_bus_lock = lock;
 }
 
 void SB_Init(SB_Handle *h)

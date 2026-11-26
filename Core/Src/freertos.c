@@ -66,6 +66,14 @@ const osMutexAttr_t print_mutex_attributes = {
   .name = "printLock"
 };
 
+/* 总线舵机 UART3 互斥锁：ArmTask（运动/轮询）与 ProtocolTask（$ARM,STOP/RESUME/READ/TEMP/VIN）
+ * 都会阻塞收发 USART3，必须串行化，否则急停帧可能撞上 HAL_BUSY 被静默丢弃。
+ * 在 MX_FREERTOS_Init 里 osMutexNew 后通过 SB_SetBusLock 注入 servo_bus。 */
+osMutexId_t arm_bus_lock;
+const osMutexAttr_t arm_bus_lock_attributes = {
+  .name = "armBusLock"
+};
+
 /* ---- 任务的句柄与属性（全在 USER CODE 内，重新生成被保留） ---- */
 osThreadId_t ProtocolTaskHandle;
 const osThreadAttr_t ProtocolTask_attributes = {
@@ -94,7 +102,9 @@ const osThreadAttr_t ChassisTask_attributes = {
 /* 机械臂任务（六轴总线舵机 on USART3）：10ms 一拍，兼做「执行作业 + 温度/位置/电压轮询」。
  * 优先级刻意低于底盘任务：本任务有阻塞式舵机收发（一轮轮询 25~35ms，
  * J5 背隙补偿两段式可达 1s 以上），绝不能让 20ms 的底盘节拍给它让路。
- * 反过来，协议任务只投递作业不阻塞，所以底盘 500ms 心跳也不会被机械臂拖停。 */
+ * 反过来，$ARM,POS/J/HOME 在协议任务里只投递作业、不碰 UART，所以底盘 500ms 心跳
+ * 不会被机械臂拖停；$ARM,STOP/RESUME/READ/TEMP/VIN 虽在协议任务里短阻塞（≤约 50ms），
+ * 但与 ArmTask 靠 arm_bus_lock 串行化，不会丢帧。 */
 osThreadId_t ArmTaskHandle;
 const osThreadAttr_t ArmTask_attributes = {
   .name = "ArmTask",
@@ -135,6 +145,8 @@ void MX_FREERTOS_Init(void) {
   /* USER CODE BEGIN RTOS_MUTEX */
   /* add mutexes, ... */
   print_lock = osMutexNew(&print_mutex_attributes);
+  arm_bus_lock = osMutexNew(&arm_bus_lock_attributes);
+  SB_SetBusLock(arm_bus_lock);      /* 注入总线互斥锁，之后 ArmTask/ProtocolTask 才并发收发 USART3 */
   /* USER CODE END RTOS_MUTEX */
 
   /* USER CODE BEGIN RTOS_SEMAPHORES */
