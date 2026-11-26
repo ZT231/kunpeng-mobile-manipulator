@@ -349,12 +349,12 @@ def main():
     # 期望：示教工位 (-5.26,25) → 1691（与当初 IK 给的 J1 一致）；
     #       正前方 (0,25) → 1580（等于初始位的 J1）；两者之间单调。
     try:
-        j1_a, _, az_a = ap.j1_pulse_from_xy(-5.26, 25.0)
-        j1_b, _, az_b = ap.j1_pulse_from_xy(0.0, 25.0)
-        j1_c, _, az_c = ap.j1_pulse_from_xy(-4.19, 23.65)
+        j1_a, _, az_a = ap.j1_pos_from_xy(-5.26, 25.0)
+        j1_b, _, az_b = ap.j1_pos_from_xy(0.0, 25.0)
+        j1_c, _, az_c = ap.j1_pos_from_xy(-4.19, 23.65)
     except Exception as exc:                     # noqa: BLE001
         j1_a = j1_b = j1_c = -1
-        print("  ✗ j1_pulse_from_xy 抛异常：%s" % exc)
+        print("  ✗ j1_pos_from_xy 抛异常：%s" % exc)
     print("\n用例13 J1 方位角: (-5.26,25)→%d（期望 1691）｜(0,25)→%d（期望 1580）"
           "｜(-4.19,23.65)→%d（期望 1673~1675）" % (j1_a, j1_b, j1_c))
     if j1_a != 1691 or j1_b != 1580 or not (1673 <= j1_c <= 1675):
@@ -363,9 +363,9 @@ def main():
 
     # 方位角补偿：视觉 (−2.64,23.79) 给 1639；尺子真值 (−4.4,26.8) 是 1667。
     # 补 +2.98° 之后必须等于尺子那条 ⇒ 20:0x 实测的那 2.98° 偏差就是这么用的。
-    j1_nb, _, _ = ap.j1_pulse_from_xy(-2.64, 23.79)
-    j1_wb, _, _ = ap.j1_pulse_from_xy(-2.64, 23.79, az_bias_deg=2.98)
-    j1_truth, _, _ = ap.j1_pulse_from_xy(-4.4, 26.8)
+    j1_nb, _, _ = ap.j1_pos_from_xy(-2.64, 23.79)
+    j1_wb, _, _ = ap.j1_pos_from_xy(-2.64, 23.79, az_bias_deg=2.98)
+    j1_truth, _, _ = ap.j1_pos_from_xy(-4.4, 26.8)
     print("用例13b 方位角补偿: 不补=%d｜补2.98°=%d｜尺子真值=%d（三者应满足 不补<补=真值）"
           % (j1_nb, j1_wb, j1_truth))
     if not (j1_nb < j1_wb == j1_truth):

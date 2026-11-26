@@ -165,7 +165,7 @@ def main():
         r = c.get("/api/ik/eye").get_json()
         check("eye.flag 含『占位』", "占位" in (r.get("eye", {}).get("flag") or ""),
               r.get("eye", {}).get("flag", ""))
-        check("eye.plane_z=抓取高度", abs(float(r.get("plane_z", 0)) - wc._IK.grab_h) < 1e-9,
+        check("eye.plane_z=默认抓取高度", abs(float(r.get("plane_z", 0)) - 2.0) < 1e-9,
               "plane_z=%s" % r.get("plane_z"))
 
         # ---- 4) 不连串口时，眼在手接口必须明确报错而不是瞎算 ----

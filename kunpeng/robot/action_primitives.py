@@ -35,7 +35,7 @@ action_primitives.py —— 具身智能的「动作原语层」：把一次抓�
   python3 action_primitives.py --dry-run pick 20 25   # 只算脉宽并打印，不发命令
   python3 action_primitives.py state                  # 读当前 6 路脉宽
   python3 action_primitives.py home                   # 回初始位
-  python3 action_primitives.py pick 20 25 --yes       # 真的抓（z 用 grab_height）
+  python3 action_primitives.py pick 20 25 --z 2 --yes  # 真的抓（z 显式给：深度相机或 --z）
   python3 action_primitives.py place 10 30 --yes      # 真的放
 """
 
@@ -62,23 +62,20 @@ RECIPES_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)),
 
 JOINT_NAMES = ("J1", "J2", "J3", "J4", "J5", "J6")
 
-# 🔴 这 6 组是**固件软限位**（Core/Inc/main.h 的 SERVO_Jx_MIN/MAX），
-#    与 kunpeng/web/web_control.py 的 PULSE_RANGES 必须逐字一致。
-#    改任何一处，另外两处 + docs/舵机标定记录.md 都要同步，
-#    否则会出现「Python 以为能到 2500、固件静默裁到 1850」这种假到位。
-#    注意 J4 特别窄（500~1850）：它在 arm_params.json 的 map 里到 2500，
-#    但那是映射自变量范围，不是机械行程上限。
+# 🔴 总线舵机软限位（位置 0~1000）。当前为**占位**：上下界取 servo_bus.c 的
+#    SB_POS_SAFE_MIN/MAX（10/990）。装机标定后按各关节机械行程收紧，
+#    并同步 servo_bus.c 与 web_control.py 的 PULSE_RANGES（旧 µs 已废弃）。
 SAFE_LIMITS = (
-    (800, 2300),   # J1 基座回转
-    (750, 2150),   # J2 大臂
-    (520, 2500),   # J3 小臂
-    (500, 1850),   # J4 腕俯仰（软限位收窄）
-    (500, 2500),   # J5 腕回转
-    (900, 2000),   # J6 夹爪：900 全张 / 1900 闭合
+    (10, 990),   # J1 基座回转（待标定）
+    (10, 990),   # J2 大臂（待标定）
+    (10, 990),   # J3 小臂（待标定）
+    (10, 990),   # J4 腕俯仰（待标定）
+    (10, 990),   # J5 腕回转（待标定）
+    (300, 674),  # J6 夹爪（2026-11-26 实测：全张=300，全闭=674）
 )
 
-# 初始位（与固件 Arm_Init() 的 INIT 值一致）
-HOME_PULSES = (1580, 1900, 2400, 700, 1450, 1500)
+# 初始位 = 六轴零位（pos_zero，2026-11-26 实测：整臂竖直矗立、面朝正前、J6 闭合）
+HOME_POSITIONS = (460, 514, 516, 502, 494, 674)
 
 # 夹爪三个实测工作点（11-16 用 3.8cm 喷雾瓶逐点量出来的，别凭印象改）：
 #   950  → 开口 6.8cm，全张；抓前用它下放才不会撞到物体
@@ -190,8 +187,8 @@ def send_joint(target, timeout=5.0):
 # ---------------------------------------------------------------------------
 # 纯函数层：只算不发，可以离线单测、可以 dry-run
 # ---------------------------------------------------------------------------
-def clip_pulses(raw, limits=SAFE_LIMITS):
-    """把 6 路脉宽裁到软限位内，返回 (裁剪后的 tuple, 被裁的关节名列表)。
+def clip_positions(raw, limits=SAFE_LIMITS):
+    """把 6 路总线位置裁到软限位内，返回 (裁剪后的 tuple, 被裁的关节名列表)。
 
     🔴 为什么不交给固件自动裁：固件的 clamp_pulse 是**静默**的，
     裁完照样回 OK。人会以为「到目标位置了」，实际差了十几度。
@@ -263,7 +260,7 @@ def build_recipe_plan(recipe, j1_offset=0):
             raise RuntimeError("配方第 %d 步脉宽不是 6 路：%r" % (i, pulses))
         if j1_offset:
             pulses[0] += int(j1_offset)
-        pulses, clamped = clip_pulses(pulses)
+        pulses, clamped = clip_positions(pulses)
         name = str(st.get("name") or ("步骤%d" % i))
         note = "示教配方第 %d/%d 步" % (i, len(raw_steps))
         if j1_offset:
@@ -275,21 +272,17 @@ def build_recipe_plan(recipe, j1_offset=0):
     return Plan(steps=steps, warnings=warnings)
 
 
-def j1_pulse_from_xy(x, y, ik=None, az_bias_deg=0.0):
-    """工作台坐标 (x, y) → J1 脉宽（只算方位角，不做到达判定）。
+def j1_pos_from_xy(x, y, ik=None, az_bias_deg=0.0):
+    """工作台坐标 (x, y) → J1 总线位置（只算方位角，不做到达判定）。
 
     🔴 为什么把 J1 单独拿出来：J1 只由方位角决定，跟伸多远、倾角多少、
     能不能够到都没关系。所以「视觉定 J1 + 示教定 J2~J5」这条路里，J1 可以
     直接用视觉结果——哪怕 IK 因为 J2~J4 越界而解不出来。
 
-    实测校验：示教工位 (−5.26, 25.0) → 1691（与 IK 的 J1 一致）；
-             (−4.19, 23.65) → 1674（IK 给 1673，差 1µs）。
-
-    az_bias_deg：补偿视觉方位角的固定偏小（11-16 尺子实测 −2.98°，
-    与历史记录的 −2.7° 吻合）。默认 0，**不静默改**。
+    az_bias_deg：补偿视觉方位角的固定偏小。默认 0，**不静默改**。
     """
     ik = ik or _get_ik()
-    return ik.j1_pulse_for_xy(x, y, az_bias_deg=az_bias_deg)
+    return ik.j1_pos_for_xy(x, y, az_bias_deg=az_bias_deg)
 
 
 def jaw_for_width(width_cm, grip_ref_pulses=1500, ref_cm=3.8,
@@ -354,7 +347,7 @@ def best_tilt(x, y, z, ik=None, prefer=96.0, floor=41.0, step=2.0,
     while t >= float(floor) - 1e-9:
         try:
             ang = ik.solve(tx, ty, z=tz, tilt=t)
-            pulses, clamped = clip_pulses(ik.to_pulses(ang))
+            pulses, clamped = clip_positions(ik.to_positions(ang))
         except Exception:
             t -= step          # 这个倾角解不出来（不可达 / 数值问题），退一档再试
             continue
@@ -374,7 +367,7 @@ def plan_move(x, y, z, jaw=None, ik=None, tilt=0.0, compensate=True):
     参数 tilt：夹爪前倾角(度)。🔴 必须与「拍照那一刻」的真实姿态一致：
       solve() 里 r_w = r − L3·sin(tilt)，用错 tilt 会让可达判定与落点都偏。
       tilt=0（默认）只适用于真的垂直抓取；眼在手链路应由调用方用
-      `ik.tilt_from_pulses(pulses)` 从当前脉宽反算后传入（C 姿态 = 41.00°）。
+      `ik.tilt_from_positions(pulses)` 从当前脉宽反算后传入（C 姿态 = 41.00°）。
       历史坑：默认 0 曾让 24cm 的目标报「超出可达范围 d=28.0」。
 
     参数 compensate：是否扣执行侧重力偏置（见 apply_tip_compensation）。
@@ -387,12 +380,12 @@ def plan_move(x, y, z, jaw=None, ik=None, tilt=0.0, compensate=True):
     else:
         tx, ty, tz = float(x), float(y), float(z)
     angles = ik.solve(tx, ty, z=tz, tilt=tilt)
-    raw = ik.to_pulses(angles)
-    pulses, clamped = clip_pulses(raw)
+    raw = ik.to_positions(angles)
+    pulses, clamped = clip_positions(raw)
     if jaw is not None:
-        pulse_list = list(pulses)
-        pulse_list[5] = int(jaw)
-        pulses, clamped2 = clip_pulses(pulse_list)
+        position_list = list(pulses)
+        position_list[5] = int(jaw)
+        pulses, clamped2 = clip_positions(position_list)
         clamped = clamped + clamped2
     note = "工作台 (%.1f, %.1f, %.1f) cm" % (x, y, z)
     if compensate:
@@ -421,7 +414,7 @@ def plan_pick(x, y, z=None, hover=4.0, jaw_open=JAW_OPEN, jaw_close=JAW_CLOSE,
     """
     ik = ik or _get_ik()
     if z is None:
-        z = ik.grab_h
+        raise ValueError("需要显式 z（抓取高度 cm）；已取消 grab_height 默认值")
     if auto_tilt:
         got = best_tilt(x, y, z, ik=ik, compensate=compensate)
         if got is None:
@@ -463,7 +456,7 @@ def plan_place(x, y, z=None, hover=4.0, jaw_open=JAW_OPEN,
     """
     ik = ik or _get_ik()
     if z is None:
-        z = ik.grab_h
+        raise ValueError("需要显式 z（抓取高度 cm）；已取消 grab_height 默认值")
     if auto_tilt:
         got = best_tilt(x, y, z, ik=ik, compensate=compensate)
         if got is not None:
@@ -490,7 +483,7 @@ def plan_place(x, y, z=None, hover=4.0, jaw_open=JAW_OPEN,
 
 def plan_home():
     """回初始位（纯函数，不读硬件）。"""
-    return Plan(steps=[Step(name="回初始位", pulses=tuple(HOME_PULSES),
+    return Plan(steps=[Step(name="回初始位", pulses=tuple(HOME_POSITIONS),
                             note="6 路拉回 Arm_Init() 的 INIT 值")])
 
 
@@ -886,7 +879,7 @@ def self_test():
     # ⚠️ 这里传 compensate=False：本节点验的是**计划结构**，不是几何。
     #    开补偿会把目标 z 抬 |SAG_DZ|=3.88cm，(10,18) 在 tilt=0 下 d 就变 25.4
     #    而越界 —— 那是几何事实（补偿会吃可达范围），不是 bug，seed 见第 7 项。
-    plan = plan_pick(10.0, 18.0, compensate=False)
+    plan = plan_pick(10.0, 18.0, z=2.0, compensate=False)
     assert len(plan.steps) == 4, len(plan.steps)
     names = [s.name for s in plan.steps]
     assert names[0] == "移到上方" and names[-1] == "抬起", names
@@ -911,32 +904,32 @@ def self_test():
     assert zs[1] == zs[2], (zs[1], zs[2])
 
     # 4) place 必须是 4 步，且 J6 先合后开
-    p2 = plan_place(6.0, 20.0, compensate=False)
+    p2 = plan_place(6.0, 20.0, z=2.0, compensate=False)
     assert len(p2.steps) == 4, len(p2.steps)
     assert p2.steps[0].pulses[5] == JAW_CLOSE, p2.steps[0].pulses
     assert p2.steps[-1].pulses[5] == JAW_OPEN, p2.steps[-1].pulses
 
     # 5) 限位裁剪必须生效且被报告。
-    #    这里直接测 clip_pulses 而不是造一个「可达但超限位」的坐标 ——
+    #    这里直接测 clip_positions 而不是造一个「可达但超限位」的坐标 ——
     #    后者极难构造（越界的目标点通常先被 solve 以「不可达」拦掉），
-    #    而 clip_pulses 才是真正干活的那一层，测它更直接。
+    #    而 clip_positions 才是真正干活的那一层，测它更直接。
     raw = (100, 9999, 2400, 2400, 1450, 3000)   # 越界的是 J1/J2/J4/J6（J3/J5 在范围内）
-    clipped, names = clip_pulses(raw)
+    clipped, names = clip_positions(raw)
     assert clipped == (800, 2150, 2400, 1850, 1450, 2000), clipped
     assert names == ["J1", "J2", "J4", "J6"], names
     # 不越界的输入必须原样返回、且不报任何裁剪
-    same, none_clipped = clip_pulses(HOME_PULSES)
-    assert same == HOME_PULSES and none_clipped == [], (same, none_clipped)
+    same, none_clipped = clip_positions(HOME_POSITIONS)
+    assert same == HOME_POSITIONS and none_clipped == [], (same, none_clipped)
 
     # 6) home 的 6 路必须与固件 INIT 一致
     h = plan_home().steps[0]
-    assert h.pulses == HOME_PULSES, h.pulses
+    assert h.pulses == HOME_POSITIONS, h.pulses
 
     # 7) 时间估算：走 1500 µs 应约 1.2 s
     est = estimate_travel_s((0, 0, 0, 0, 0, 0), (1500, 0, 0, 0, 0, 0))
     assert abs(est - 1.2) < 0.01, est
 
-    # 8) 🔴 闭环自检：solve() → to_pulses() → fk_pulses() 必须回到原坐标。
+    # 8) 🔴 闭环自检：solve() → to_positions() → fk_positions() 必须回到原坐标。
     #    这一步能抓住「IK 和 FK 各写各的」—— 那种错在纸上永远看不出来，
     #    只有真把臂开过去才会发现差几厘米。
     #    实测：多数点 0.02~0.03 cm（脉宽 25 µs 量化极限）；
@@ -948,10 +941,10 @@ def self_test():
                                       "arm_params.json"), ik=ik)
         loop_worst = 0.0
         for (px, py) in ((10.0, 18.0), (6.0, 20.0), (15.0, 15.0), (5.0, 12.0)):
-            ang = ik.solve(px, py, z=ik.grab_h)
-            T = kin.fk_pulses(ik.to_pulses(ang))
+            ang = ik.solve(px, py, z=2.0)
+            T = kin.fk_positions(ik.to_positions(ang))
             err = ((T[0][3] - px) ** 2 + (T[1][3] - py) ** 2
-                   + (T[2][3] - ik.grab_h) ** 2) ** 0.5
+                   + (T[2][3] - 2.0) ** 2) ** 0.5
             loop_worst = max(loop_worst, err)
             assert err < 1.0, "IK→FK 闭环误差 %.2f cm 超标 @ (%.0f,%.0f)" % (err, px, py)
     except ImportError:
@@ -961,8 +954,8 @@ def self_test():
     # 9) 🔴 执行侧补偿 + 姿态自适应（11-16 新增，这两项直接决定「换个位置还能不能抓」）
     #    ① 补偿必须真的改动脉宽，否则等于没生效（11-16 的坑就是压根没补）；
     #    ② best_tilt 必须返回「6 路都不越软限位」的解，且比默认 41° 更平。
-    p_raw = plan_pick(-5.0, 25.0, tilt=41.0, compensate=False)
-    p_cmp = plan_pick(-5.0, 25.0, tilt=41.0, compensate=True)
+    p_raw = plan_pick(-5.0, 25.0, z=2.0, tilt=41.0, compensate=False)
+    p_cmp = plan_pick(-5.0, 25.0, z=2.0, tilt=41.0, compensate=True)
     assert p_raw.steps[1].pulses != p_cmp.steps[1].pulses, \
         "补偿没改变脉宽，等于没生效"
     got = best_tilt(-5.0, 25.0, 2.0)
@@ -1001,7 +994,7 @@ def main():
     ap.add_argument("--dry-run", action="store_true", help="只打印计划，不发命令")
     ap.add_argument("--yes", action="store_true", help="确认真的动臂（不加只打印）")
     ap.add_argument("--hover", type=float, default=4.0, help="上方接近高度 cm，默认 4")
-    ap.add_argument("--z", type=float, default=None, help="抓取高度 cm，默认 grab_height")
+    ap.add_argument("--z", type=float, default=None, help="抓取高度 cm（必填；已取消 grab_height 默认值）")
     ap.add_argument("--tilt", type=float, default=None,
                     help="夹爪前倾角(度)。不给就从当前 STATE 脉宽自动反算"
                          "（C 姿态=41.00°）；显式给则用它覆盖。"
@@ -1136,7 +1129,7 @@ def main():
         if args.lift_dj2:
             up = list(pose5)
             up[1] += int(args.lift_dj2)
-            up_c, cut = clip_pulses(up + [jaw])
+            up_c, cut = clip_positions(up + [jaw])
             try:
                 send_joint(up_c)
                 actual, arrived = wait_arrive(up_c)
@@ -1159,7 +1152,7 @@ def main():
         else:
             sug = list(pose5)
             sug[1] += 60
-            sug_c, cut = clip_pulses(sug + [jaw])
+            sug_c, cut = clip_positions(sug + [jaw])
             print("  两条可直接粘贴（数字已填好，不用改）：")
             print("   ① 抬起（J2 +60µs ≈ 示教悬停增量）：")
             print(_curl(sug_c))
@@ -1202,7 +1195,7 @@ def main():
     if tilt is None and not args.auto_tilt:
         try:
             _cur = read_state()
-            tilt = _get_ik().tilt_from_pulses(_cur)
+            tilt = _get_ik().tilt_from_positions(_cur)
             print("  tilt 自动反算：%.2f°（当前脉宽 %s）"
                   % (tilt, ",".join(str(p) for p in _cur)))
         except Exception as e:

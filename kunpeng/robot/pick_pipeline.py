@@ -633,7 +633,7 @@ def run(args):
         j1_recipe = int(r_steps[0]["pulses"][0])
         az_raw = math.degrees(math.atan2(loc["y"], loc["x"]))
         az_bias = float(getattr(args, "az_bias", 0.0))
-        j1_vision, j1_deg, az = ap.j1_pulse_from_xy(loc["x"], loc["y"],
+        j1_vision, j1_deg, az = ap.j1_pos_from_xy(loc["x"], loc["y"],
                                                     az_bias_deg=az_bias)
         offset = j1_vision - j1_recipe
         print("  示教姿态模式（--recipe %s）：J2~J5 取示教值，J1 由视觉算"
@@ -845,7 +845,7 @@ def build_parser():
 
     g3 = p.add_argument_group("几何与动作")
     g3.add_argument("--grab-z", type=float, default=2.0,
-                    help="抓取高度 cm（夹爪尖离桌面），默认 2.0 = arm_params.grab_height")
+                    help="抓取高度 cm（夹爪尖离桌面，深度相机给）")
     g3.add_argument("--hover", type=float, default=4.0, help="接近点比抓取点高多少 cm")
     g3.add_argument("--place-x", type=float, default=None, help="放置点 x cm（示教值）")
     g3.add_argument("--place-y", type=float, default=None, help="放置点 y cm（示教值）")
