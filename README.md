@@ -1,11 +1,13 @@
 # 移动抓取机器人 · STM32F407 底盘固件（FreeRTOS）
 
-> ⚠️ **代码现状（2026-11-24 收口）**：STM32 固件已完成大清理，彻底移除「固定工位机械臂」的全部旧代码——
+> ⚠️ **代码现状（2026-11-26 更新）**：STM32 固件已完成大清理，彻底移除「固定工位机械臂」的全部旧代码——
 > PCA9685(PWM 舵机) / RC522(RFID) / 电位器(ADC+DMA) / 示教回放 / ACS712(电流) / 安全监控 / I2C1 / ADC1 / DMA。
 > 当前固件只保留：**底盘**（2×TB6612 + 4×JGB37-520 麦轮 + 编码器，`chs_tb6612.c`/`chassis.c`）、
-> **三路 UART 协议**（USART1 PC / USART2 蓝牙 / USART3 预留，三路共用 `uart_protocol.c` 同一套代码）、
-> 总线舵机骨架（`servo_bus.c/h`）文件保留在 `Core/Src`，**未加入 Keil 工程**（等机械臂阶段再启用）。`.ioc` 已同步移除 I2C1/ADC1/DMA。
-> 下文提及机械臂/舵机/RFID/示教/电流/手眼标定的内容均为**历史记录**（代码已删），仅作面试参考。
+> **两路 UART 指令协议**（USART1 PC / USART2 蓝牙，共同使用 `uart_protocol.c`），
+> 以及**已接入工程的机械臂层**：`servo_bus.c/h`（总线舵机帧与个体）+ `arm_robot.c/h`（六轴零位 / 作业邮箱 / `$ARM` 命令），
+> 绑定 **USART3（PB10/PB11，115200 8N1）**——原「预留第三控制源」取消，`wifi.c/h` 已删除，USART3 只做阻塞收发、不进协议栈。
+> `.ioc` 已同步移除 I2C1/ADC1/DMA。
+> 下文提及 RFID/示教/电流/手眼标定的内容均为**历史记录**（代码已删），仅作面试参考。
 
 基于 STM32F407VET6 的移动底盘 + 三路串口协议固件，配合 KunPeng Pro（openEuler）边缘端与 ESP32-S3 语音入口，
 构建「云-边-端移动操作平台」的底层执行单元。
@@ -21,8 +23,8 @@
 > （FREERTOS / NVIC / RCC / SYS / USART1 / USART2 / USART3）；引脚 13 条
 > （含 TIM6 时基、SWD、KEY0，`Mcu.IPNb=7` / `Mcu.PinsNb=13`）。
 > 底盘 `chs_tb6612.c` 自己开 TIM1/2/3/4/8 与 GPIO，不动 CubeMX 已配的 USART/SWD。
-> CubeMX 重新生成后，若 `chs_tb6612.c` / `chassis.c` / `uart_protocol.c` / `bt.c` / `wifi.c`
-> 被移出 Keil 工程，需手动加回（`servo_bus.c` 当前故意不在工程内）。
+> CubeMX 重新生成后，若 `chs_tb6612.c` / `chassis.c` / `uart_protocol.c` / `bt.c` / `servo_bus.c` / `arm_robot.c`
+> 被移出 Keil 工程，需手动加回。
 
 > 固件：Keil MDK（CubeMX 生成框架 + 手写模块）｜ 边缘端 / 上位机：Python + OpenCV + Flask
 >
@@ -42,8 +44,12 @@
   PB0 常高关闭板载 W25Q16 CS（编码器 A/B 复用 PB3/PB4/PB5 的前提；编码器由 TB6612 板 3.3V 供电，电平与 FLASH 兼容，见硬件文档）；
   麦轮逆解 + PID + 里程计，20ms 固定节拍（`CHS_Tick`）。
 - **串口协议**：USART1（PA9/PA10，115200 8N1）自定义帧 `$<CMD>[,<ARG>...]*<CK>\r\n`（XOR 校验、2 位大写 HEX），
-  命令集 `PING / LOG / CAR:VEL / STOP / ODOM / RESET / RAW / WHEEL / ENC / GAIN / CLRFAULT`。
-- **多通道**：USART1（PC 上位机）/ USART2（HC-05 蓝牙）/ USART3（预留第三控制源）三路完全对等，复用同一套帧协议，无模块专用封装。ESP32-S3 语音节点走 Wi-Fi TCP 连鲲鹏，不占用 STM32 串口。
+  命令集 `PING / LOG / CAR:VEL / STOP / ODOM / RESET / RAW / WHEEL / ENC / GAIN / CLRFAULT`，
+  以及机械臂 `ARM:POS / J / HOME / STOP / RESUME / READ / TEMP / VIN / CLRFAULT`。
+- **机械臂（六轴总线舵机）**：`servo_bus.c`（幻尔/Lobot 帧、位置/温度/电压回读、软限位、J5 背隙补偿）+
+  `arm_robot.c`（六轴零位 460/514/516/502/494/674、作业邮箱、ArmTask 10ms 轮询）；串口 **USART3 PB10/PB11**
+  经 Waveshare Bus Servo Adapter (A) 接单线总线，115200 8N1。
+- **多通道**：USART1（PC 上位机）/ USART2（HC-05 蓝牙）两路对等，复用同一套帧协议；USART3 已改为机械臂专用、不再作控制源。ESP32-S3 语音节点走 Wi-Fi TCP 连鲲鹏，不占用 STM32 串口。
 
 ### 🔶 上位机 / 边缘端（鲲鹏）历史能力（不在 STM32 固件内）
 
@@ -64,7 +70,7 @@
 > 旧版演示脚本与视觉测试程序已移除（`vision_old/`）；对应验收文档已于 2026-11-24 删除。
 
 - **视觉引导抓取（旧版）**：USB 摄像头 HSV 颜色阈值 + 轮廓检测识别目标，四点 Homography 完成像素→毫米换算，平面几何逆运动学解算 6 路舵机脉宽；按目标形状自适应夹爪方向（沿边抓取），远目标自动前倾扩臂（上限 45°）。
-- **多通道控制（历史）**：串口（PC 上位机）/ 蓝牙（HC-05）/ WiFi（ESP-01S）/ RFID（RC522）四通道复用同一套 `$CMD*CK\r\n` 协议（XOR 校验）。当前保留 `bt.c`（USART2 蓝牙）与 `wifi.c`（USART3 预留口，无模块专用逻辑）；RC522 驱动已随机械臂代码删除。
+- **多通道控制（历史）**：串口（PC 上位机）/ 蓝牙（HC-05）/ WiFi（ESP-01S）/ RFID（RC522）四通道复用同一套 `$CMD*CK\r\n` 协议（XOR 校验）。当前保留 `bt.c`（USART2 蓝牙）；`wifi.c`（USART3 第三控制源）已于 2026-11-26 删除，该口改作总线舵机专用；RC522 驱动已随机械臂代码删除。
 - **模式状态机**：MANUAL（电位器手控）/ CMD（待命）/ RECORD（示教录制）/ PLAYBACK（回放）/ ESTOP（急停）五态；急停冻结输出，仅 RESUME 可解除。
 - **示教回放**：上位机 REC 采集轨迹，PLAY 一键回放。
 
@@ -164,8 +170,8 @@ STM32 / 鲲鹏 / ESP32-S3 三块板的代码与全部文档都收在这一个文
 RoboticArm_Kunpeng/
 ├── RoboticArm_Kunpeng.ioc     CubeMX 工程文件（打开它即可重新生成代码）
 ├── Core/                        ★STM32 固件源码（CubeMX 标准结构，勿改目录名）
-│   ├── Inc/                     头文件：main / usart / bt / wifi / uart_protocol /
-│   │                            freertos / chs_tb6612 / chassis / servo_bus
+│   ├── Inc/                     头文件：main / usart / bt / uart_protocol / freertos /
+│   │                            chs_tb6612 / chassis / servo_bus / arm_robot
 │   └── Src/                     源文件：与 Inc 同名成对
 ├── Drivers/                     ST HAL 库（ST 官方）
 ├── Middlewares/                 FreeRTOS + CMSIS（官方）
@@ -356,7 +362,7 @@ python3 kunpeng/robot/handeye_calib.py solve --samples samples.json --out handey
 
 - **多串口同时收发时偶发数据错乱**：发送侧双缓冲（活动槽 + 备用槽）在 tx_busy 期间 ISR 写备用槽，主循环搬运与发送前置位存在竞态；搬运与发送前置位两处均用 `__disable_irq`/`__enable_irq` 临界区保护，避免 ISR 误写活动槽或破坏拷贝。
 - **蓝牙指令返回 $ERR,1**：校验码错误；上位机自动计算 XOR 校验码（如 `$MOVE,0,1800*28`），无需手算。
-- **编译报 huart2 未定义 / 链接缺少 bt、wifi 模块**：`stm32f4xx_it.c` 的 USER CODE Includes 段补 `#include "usart.h"`；bt.c、wifi.c 手动加入 Keil 工程的 Application/User/Core 分组。
+- **编译报 huart2 未定义 / 链接缺少 bt 模块**：`stm32f4xx_it.c` 的 USER CODE Includes 段补 `#include "usart.h"`；bt.c 手动加入 Keil 工程的 Application/User/Core 分组。（`wifi.c` 已于 2026-11-26 删除，USART3 改作总线舵机，报「缺少 wifi 模块」属于旧工程残留，删掉即可。）
 
 ## 演示要点（建议 15 分钟流程）
 

@@ -27,8 +27,8 @@
 /* USER CODE BEGIN Includes */
 #include "uart_protocol.h"
 #include "bt.h"
-#include "wifi.h"
 #include "chassis.h"
+#include "arm_robot.h"
 #include <stdio.h>
 #include <string.h>
 
@@ -90,6 +90,17 @@ const osThreadAttr_t ChassisTask_attributes = {
   .stack_size = 512 * 4,
   .priority = (osPriority_t) osPriorityNormal,
 };
+
+/* 机械臂任务（六轴总线舵机 on USART3）：10ms 一拍，兼做「执行作业 + 温度/位置/电压轮询」。
+ * 优先级刻意低于底盘任务：本任务有阻塞式舵机收发（一轮轮询 25~35ms，
+ * J5 背隙补偿两段式可达 1s 以上），绝不能让 20ms 的底盘节拍给它让路。
+ * 反过来，协议任务只投递作业不阻塞，所以底盘 500ms 心跳也不会被机械臂拖停。 */
+osThreadId_t ArmTaskHandle;
+const osThreadAttr_t ArmTask_attributes = {
+  .name = "ArmTask",
+  .stack_size = 512 * 4,
+  .priority = (osPriority_t) osPriorityBelowNormal,
+};
 /* USER CODE END Variables */
 /* Definitions for defaultTask */
 osThreadId_t defaultTaskHandle;
@@ -104,6 +115,7 @@ const osThreadAttr_t defaultTask_attributes = {
 void StartProtocolTask(void *argument);
 void StartPrintTask(void *argument);
 void StartChassisTask(void *argument);
+void StartArmTask(void *argument);
 /* USER CODE END FunctionPrototypes */
 
 void StartDefaultTask(void *argument);
@@ -146,6 +158,7 @@ void MX_FREERTOS_Init(void) {
   ProtocolTaskHandle = osThreadNew(StartProtocolTask, NULL, &ProtocolTask_attributes);
   PrintTaskHandle   = osThreadNew(StartPrintTask,   NULL, &PrintTask_attributes);
   ChassisTaskHandle = osThreadNew(StartChassisTask, NULL, &ChassisTask_attributes);
+  ArmTaskHandle     = osThreadNew(StartArmTask,     NULL, &ArmTask_attributes);
   /* USER CODE END RTOS_THREADS */
 
   /* USER CODE BEGIN RTOS_EVENTS */
@@ -266,6 +279,22 @@ void StartChassisTask(void *argument)
     }
 
     (void)osDelayUntil(next_tick);
+  }
+}
+
+/**
+  * @brief  机械臂任务：10ms 一拍。
+  *         ① 先执行 $ARM,POS/J/HOME 投递下来的作业（阻塞到动作下发完或 J5 补偿走完）；
+  *         ② 再做一拍 SB_Tick10ms 轮询（位置 1s、电压 5s、温度状态机）。
+  *         ARM_Init() 已在调度器启动前由 main 调过，这里不再重复初始化。
+  * @param  argument: Not used
+  */
+void StartArmTask(void *argument)
+{
+  for (;;)
+  {
+    ARM_TaskTick();
+    osDelay(10);
   }
 }
 

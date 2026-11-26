@@ -188,10 +188,7 @@ void USART2_IRQHandler(void)
   HAL_UART_IRQHandler(&huart2);
 }
 
-/* USART3 接收中断：预留第三控制源（与 USART1/2 对等） */
-void USART3_IRQHandler(void)
-{
-  HAL_UART_IRQHandler(&huart3);
-}
+/* 注：USART3 自 2026-11-26 起改为机械臂总线舵机专用（servo_bus.c 阻塞收发），
+   不注册中断、NVIC 中也不使能 USART3_IRQn，因此这里不再需要 USART3_IRQHandler。 */
 
 /* USER CODE END 1 */

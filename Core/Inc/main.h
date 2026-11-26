@@ -77,8 +77,8 @@ void Error_Handler(void);
  *   PA10     USART1_RX   AF7
  *   PD5      USART2_TX   AF7      HC-05 蓝牙              115200 8N1
  *   PD6      USART2_RX   AF7
- *   PB10     USART3_TX   AF7      预留第三控制源（当前未接）  115200 8N1
- *   PB11     USART3_RX   AF7
+ *   PB10     USART3_TX   AF7      机械臂总线舵机（2026-11-26 起专用）  115200 8N1
+ *   PB11     USART3_RX   AF7      经 Waveshare Bus Servo Adapter (A) 转单线总线
  *   PA13     SWDIO               SWD 调试（禁止改作他用）
  *   PA14     SWCLK               SWD 调试（禁止改作他用）
  *   PH0      OSC_IN              HSE 8MHz 晶振
@@ -120,8 +120,8 @@ void Error_Handler(void);
  *      不插 TFT 时才是普通 GPIO，插屏则这 4 根 DIR 冲突。
  *   ⚠️ PD12~PD15 / PE8 / PE9 / PE11 同时是板载 TFT 的 FSMC 排座脚；
  *      不插 3.5" TFT 时可用，插屏则 PWM/STBY/编码器 D 全部冲突。
- *   ⚠️ PB0 已用作 FLASH CS；PB1 是 TFT 背光(LCD_BL) 且另有 servo_bus 的 DE 预留宏
- *      （当前未加入工程），当普通输出前确认不插 TFT、且不再启用 servo_bus。
+ *   ⚠️ PB0 已用作 FLASH CS；PB1 是 TFT 背光(LCD_BL)，当普通输出前确认不插 TFT。
+ *      （servo_bus 原先占 PB1 作 DE 方向脚的预留已删除：接 Waveshare 转接板不需要 DE。）
  *   ⚠️ PC10~PC13 虽在空闲表内，但 PC10~PC12 是 SDIO_D2/D3/CK、PC13 属备份域
  *      弱驱动且部分板带 LED；不要拿来驱动 TB6612 方向，也不要驱动 LED。
  *      编码器 C 的 PC6/PC7 只是 SDIO_D6/D7 的复用名，本板 SD 卡为 4 位 SDIO

@@ -2,8 +2,8 @@
 /**
   ******************************************************************************
   * @file           : main.c
-  * @brief          : STM32F407 底盘控制（2×TB6612 + 4×JGB37-520 麦轮）
-  *                   三路 UART 协议（USART1 PC / USART2 蓝牙 / USART3 预留）
+  * @brief          : STM32F407 底盘 + 机械臂（2×TB6612 + 4×JGB37-520 麦轮 / 六轴总线舵机）
+  *                   两路 UART 指令协议（USART1 PC / USART2 蓝牙）+ USART3 总线舵机（PB10/PB11）
   ******************************************************************************
   */
 /* USER CODE END Header */
@@ -17,7 +17,7 @@
 /* USER CODE BEGIN Includes */
 #include "uart_protocol.h"
 #include "bt.h"
-#include "wifi.h"
+#include "arm_robot.h"
 #include <stdio.h>
 #include <string.h>
 /* USER CODE END Includes */
@@ -83,15 +83,19 @@ int main(void)
   MX_GPIO_Init();
   MX_USART1_UART_Init();
   MX_USART2_UART_Init();
-  MX_USART3_UART_Init();
+  MX_USART3_UART_Init();          /* PB10/PB11：机械臂总线舵机专用（由 ARM_Init 绑定） */
   /* USER CODE BEGIN 2 */
-  /* UART 指令协议：使能串口中断接收（USART1=PC/OrangePi，USART2=蓝牙，USART3=预留） */
+  /* UART 指令协议：只注册两路控制源（USART1=PC/OrangePi，USART2=蓝牙）。
+   * USART3 已从第三控制源改为总线舵机专用，不再进协议栈。 */
   UartProto_Init(&huart1);
   BT_Init(&huart2);
-  WIFI_Init(&huart3);
+
+  /* 机械臂控制层：绑定 huart3、装载六轴零位（不在此处动舵机，动作由 ArmTask 执行） */
+  ARM_Init();
 
   printf("Chassis ready. (2xTB6612 + 4xJGB37-520 + 80mm mecanum)\r\n");
   printf("Protocol: $CMD*ck\\r\\n (PING/LOG/CAR:VEL/STOP/ODOM/RESET/RAW/WHEEL/ENC/GAIN/CLRFAULT)\r\n");
+  printf("Arm:      $ARM,POS/J/HOME/STOP/RESUME/READ/TEMP/VIN/CLRFAULT*ck  (bus servo on USART3)\r\n");
 
   /* 注：此后交由 FreeRTOS 调度器接管。
    * 底盘任务 / 协议任务 / 打印任务 见 freertos.c。 */

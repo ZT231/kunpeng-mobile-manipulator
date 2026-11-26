@@ -328,6 +328,7 @@ void SB_SetReportHook(void (*fn)(const char *line))
 void SB_Init(SB_Handle *h)
 {
     uint8_t i;
+    static const uint16_t home[SB_JOINT_NUM] = SB_HOME_POS_LIST;
 
     if (!h) return;
     memset(h, 0, sizeof(SB_Handle));
@@ -342,10 +343,15 @@ void SB_Init(SB_Handle *h)
         h->j[i].id = (uint8_t)(i + 1U);
         h->j[i].pos_min = SB_POS_SAFE_MIN;   /* 无机械限位机种：软限位 10~990 */
         h->j[i].pos_max = SB_POS_SAFE_MAX;   /* TODO: 新结构到货后按实测再收紧 */
-        h->j[i].target = SB_POS_MID;
+        h->j[i].target = home[i];            /* 上电目标 = 六轴零位 */
+        h->j[i].pos = home[i];
         h->j[i].bl_en = 0U;
         h->j[i].bl_dir = 1;
     }
+    /* J6 夹爪：300=全张 / 674=全闭（实测软限位），盖掉上面的通用 10~990 */
+    h->j[5].pos_min = SB_J6_POS_MIN;
+    h->j[5].pos_max = SB_J6_POS_MAX;
+
     /* J5(index 4) 用 HTS-20H，实测背隙 3.6°(15 单位)，默认开启单侧逼近补偿 */
     h->j[4].bl_en = 1U;
     h->j[4].bl_dir = 1;

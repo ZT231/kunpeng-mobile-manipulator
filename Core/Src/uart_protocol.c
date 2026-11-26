@@ -1,5 +1,6 @@
 ﻿#include "uart_protocol.h"
 #include "chassis.h"
+#include "arm_robot.h"
 #include "cmsis_os.h"
 #include <string.h>
 #include <stdio.h>
@@ -26,6 +27,11 @@ extern osMutexId_t print_lock;
  *   $CAR,ENC*XX\r\n                  (回 $ENC,a,b,c,d*XX，原始累计计数，标定 3960 用)
  *   $CAR,GAIN,700,900,0*XX\r\n       (在线改 KP/KI/KD，不写 Flash)
  *   $CAR,CLRFAULT*XX\r\n             (清堵转故障并重新使能 STBY)
+ *   $ARM,POS,460,514,516,502,494,674*XX\r\n   (六轴同步到零位，位置单位 0~1000)
+ *   $ARM,J,5,500,800*XX\r\n          (只动 J5 到 500，800ms；J5 自动走背隙补偿)
+ *   $ARM,HOME*XX\r\n                 (六轴回零位)
+ *   $ARM,READ*XX\r\n                 (回 $OK,POS,p1..p6)
+ *   $ARM,STOP*XX\r\n                 (六轴原地停，撤销未执行作业)
  * 响应格式：
  *   $OK[,<数据>]*XX\r\n
  *   $ERR,<code>*XX\r\n
@@ -35,11 +41,13 @@ extern osMutexId_t print_lock;
 
 #define PROTO_BUF_SIZE   64U
 #define PROTO_TX_SIZE    96U
-#define PROTO_UART_MAX   3U
+#define PROTO_UART_MAX   2U
 
 static const char HEX_DIGITS[] = "0123456789ABCDEF";
 
-/* 多控制源：最多 3 个串口（USART1=PC/OrangePi，USART2=蓝牙，USART3=预留） */
+/* 多控制源：最多 2 个串口（USART1=PC/OrangePi，USART2=蓝牙）。
+   USART3 自 2026-11-26 起改为机械臂总线舵机专用（servo_bus.c 阻塞收发），
+   不注册进本协议栈，也不走中断。 */
 static UART_HandleTypeDef *proto_huarts[PROTO_UART_MAX];
 static uint8_t proto_uart_count = 0U;
 /* 响应发回目标：由 frame_hold_src 在解析前设置（谁命令谁收响应） */
@@ -521,6 +529,34 @@ static void cmd_car(const char *arg)
         proto_send_frame("ERR,2");
 }
 
+/* ==================== 机械臂命令 $ARM,... ==================== */
+
+/**
+  * @brief  $ARM,<子命令>[,...] —— 转发给 arm_robot.c 的 ARM_Exec。
+  *         子命令：POS（六轴同步）/ J（单轴）/ HOME / STOP / RESUME /
+  *                 READ / TEMP / VIN / CLRFAULT。
+  *         POS/J/HOME 只「投递作业」立刻回 OK，真正运动由 ArmTask 执行（见 arm_robot.h）；
+  *         READ/TEMP/VIN 是阻塞短查询（每轴一帧，最长约 50ms），在本任务里直接取回。
+  *         ARM_Exec 返回非 0 时按统一错误码回 $ERR,<code>。
+  */
+static void cmd_arm(const char *arg)
+{
+    char payload[96];
+    int rc;
+
+    rc = ARM_Exec(arg != NULL ? arg : "", payload, sizeof(payload));
+    if (rc == ARM_OK)
+    {
+        proto_send_frame(payload);
+    }
+    else
+    {
+        char err[16];
+        (void)snprintf(err, sizeof(err), "ERR,%d", rc);
+        proto_send_frame(err);
+    }
+}
+
 /* 分发：frame_buf 中为去除 '$' 的完整命令串（"*" 已被截断为 '\0'） */
 static void proto_dispatch(void)
 {
@@ -549,6 +585,10 @@ static void proto_dispatch(void)
     else if (strcmp(cmd, "CAR") == 0)
     {
         cmd_car(arg != NULL ? arg : "");
+    }
+    else if (strcmp(cmd, "ARM") == 0)
+    {
+        cmd_arm(arg != NULL ? arg : "");
     }
     else
     {
@@ -628,11 +668,7 @@ void UartProto_Init(UART_HandleTypeDef *huart)
         HAL_NVIC_SetPriority(USART2_IRQn, 5, 0);
         HAL_NVIC_EnableIRQ(USART2_IRQn);
     }
-    else if (huart->Instance == USART3)
-    {
-        HAL_NVIC_SetPriority(USART3_IRQn, 5, 0);
-        HAL_NVIC_EnableIRQ(USART3_IRQn);
-    }
+    /* USART3 不在此列：那是总线舵机专用口，阻塞轮询、无中断 */
 
     if (HAL_UART_Receive_IT(huart, &rx_byte[idx], 1U) != HAL_OK)
     {
@@ -786,8 +822,7 @@ void HAL_UART_RxCpltCallback(UART_HandleTypeDef *huart)
 {
     uint8_t idx;
 
-    if (huart->Instance != USART1 && huart->Instance != USART2 &&
-        huart->Instance != USART3) return;
+    if (huart->Instance != USART1 && huart->Instance != USART2) return;
 
     for (idx = 0U; idx < proto_uart_count; idx++)
     {
@@ -839,8 +874,7 @@ void HAL_UART_ErrorCallback(UART_HandleTypeDef *huart)
 {
     uint8_t idx;
 
-    if (huart->Instance != USART1 && huart->Instance != USART2 &&
-        huart->Instance != USART3) return;
+    if (huart->Instance != USART1 && huart->Instance != USART2) return;
 
     /* 找到这个串口在协议里的下标（拿对应的单字节接收缓冲 rx_byte[idx]） */
     for (idx = 0U; idx < proto_uart_count; idx++)

@@ -28,28 +28,39 @@ extern "C" {
 #endif
 
 #include "main.h"
+#include "usart.h"      /* huart3：本模块绑定的串口句柄（USART3 已改为舵机专用） */
 #include <stdint.h>
 
 /* ==================== 配置区（按实机改这里） ==================== */
 
 #define SB_JOINT_NUM            6U
 
-/* 总线舵机串口与方向脚（经 Waveshare Bus Servo Adapter (A) 转接）
- * 本模块未加入 Keil 工程（等机械臂阶段再启用），以下为启用时的接线约定：
- *   · USART3(PB10/PB11) 已被 uart_protocol.c 注册为第三控制源，
- *     SB 启用时必须另选串口（如 USART6），不要直接抢占 huart3。
- *   · 转接板拨到 A 档（UART~SERVO），板内已完成 UART↔单线总线方向切换，
- *     主机侧用【全双工 UART】按丝印 TX/RX 同名相接即可，不需要 DE 方向脚；
- *     PB1 的 DE 是早期面向裸 RS485 收发器的预留，接 Waveshare 转接板时不使用。 */
-/* 占位符故意不绑定现成句柄：huart3 已被 uart_protocol.c 注册为第三控制源，
-   直接绑过去会造成两个驱动抢同一个串口。启用本模块时必须在 CubeMX 新建
-   独立 UART（如 USART6），再把下面这行改成该句柄；未改之前编译/链接会报
-   未定义符号，这是有意为之的「防误用」闸门。 */
-extern UART_HandleTypeDef sb_uart_handle;
-#define SB_UART_HANDLE          sb_uart_handle
-#define SB_DE_PORT              GPIOB
-#define SB_DE_PIN               GPIO_PIN_1      /* 预留；接 Waveshare 转接板时不用 */
-#define SB_USE_HW_HALFDUPLEX    0               /* 1=HAL 单线半双工，0=GPIO 控收发器（两者均为旧收发器方案） */
+/* 总线舵机串口（经 Waveshare Bus Servo Adapter (A) 转接，2026-11-26 定案）
+ *   · 端口：USART3 —— PB10=TX / PB11=RX，AF7，115200 8N1。
+ *     2026-11-26 起 USART3 从「预留第三控制源」改为机械臂总线舵机专用：
+ *     原第三控制源空接（ESP32-S3 走 Wi-Fi/TCP 连鲲鹏，不占 STM32 串口），
+ *     而 PB10/PB11 在排针上、接线方便；UART5(PC12/PD2)、USART6(PC6/PC7) 都不可用
+ *     （前者在板载 SD 卡座 SDIO 上、后者已被编码器 C 占用）。
+ *     因此本模块启用后，USART3 不再注册进 uart_protocol.c、不走中断，只做阻塞收发。
+ *   · 转接板拨到 A 档（UART~SERVO）：板内完成 UART↔单线总线的方向切换，
+ *     主机侧用【全双工 UART】按丝印 TX/RX 同名相接（PB10→板 RX，PB11→板 TX），
+ *     另接 GND 与舵机电源，**不需要 DE 方向脚**。
+ *   · 旧方案里 PB1 的 DE（面向裸 RS485 收发器的预留）已删除：
+ *     PB1 与本板 TFT 背光 LCD_BL 同名，留着是隐患。 */
+#define SB_UART_HANDLE          huart3
+#define SB_DE_PORT              NULL            /* 接 Waveshare 转接板：无方向脚 */
+#define SB_DE_PIN               0U
+#define SB_USE_HW_HALFDUPLEX    0               /* 1=HAL 单线半双工（仅旧裸收发器方案用） */
+
+/* 六轴零位（2026-11-26 实测：全部泄力、手掰到整臂垂直桌面正前方后读回；
+   J6 取【完全闭合】674 而不是手掰当时的半开 501 —— 代码约定 θ6=0 即全闭）。
+   自洽校验：(全张 300 - 674) × 0.24° × dir(-1) = +89.76° ≈ 90° 行程。 */
+#define SB_HOME_POS_LIST        {460U, 514U, 516U, 502U, 494U, 674U}
+
+/* J6 夹爪软限位（实测）：300=完全张开，674=完全闭合。
+   写进舵机内部的限位不做，只在驱动层钳位，方便以后换夹爪重新标。 */
+#define SB_J6_POS_MIN           300U
+#define SB_J6_POS_MAX           674U
 
 /* 协议帧 */
 #define SB_HEAD0                0x55U

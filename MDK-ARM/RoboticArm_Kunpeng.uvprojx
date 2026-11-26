@@ -467,11 +467,6 @@
               <FilePath>../Core/Src/bt.c</FilePath>
             </File>
             <File>
-              <FileName>wifi.c</FileName>
-              <FileType>1</FileType>
-              <FilePath>../Core/Src/wifi.c</FilePath>
-            </File>
-            <File>
               <FileName>chassis.c</FileName>
               <FileType>1</FileType>
               <FilePath>../Core/Src/chassis.c</FilePath>
@@ -480,6 +475,16 @@
               <FileName>chs_tb6612.c</FileName>
               <FileType>1</FileType>
               <FilePath>../Core/Src/chs_tb6612.c</FilePath>
+            </File>
+            <File>
+              <FileName>servo_bus.c</FileName>
+              <FileType>1</FileType>
+              <FilePath>../Core/Src/servo_bus.c</FilePath>
+            </File>
+            <File>
+              <FileName>arm_robot.c</FileName>
+              <FileType>1</FileType>
+              <FilePath>../Core/Src/arm_robot.c</FilePath>
             </File>
           </Files>
         </Group>
