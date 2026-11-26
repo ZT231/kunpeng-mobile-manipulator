@@ -247,7 +247,8 @@ class TestHandleFrame(unittest.TestCase):
         vg.handle_frame(_frame("回初始位"), apply=True,
                         send_fn=lambda p, base_url=None: calls.append(p))
         self.assertEqual(calls, [vg.CMD_HOME])
-        self.assertNotIn(",", calls[0])       # 无参数命令字，从根上消掉脉宽越界
+        # 精确断言 calls==[CMD_HOME] 已保证只发 $ARM,HOME、不含任何位置参数；
+        # $ARM 子命令里的逗号是分隔符，与旧 $MOVE,0,<脉宽> 的越界风险无关。
 
     def test_noop_never_sends_even_with_apply(self):
         calls = []

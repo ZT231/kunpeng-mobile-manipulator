@@ -2,6 +2,13 @@
 # -*- coding: utf-8 -*-
 """test_pick_pipeline.py —— 用两个假 HTTP 服务把 pick_pipeline 整条链路跑一遍。
 
+🔴🔴🔴 待迁移（2026-11-26）🔴🔴🔴
+本测试的假 Flask 仍模拟旧 PWM 协议（$JOINT/$STATE + pulses 字段 + 旧 µs 姿态值
+[1580,1900,2400,700,1450,1500]），而 pick_pipeline.py 已迁到 $ARM,POS/$ARM,READ
+（positions 字段 + 位置 0~1000）。当前直接运行会因协议/字段/量程不匹配失败——
+不是主链路 bug，是测试替身停在旧协议。等 B 层（配方重录 + 电压标定）后重写。
+🔴🔴🔴 待迁移（2026-11-26）🔴🔴🔴
+
 为什么要有它（而不是只靠 pick_pipeline.py --self-test）：
     --self-test 只验纯函数（IoU、底角、闸门、计划）。但真正容易错的是
     **HTTP 这一层的契约**：字段名、返回结构、ok=false 怎么传、clamped 怎么报。
