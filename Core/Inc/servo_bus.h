@@ -1,7 +1,7 @@
 ﻿/**
- * servo_bus.h  —  幻尔总线舵机接口（HTS-35H / HTD-45H / LX-224(HV) 通用）
- * 适用：J1=HTS-35H(35kg) / J2=HTD-45H(45kg) / J3~J6=LX-224(HV)(20kg)
- *       全部二手件，状态未知，需建档 + 温度基线
+ * servo_bus.h  —  幻尔总线舵机接口（HTS-35H / HTD-45H / HTS-20H / LX-224HV 通用）
+ * 适用：J1=HTS-35H(35kg) / J2=HTD-45H(45kg) / J3,J4,J6=LX-224HV(20kg) / J5=HTS-20H(20kg,单轴)
+ *       全部二手件，已逐颗验收；J5 用 HTS-20H 替换原 LX-224HV（单轴，背隙 3.6°，见单侧逼近补偿）
  *
  * 协议依据：LX-224 官方手册（CMD 1 = MOVE_TIME_WRITE、CMD 13 = ID_WRITE）
  *   帧 = 0x55 0x55 | ID | LEN | CMD | PARAM... | CHK
@@ -18,7 +18,7 @@
  *    回读按有符号解析：0~1200 是真实读数，负数（缺口）作废、保持上一有效值。
  *
  * ⚠️ 电压域警告：LX-224 非 HV 版工作电压 6~8.4V，严禁挂 11.1V 母线；
- *    LX-224HV / HTS-35H / HTD-45H 才是 9~12.6V。上电前逐颗看丝印/标签。
+ *    LX-224HV / HTS-35H / HTD-45H / HTS-20H 才是 9~12.6V。上电前逐颗看丝印/标签。
  */
 #ifndef __SERVO_BUS_H
 #define __SERVO_BUS_H
@@ -66,6 +66,8 @@ extern UART_HandleTypeDef sb_uart_handle;
 #define SB_CMD_MOVE_STOP           12U    /* 暂停在当前位置 */
 #define SB_CMD_ID_WRITE            13U    /* 新 ID(1B)，LEN=4 */
 #define SB_CMD_ID_READ             14U    /* 返回 ID(1B) */
+#define SB_CMD_ANGLE_OFFSET_WRITE  17U    /* 写角度偏差：1B 有符号(±125)，单位 0.24°(1 位置单位)，掉电保存；写 0 即复位 */
+#define SB_CMD_ANGLE_OFFSET_READ   19U    /* 读角度偏差：返回 1B 有符号（2026-11-26 实测：19 才是读，18 不回包） */
 #define SB_CMD_ANGLE_LIMIT_WRITE   20U    /* min(2B)+max(2B)，LEN=7，掉电保存 */
 #define SB_CMD_ANGLE_LIMIT_READ    21U
 #define SB_CMD_VIN_LIMIT_WRITE     22U    /* min(mV)+max(mV)，LEN=7，掉电保存 */
@@ -89,6 +91,11 @@ extern UART_HandleTypeDef sb_uart_handle;
    命令目标钳到 10~990，给闭环和机械误差留边，绝不主动开进死区。 */
 #define SB_POS_SAFE_MIN         10U
 #define SB_POS_SAFE_MAX         990U
+
+/* ---------------- 单侧逼近背隙补偿（J5 HTS-20H 实测背隙 ≈15 单位 = 3.6°） ---------------- */
+#define SB_BL_OVERSHOOT        24U     /* 越过目标的量(单位)，必须 > 背隙 15 单位，取 24 留余量 */
+#define SB_BL_SETTLE_MS        150U    /* 越过目标后的停留，确保到达越过点 */
+#define SB_BL_FINAL_MS         200U    /* 最终反向逼近的小行程时间（约 1° 慢速，落点稳） */
 
 /* ---------------- 温度保护阈值（℃） ---------------- */
 #define SB_T_NORMAL_MAX         60U     /* 正常上限 */
@@ -146,6 +153,8 @@ typedef struct {
     uint16_t pos_min;
     uint16_t pos_max;
     uint16_t cyc_cnt;
+    uint8_t  bl_en;         /* 单侧逼近背隙补偿：0=关，1=开 */
+    int8_t   bl_dir;        /* +1=从上逼近(最终负向)，-1=从下逼近(最终正向) */
 } SB_Joint;
 
 typedef struct {
@@ -178,6 +187,14 @@ int  SB_ReadID(uint8_t id_on_bus, uint8_t *real_id);
 int  SB_DumpRaw(SB_Handle *h, uint8_t joint);
 int  SB_ScanIDs(int *ids, uint8_t max_num);
 int  SB_SetID(uint8_t old_id, uint8_t new_id);
+
+/* 单侧逼近背隙补偿：J5 用（SB_Init 已对 index 4 默认开启），也可用 setter 改 */
+int  SB_SetBacklash(SB_Handle *h, uint8_t joint, uint8_t enable, int8_t dir);
+
+/* 角度偏差（零位标定，掉电保存；装臂标定用，先看手册再写） */
+int  SB_WriteAngleOffset(uint8_t id, int8_t offset);
+int  SB_ReadAngleOffset(uint8_t id, int8_t *offset);
+int  SB_ResetAngleOffset(uint8_t id);
 
 /* 把保护阈值写进舵机内部（掉电保存，写错会永久生效，先看手册） */
 int  SB_WriteTempLimit(uint8_t id, uint8_t temp_c);

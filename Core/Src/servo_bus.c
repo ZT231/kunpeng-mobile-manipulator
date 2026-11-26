@@ -24,6 +24,13 @@
  *     命令目标钳到 10~990（SB_POS_SAFE_MIN/MAX）；
  *     回读按有符号 16 位解析，0~1200 可信，负数（缺口）作废、保持上一有效值，
  *     在线状态不受影响（有应答就是在线，缺口不算掉线）。
+ *
+ * 【单侧逼近背隙补偿（J5 HTS-20H 实测背隙 3.6°=15 单位）】
+ *   该单轴舵机换向到位会差约 15 单位（从下逼近 492、从上逼近 506）。
+ *   SB_MovePos 对开启补偿的关节做两段式：先越过目标 24 单位，再反向慢速逼近，
+ *   保证每次都从同一侧啮合，回差被吃掉。越过量必须 > 背隙，否则齿轮翻不到另一侧。
+ *   补偿是阻塞两段式，只在单关节 SB_MovePos 生效；SB_MoveAll 走原路径不补偿，
+ *   避免破坏多轴同步（J5 要精确到位时单独调 SB_MovePos）。
  */
 #include "servo_bus.h"
 #include <stdio.h>
@@ -336,7 +343,12 @@ void SB_Init(SB_Handle *h)
         h->j[i].pos_min = SB_POS_SAFE_MIN;   /* 无机械限位机种：软限位 10~990 */
         h->j[i].pos_max = SB_POS_SAFE_MAX;   /* TODO: 新结构到货后按实测再收紧 */
         h->j[i].target = SB_POS_MID;
+        h->j[i].bl_en = 0U;
+        h->j[i].bl_dir = 1;
     }
+    /* J5(index 4) 用 HTS-20H，实测背隙 3.6°(15 单位)，默认开启单侧逼近补偿 */
+    h->j[4].bl_en = 1U;
+    h->j[4].bl_dir = 1;
     h->st = SB_TEMP_NORMAL;
     h->speed_scale = SB_SCALE_NORMAL;
 }
@@ -389,17 +401,13 @@ int SB_ReadID(uint8_t id_on_bus, uint8_t *real_id)
     return SB_OK;
 }
 
-int SB_MovePos(SB_Handle *h, uint8_t joint, uint16_t pos, uint16_t time_ms)
+/* 原始单点移动（不含背隙补偿）：软限位钳位 + 降速折算 + 发送 */
+static int sb_move_raw(SB_Joint *j, uint16_t pos, uint16_t time_ms)
 {
     uint8_t par[4];
     uint16_t t;
     int r;
-    SB_Joint *j;
 
-    if (!h || joint >= SB_JOINT_NUM) return SB_ERR_PARAM;
-    if (h->fault)                    return SB_ERR_FAULT_LOCK;
-
-    j = &h->j[joint];
     /* 安全软限位优先：绝不主动开进电位器死区（0 以下即缺口） */
     if (pos < SB_POS_SAFE_MIN) pos = SB_POS_SAFE_MIN;
     if (pos > SB_POS_SAFE_MAX) pos = SB_POS_SAFE_MAX;
@@ -422,6 +430,42 @@ int SB_MovePos(SB_Handle *h, uint8_t joint, uint16_t pos, uint16_t time_ms)
     return r;
 }
 
+int SB_MovePos(SB_Handle *h, uint8_t joint, uint16_t pos, uint16_t time_ms)
+{
+    SB_Joint *j;
+    uint16_t over;
+    int r;
+
+    if (!h || joint >= SB_JOINT_NUM) return SB_ERR_PARAM;
+    if (h->fault)                    return SB_ERR_FAULT_LOCK;
+    j = &h->j[joint];
+
+    /* 先钳位目标，保证 overshoot 计算基于合法值（防 uint16 回绕） */
+    if (pos < SB_POS_SAFE_MIN) pos = SB_POS_SAFE_MIN;
+    if (pos > SB_POS_SAFE_MAX) pos = SB_POS_SAFE_MAX;
+    if (pos < j->pos_min) pos = j->pos_min;
+    if (pos > j->pos_max) pos = j->pos_max;
+
+    /* 单侧逼近背隙补偿：先越过目标、再反向逼近。
+     * 越过量必须 > 背隙（J5 实测 15 单位），否则反向时齿轮翻不到另一侧齿面。 */
+    if (j->bl_en) {
+        if (j->bl_dir >= 0) {
+            /* 从上逼近（最终负向）：先走到目标上方 */
+            over = pos + SB_BL_OVERSHOOT;
+            if (over > SB_POS_SAFE_MAX) over = SB_POS_SAFE_MAX;
+        } else {
+            /* 从下逼近（最终正向）：先走到目标下方 */
+            over = (pos > SB_BL_OVERSHOOT) ? (uint16_t)(pos - SB_BL_OVERSHOOT) : SB_POS_SAFE_MIN;
+        }
+        r = sb_move_raw(j, over, time_ms);
+        if (r != SB_OK) return r;
+        HAL_Delay(time_ms + SB_BL_SETTLE_MS);        /* 等越过点到位 */
+        return sb_move_raw(j, pos, SB_BL_FINAL_MS);  /* 反向慢速逼近目标 */
+    }
+
+    return sb_move_raw(j, pos, time_ms);
+}
+
 int SB_MoveAll(SB_Handle *h, const uint16_t pos[SB_JOINT_NUM], uint16_t time_ms)
 {
     uint8_t i;
@@ -429,9 +473,11 @@ int SB_MoveAll(SB_Handle *h, const uint16_t pos[SB_JOINT_NUM], uint16_t time_ms)
     if (!h || !pos) return SB_ERR_PARAM;
     if (h->fault)   return SB_ERR_FAULT_LOCK;
 
-    /* 半双工总线，逐颗下发；同一 time_ms 让它们尽量同步起停 */
+    /* 半双工总线，逐颗下发；同一 time_ms 让它们尽量同步起停。
+     * 不做单侧逼近补偿：补偿是阻塞两段式，插在循环里会破坏多轴同步；
+     * J5 要精确到位时单独调 SB_MovePos。 */
     for (i = 0U; i < SB_JOINT_NUM; i++) {
-        r = SB_MovePos(h, i, pos[i], time_ms);
+        r = sb_move_raw(&h->j[i], pos[i], time_ms);
         if (r != SB_OK) return r;
     }
     return SB_OK;
@@ -568,6 +614,39 @@ int SB_SetID(uint8_t old_id, uint8_t new_id)
 {
     uint8_t par = new_id;
     return sb_send(old_id, SB_CMD_ID_WRITE, &par, 1U);
+}
+
+int SB_SetBacklash(SB_Handle *h, uint8_t joint, uint8_t enable, int8_t dir)
+{
+    if (!h || joint >= SB_JOINT_NUM) return SB_ERR_PARAM;
+    h->j[joint].bl_en = enable ? 1U : 0U;
+    h->j[joint].bl_dir = (dir >= 0) ? 1 : -1;
+    return SB_OK;
+}
+
+int SB_WriteAngleOffset(uint8_t id, int8_t offset)
+{
+    uint8_t par;
+    if (offset > 125) offset = 125;
+    if (offset < -125) offset = -125;
+    par = (uint8_t)offset;
+    return sb_send(id, SB_CMD_ANGLE_OFFSET_WRITE, &par, 1U);
+}
+
+int SB_ReadAngleOffset(uint8_t id, int8_t *offset)
+{
+    uint8_t d[4], len = 0U;
+    if (!offset) return SB_ERR_PARAM;
+    if (sb_query(id, SB_CMD_ANGLE_OFFSET_READ, NULL, 0U, d, sizeof(d), &len) != SB_OK || len < 1U)
+        return SB_ERR_RX;
+    *offset = (int8_t)d[0];
+    return SB_OK;
+}
+
+int SB_ResetAngleOffset(uint8_t id)
+{
+    /* 无独立复位命令：写 0 即复位（2026-11-26 实测确认 17=写、19=读） */
+    return SB_WriteAngleOffset(id, 0);
 }
 
 int SB_WriteTempLimit(uint8_t id, uint8_t temp_c)
