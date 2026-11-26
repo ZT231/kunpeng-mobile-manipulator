@@ -808,6 +808,14 @@ int CHS_SelfTest(CHS_Handle *h)
 
     chs_st_log("\r\n[CHS] self-test start: LIFT ALL FOUR WHEELS OFF THE GROUND!\r\n");
 
+    /* 把方向宏原样打出来：重烧后一眼确认 WDIR/EDIR 是否真的编进固件，
+       避免「改了 EDIR 但下面 fwd 数字不变」被误判成没生效。 */
+    (void)snprintf(buf, sizeof(buf),
+                   "[CHS] dir cfg: EDIR=%d/%d/%d/%d WDIR=%d/%d/%d/%d\r\n",
+                   (int)CHS_EDIR_A, (int)CHS_EDIR_B, (int)CHS_EDIR_C, (int)CHS_EDIR_D,
+                   (int)CHS_WDIR_A, (int)CHS_WDIR_B, (int)CHS_WDIR_C, (int)CHS_WDIR_D);
+    chs_st_log(buf);
+
     /* 先把四轮停住，再逐轮单独给 ±20%：同一时刻只有一个电机吃电流，
        12V 母线压力最小，也最容易用眼睛看清是哪一轮在转。 */
     for (i = 0U; i < CHS_W_NUM; i++)

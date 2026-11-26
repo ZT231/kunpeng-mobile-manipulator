@@ -92,25 +92,28 @@ extern "C" {
 
 /* ==================== 方向宏（装车后按实车改） ==================== */
 /* WDIR：目标「车前进」→ 该电机正转的方向。
-   接线规则（推荐）：四个轮子统一按 红→AO1、白→AO2 接；用 $CAR,RAW 给正数，
-   若该轮把车往后推，就交换该电机的红/白两根线。这样四个轮子的 WDIR 都是 +1，
-   麦轮逆解「四轮同为正 = 前进」才成立。
-   如果你坚持不换线，也可以把该轮 WDIR 改成 -1；但必须同时按自检结果修正
-   该轮 EDIR（见下），否则速度环会把「前进」测成负速度，越跑越反。 */
-#define CHS_WDIR_A                  (+1)        /* 左前 */
-#define CHS_WDIR_B                  (+1)        /* 右前 */
-#define CHS_WDIR_C                  (+1)        /* 左后 */
-#define CHS_WDIR_D                  (+1)        /* 右后 */
+   ⚠️ 2026-11-25 实测：本车左右电机是镜像安装的 —— 四路同给 raw+ 时，左侧（A/C）
+   把车往前推、右侧（B/D）把车往后推，整车原地打转。所以 A/C 保持 +1、B/D 改成 -1
+   （软件补偿，不拆线；想恢复「四轮 WDIR 全 +1」就把右侧两轮的 M1/M2 对调）。
+   WDIR 只在闭环下发前乘（chs Tick ⑪ 里 duty×wdir）；RAW 模式直接下原始占空比、
+   不经过它 —— 所以改完 WDIR 再用 RAW 测，车还是原地打转，这是正常的。
+   ⚠️ 某轮 WDIR 一翻，该轮 EDIR 必须同时翻，否则速度环把「前进」测成负速度，正反馈。 */
+#define CHS_WDIR_A                  (+1)        /* 左前：raw+ 使车前进 */
+#define CHS_WDIR_B                  (-1)        /* 右前：镜像，raw+ 使车后退 */
+#define CHS_WDIR_C                  (+1)        /* 左后：raw+ 使车前进 */
+#define CHS_WDIR_D                  (-1)        /* 右后：镜像，raw+ 使车后退 */
 
 /* EDIR：编码器原始计数 → 「车前进为正」的换算。
    自检里 raw + 时 fwd 计数为正 → EDIR=+1；fwd 为负 → EDIR=-1（A/B 对调）。
-   正常接线（红→AO1、白→AO2、黄→A、绿→B）四个都是 +1。
-   只翻 EDIR 不动 WDIR 是「只交换编码器 A/B」的软件等价；如果是换电机线，
-   WDIR 和 EDIR 会一起翻，别只改一个。 */
-#define CHS_EDIR_A                  (+1)
-#define CHS_EDIR_B                  (+1)
-#define CHS_EDIR_C                  (+1)
-#define CHS_EDIR_D                  (+1)
+   2026-11-25 实测：raw+ 时四路 fwd 全为负（A -548 / B -485 / C -594 / D -339）。
+   但叠上 WDIR 之后，「车前进」对应的原始计数符号左右相反：
+     A/C（WDIR=+1，前进=raw+）→ 前进时计数负 → EDIR=-1
+     B/D（WDIR=-1，前进=raw-）→ 前进时计数正 → EDIR=+1
+   只翻 EDIR 不动 WDIR 是「只交换编码器 A/B」的软件等价；换电机线时两者一起翻。 */
+#define CHS_EDIR_A                  (-1)        /* 左前 */
+#define CHS_EDIR_B                  (+1)        /* 右前：前进走 raw- */
+#define CHS_EDIR_C                  (-1)        /* 左后 */
+#define CHS_EDIR_D                  (+1)        /* 右后：前进走 raw- */
 
 /* ==================== 故障码 ==================== */
 #define CHS_FAULT_NONE              0x00U
