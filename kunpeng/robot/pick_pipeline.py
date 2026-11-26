@@ -29,7 +29,7 @@ README 三行法
    哪一环错的。所以本文件把每一个都做成**显式闸门**：宁可拒绝执行并
    说清原因，也不发出一条自己都不信的 $ARM,POS。
 ③ 不这么写会怎样：会出现「命令发出去、臂动了、杯子没抓到」这种最难查的
-   故障 —— 因为每一步都"成功"了。开环舵机 + 单目相机的组合里，
+   故障 —— 因为每一步都"成功"了。总线舵机 + 单目相机的组合里，
    唯一的真相来源是 /api/state 回读和几何自洽，不是"我觉得应该对了"。
 ------------------------------------------------------------------------------
 """
@@ -68,7 +68,7 @@ import vlm_decider as vd                # noqa: E402  语义决策（../llm/扁�
 # ---------------------------------------------------------------------------
 
 # 工作台坐标系：原点在 J1 底座中心的地面投影，x 向前、y 向左、z 向上，单位 cm。
-# 🔴 桌面就是 z=0 平面（arm_params.json 的 shoulder_height=8.1 是 J2 轴高）。
+# 🔴 桌面就是 z=0 平面（arm_params.json 的 shoulder_height=9.2 是 J2 轴高）。
 TABLE_PLANE_Z = 0.0
 
 # 判定「臂已静止」的位置容差。8 位置单位 = 软件步长 25 位置单位 的三分之一，
@@ -342,7 +342,7 @@ def locate_object(api_base, bbox, positions, plane_z=TABLE_PLANE_Z):
         "pixel_v": round(float(vb), 1),
         # 🔴 后端在这一步已把「当前真实前倾角」反算出来（响应里的 tilt 字段），
         # 动作计划必须用同一个值：solve() 里 r_w = r − L3·sin(tilt)，
-        # 用 0 会让 C 姿态(41°) 下的 r_w 少扣约 11cm，远处目标误判「超出可达范围」。
+        # 用 0 会让前倾姿态下的 r_w 少扣约 11cm，远处目标误判「超出可达范围」。
         # 这是 11-16 实测踩到的坑（同一份目标，tilt=0 报 d=28.0、tilt=41 正常解出）。
         "tilt": float(ra.get("tilt", 0.0)),
         # 🔴 原始坐标与径向修正系数一起带出来：定位"准不准"必须能看见
@@ -369,7 +369,7 @@ def locate_object(api_base, bbox, positions, plane_z=TABLE_PLANE_Z):
 def person_guard(cands, target_bbox, limit=PERSON_IOU_LIMIT):
     """目标框与任何 person 框重叠超过 limit 就拒绝。返回警告文本或 None。
 
-    大白话：机械臂不知道"夹到手指了"——舵机是开环的，没有力反馈、没有碰撞检测。
+    大白话：机械臂不知道"夹到手指了"——舵机没有力反馈、没有碰撞检测。
             所以唯一能做的安全措施是**事前不许靠近人**。
     规范定义：用 COCO 的 person 类做区域干涉检查（region interference check），
              以 IoU 为判据；这是低成本机器人里的标准"软急停"。
@@ -472,30 +472,22 @@ def render_candidates(cands):
 # ---------------------------------------------------------------------------
 # 九、动作计划：定位结果 → 4 步抓取（+ 可选 4 步放置）
 # ---------------------------------------------------------------------------
-def build_plan(x, y, grab_z, hover, place_xy=None, tilt=0.0, compensate=True):
+def build_plan(x, y, grab_z, hover, place_xy=None, tilt=0.0):
     """生成动作计划，返回 (plan, notes)。notes 是给人看的提示，不影响执行。
 
     🔴 tilt 必须传「定位那一刻反算出来的真实前倾角」（`locate_object()` 返回的
     `tilt` 字段）。漏传会用 0，solve() 里 r_w = r − L3·sin(tilt) 就少扣约 11cm，
     远处目标被误判「超出可达范围」——这是 11-16 实际踩到的坑。
-
-    🔴 compensate：是否扣执行侧重力偏置（`TIP_BIAS_XY` + `SAG_DZ`）。
-      默认 True —— 不扣会矮 3.88cm、近 0.95cm，表现是「4 步全到位却碰都没碰到」。
-      代价是目标 z 抬高 3.88cm 后**可达范围会变小**：原先勉强够到的点可能变不可达，
-      这时宁可报错也别硬抓（硬抓就是偏 3.88cm 去撞）。端到端回归传 False 是为了
-      验链路结构，不代表生产行为。
     """
     notes = []
-    plan = ap.plan_pick(x, y, z=grab_z, hover=hover, tilt=tilt,
-                        compensate=compensate)
+    plan = ap.plan_pick(x, y, z=grab_z, hover=hover, tilt=tilt)
 
     if place_xy is not None:
         px, py = place_xy
-        place = ap.plan_place(px, py, z=grab_z, hover=hover, tilt=tilt,
-                              compensate=compensate)
+        place = ap.plan_place(px, py, z=grab_z, hover=hover, tilt=tilt)
         plan.steps.extend(place.steps)
         plan.warnings.extend(place.warnings)
-        notes.append("放置点 (%.1f, %.1f) cm：这是**示教值**，不是视觉找出来的"
+        notes.append("放置点 (%.1f, %.1f) cm：这是**人工给定值**，不是视觉找出来的"
                      "（COCO 里没有 box 类，盒子只能人工摆好后量一次坐标）"
                      % (px, py))
     return plan, notes
@@ -612,69 +604,23 @@ def run(args):
     if args.place_x is not None and args.place_y is not None:
         place_xy = (float(args.place_x), float(args.place_y))
 
-    if getattr(args, "recipe", ""):
-        # 🔴 C 方案：J1 用视觉、J2~J5 用示教。
-        #    为什么这么做：实测同一点上，IK 给的下降位是 J2=1532/J4=1103，
-        #    而人工示教抓到过的是 J2=1279/J4=1850（旧 PWM µs 值，总线臂待重测），
-        #    且 J4=1850 已顶软限位——说明 IK 模型与真实机构在那一段有系统偏差，
-        #    调参消不掉。J1 反而两边一致（1673 vs 1691），所以只信 J1。
-        try:
-            data = ap.load_recipes()
-        except RuntimeError as e:
-            raise Rejected("读不到配方库：%s" % e, code=15)
-        rec = data.get("recipes", {}).get(args.recipe)
-        if rec is None:
-            raise Rejected("配方库里没有「%s」，可用：%s"
-                           % (args.recipe, ", ".join(sorted(data.get("recipes", {})))),
-                           code=15)
-        r_steps = rec.get("steps") or []
-        if not r_steps:
-            raise Rejected("配方「%s」没有 steps" % args.recipe, code=15)
-        j1_recipe = int(r_steps[0]["positions"][0])
-        az_raw = math.degrees(math.atan2(loc["y"], loc["x"]))
-        az_bias = float(getattr(args, "az_bias", 0.0))
-        j1_vision, j1_deg, az = ap.j1_pos_from_xy(loc["x"], loc["y"],
-                                                    az_bias_deg=az_bias)
-        offset = j1_vision - j1_recipe
-        print("  示教姿态模式（--recipe %s）：J2~J5 取示教值，J1 由视觉算"
-              % args.recipe)
-        print("    ⚠ 此模式下 --grab-z / --hover / --place-x / --place-y 全部不生效，"
-              "抓取高度与放回点都由配方的示教值决定")
-        if az_bias:
-            print("    方位角 %.2f° %+0.2f°（--az-bias）= %.2f° → J1 角度 %.2f° → J1=%d"
-                  % (az_raw, az_bias, az, j1_deg, j1_vision))
-        else:
-            print("    方位角 %.2f° → J1 角度 %.2f° → J1=%d"
-                  "（未补 --az-bias；实测偏小约 2.9° ⇒ 传 2.9 会让 J1 大 %.0f位置单位）"
-                  % (az_raw, j1_deg, j1_vision, 2.9 * 9.375))
-        print("    配方示教 J1=%d，偏移 %+d 位置单位" % (j1_recipe, offset))
-        plan = ap.build_recipe_plan(rec, j1_offset=offset)
-        notes = ["J2~J5 来自示教、J1 来自视觉方位角；不经 IK"]
-    else:
-        try:
-            # 🔴 tilt 用定位阶段反算出来的真实值，不能漏（漏了就等于用 0）
-            plan, notes = build_plan(loc["x"], loc["y"], args.grab_z, args.hover,
-                                     place_xy,
-                                     tilt=loc.get("tilt", 0.0),
-                                     compensate=not getattr(args, "no_compensate", False))
-        except ValueError as e:
-            # 🔴 逆解抛的是 ValueError（"目标点超出机械臂可达范围"），不是 Rejected。
-            #    这里必须接住并翻译成人话 —— 否则用户看到的是一段 Python traceback，
-            #    而真正该告诉他的是「这个点够不到，把物体往前挪」。
-            #
-            #    为什么「够不到」常常发生在**悬停点**而不是抓取点：
-            #    腕关节在末端上方约 L3（17cm），把末端抬高 hover 厘米，
-            #    等于把腕也抬高 hover 厘米，于是水平可达半径反而变小。
-            #    grab_z=2、hover=4 时，腕高 = 2+4+17-8.1 = 14.9 cm，
-            #    留给水平的余量只有 sqrt(25.2² - 14.9²) ≈ 20.3 cm。
-            #
-            #    🔴 开了重力补偿后 z 还要再抬 3.88cm（补 SAG_DZ），余量进一步缩小：
-            #       所以「关掉补偿能到、开着补偿到不了」是正常现象，不是 bug。
-            raise Rejected("逆解失败（目标 %.1f, %.1f cm，悬停高度 %.1f cm）：%s\n"
-                           "  ⇒ 常见原因是目标太远/太高。悬停点越高，水平可达半径越小；"
-                           "把物体往 J1 方向挪几厘米，或把 --hover 调小"
-                           "（开了重力补偿时 z 额外 +3.88cm，可加 --no-compensate 对比）"
-                           % (loc["x"], loc["y"], args.grab_z + args.hover, e), code=12)
+    try:
+        # 🔴 tilt 用定位阶段反算出来的真实值，不能漏（漏了就等于用 0）
+        plan, notes = build_plan(loc["x"], loc["y"], args.grab_z, args.hover,
+                                 place_xy,
+                                 tilt=loc.get("tilt", 0.0))
+    except ValueError as e:
+        # 🔴 逆解抛的是 ValueError（"目标点超出机械臂可达范围"），不是 Rejected。
+        #    这里必须接住并翻译成人话 —— 否则用户看到的是一段 Python traceback，
+        #    而真正该告诉他的是「这个点够不到，把物体往前挪」。
+        #
+        #    为什么「够不到」常常发生在**悬停点**而不是抓取点：
+        #    腕关节在末端上方约 L3（17cm），把末端抬高 hover 厘米，
+        #    等于把腕也抬高 hover 厘米，于是水平可达半径反而变小。
+        raise Rejected("逆解失败（目标 %.1f, %.1f cm，悬停高度 %.1f cm）：%s\n"
+                       "  ⇒ 常见原因是目标太远/太高。悬停点越高，水平可达半径越小；"
+                       "把物体往 J1 方向挪几厘米，或把 --hover 调小"
+                       % (loc["x"], loc["y"], args.grab_z + args.hover, e), code=12)
     for n in notes:
         print("  · " + n)
 
@@ -790,8 +736,7 @@ def self_test():
     print("  ⑤ 定位：两角取中点=(13,20)、跨度=6cm；跨度 50cm 被拒 ✓")
 
     # 6) 计划：pick 4 步 + place 4 步，J6 先开后合再开
-    plan, notes = build_plan(10.0, 18.0, 2.0, 4.0, place_xy=(6.0, 20.0),
-                             compensate=False)
+    plan, notes = build_plan(8.0, 12.0, 2.0, 4.0, place_xy=(5.0, 12.0))
     assert len(plan.steps) == 8, len(plan.steps)
     names = [s.name for s in plan.steps]
     assert names[0] == "移到上方" and names[3] == "抬起", names
@@ -804,13 +749,13 @@ def self_test():
         for i, p in enumerate(s.positions):
             lo, hi = ap.SAFE_LIMITS[i]
             assert lo <= p <= hi, (s.name, i, p, lo, hi)
-    assert notes and "示教值" in notes[0]
+    assert notes and "人工给定值" in notes[0]
     ok += 1
     print("  ⑥ 计划：抓 4 步 + 放 4 步，J6 开→合→开，全程不越软限位 ✓")
 
     # 7) 悬停高度真的抬高了（用 J4 位置间接看）
-    hover_hi = ap.plan_pick(10.0, 18.0, z=2.0, hover=4.0, compensate=False)
-    hover_lo = ap.plan_pick(10.0, 18.0, z=2.0, hover=1.0, compensate=False)
+    hover_hi = ap.plan_pick(8.0, 12.0, z=2.0, hover=4.0)
+    hover_lo = ap.plan_pick(8.0, 12.0, z=2.0, hover=1.0)
     assert hover_hi.steps[0].positions != hover_lo.steps[0].positions, "hover 没起作用"
     ok += 1
     print("  ⑦ 悬停：hover 4cm 与 1cm 的接近点位置不同 ✓")
@@ -847,19 +792,8 @@ def build_parser():
     g3.add_argument("--grab-z", type=float, default=2.0,
                     help="抓取高度 cm（夹爪尖离桌面，深度相机给）")
     g3.add_argument("--hover", type=float, default=4.0, help="接近点比抓取点高多少 cm")
-    g3.add_argument("--place-x", type=float, default=None, help="放置点 x cm（示教值）")
-    g3.add_argument("--place-y", type=float, default=None, help="放置点 y cm（示教值）")
-    g3.add_argument("--no-compensate", action="store_true",
-                    help="不扣执行侧重力偏置 TIP_BIAS_XY/SAG_DZ。"
-                         "只在「开着补偿够不到」时做对比，正常别加")
-    g3.add_argument("--az-bias", type=float, default=0.0,
-                    help="方位角补偿（度）。视觉方位角有固定偏小约 2.9°，"
-                         "只影响 J1（横向 1.4cm 量级）。默认 0=不补，"
-                         "想让 J1 对着尺子就传 2.9")
-    g3.add_argument("--recipe", default="",
-                    help="用示教姿态执行（C 方案）：J2~J5 取配方值、J1 由视觉方位角算。"
-                         "绕开「IK 给的 J2/J4 与真实机构差几百 位置单位」这个已知问题。"
-                         "配方名见 python3 action_primitives.py --list-recipes")
+    g3.add_argument("--place-x", type=float, default=None, help="放置点 x cm（人工给定）")
+    g3.add_argument("--place-y", type=float, default=None, help="放置点 y cm（人工给定）")
 
     g4 = p.add_argument_group("安全闸")
     g4.add_argument("--person-iou", type=float, default=PERSON_IOU_LIMIT,

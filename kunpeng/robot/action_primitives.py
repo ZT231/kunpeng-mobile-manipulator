@@ -19,9 +19,8 @@ action_primitives.py —— 具身智能的「动作原语层」：把一次抓�
      有它 ≠ 有具身智能，它只是「行动」那一环的地基。
   2) 抓取是**俯视平面抓取**：夹爪始终竖直向下（tilt=0），只适用于躺在
      桌面上的单个物体。堆叠、侧躺、需要侧向接近的场景一概不支持。
-  3) 执行是**开环位置**：舵机没有位置反馈，靠的是「固件斜坡把位置推到目标值」
-     再读回位置确认。夹到东西后 J6 可能到不了目标值（堵转），
-     所以 J6 不参与到位判据。
+  3) 到位判据靠 $ARM,READ 回读位置（总线舵机有位置闭环）。夹到东西后 J6 可能
+     到不了目标值（堵转），所以 J6 不参与到位判据。
   4) 没有力控、没有碰撞检测。下降高度靠调用方给对 z，给低了会撞桌子。
 
 为什么单独一个文件，而不是塞进 web_control.py：
@@ -54,12 +53,6 @@ import urllib.request
 # ---------------------------------------------------------------------------
 BASE_URL = "http://127.0.0.1:5000"
 
-# 示教配方库：与本文件同目录（scp 时一起拷到 /root/kunpeng_vision/）。
-# 用 __file__ 定位而不是相对路径 —— 板上常在别的目录下跑 `python3 /root/.../action_primitives.py`，
-# 相对路径会找不到文件，而报错信息往往只写「No such file」，排查很费劲。
-RECIPES_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)),
-                            "pick_recipes.json")
-
 JOINT_NAMES = ("J1", "J2", "J3", "J4", "J5", "J6")
 
 # 🔴 总线舵机软限位（位置 0~1000）。J6 已实测（300~674）；J1~J5 暂用驱动安全限位
@@ -87,10 +80,6 @@ JAW_CLOSED_MAX = 674     # 完全闭合（软限位上限）
 # 到位判据：6 路位置与目标的差都 ≤ 这个值就算到了（8 位置单位 ≈ 2°）。
 # 🔴 旧 ARRIVE_TOL_US 的「µs 容差」已废弃：这里保留变量名仅避免大改引用，语义已是位置单位。
 ARRIVE_TOL_US = 8
-
-# 🔴 旧「固件斜坡速度 1250 µs/s」已废弃：总线舵机运动时间由 $ARM 命令的 ms 参数决定，
-#   上位机不再按固定斜坡估算时间。RAMP_US_PER_SEC 保留仅避免大改引用，逻辑待迁移后删除。
-RAMP_US_PER_SEC = 1250.0
 
 # 开合爪到位后再停一下，让舵机扭矩建立/释放。
 # 有 wait_jaw 兜着，这里只需很短 —— 0.6 s 是 wait_jaw 之前留下的旧值，
@@ -201,87 +190,6 @@ def clip_positions(raw, limits=SAFE_LIMITS):
     return tuple(out), clamped
 
 
-def estimate_travel_s(src, dst):
-    """估算从 src 走到 dst 要几秒（取 6 路里走得最远的那一路）。
-
-    🔴 总线舵机下此估算已失效：运动时间由 $ARM 命令的 ms 参数显式指定，
-    不是固定斜坡。保留本函数仅为兼容旧调用，新代码应直接传运动时长。
-    """
-    far = max(abs(int(b) - int(a)) for a, b in zip(src, dst))
-    return far / RAMP_US_PER_SEC
-
-
-# ---------------------------------------------------------------------------
-# 示教配方层：把人在实机上调好的 6 路位置存成「配方」，一键回放
-#
-# 为什么需要这一层：逆解缺重力下垂补偿（SAG_DZ，总线臂需装车后重测），
-# 「算出来的姿态」和「真能抓住的姿态」仍有偏差。人眼一调就准，
-# 把那次调法记下来回放，比每次重算可靠。旧 PWM 臂实测偏差 169~749 µs，
-# 总线臂的位置偏差待重录配方时再量。
-# ---------------------------------------------------------------------------
-def load_recipes(path=None):
-    """读示教配方库，返回整个 dict（含 recipes / jaw / j1 段）。
-
-    大白话：配方就是「人教过的动作录像」，一条条位置存下来，下次照着演一遍。
-    规范定义：teach & playback（示教-再现），工业机器人最基础的示教编程方式 ——
-      操作者手动把末端带到目标位姿，控制器记录各关节值，之后按记录回放。
-      对**开环、无位置反馈**的臂，它比每次重算逆解可靠得多。
-    """
-    p = path or RECIPES_PATH
-    try:
-        with open(p, "r", encoding="utf-8") as f:
-            data = json.load(f)
-    except FileNotFoundError:
-        raise RuntimeError("找不到配方库 %s（把 pick_recipes.json 和本文件放同一目录）" % p)
-    except ValueError as exc:
-        raise RuntimeError("配方库 %s 不是合法 JSON：%s" % (p, exc))
-    if not isinstance(data.get("recipes"), dict) or not data["recipes"]:
-        raise RuntimeError("配方库 %s 缺 recipes 段或为空" % p)
-    return data
-
-
-def build_recipe_plan(recipe, j1_offset=0):
-    """把一条示教配方转成 Plan（纯函数：可 dry-run、可单测、不发命令）。
-
-    j1_offset：J1 附加偏移（位置单位）。视觉算出目标方位角与示教工位不同时，
-      把角度差乘 j1.us_per_deg 加在这里。
-      🔴 符号没在实机上确认过 —— 先用 ±20 位置单位 小步试方向，别一次给几十。
-    """
-    raw_steps = recipe.get("steps") or []
-    if not raw_steps:
-        raise RuntimeError("配方没有 steps")
-    steps, warnings = [], []
-    for i, st in enumerate(raw_steps, 1):
-        positions = [int(v) for v in (st.get("positions") or [])]
-        if len(positions) != 6:
-            raise RuntimeError("配方第 %d 步位置不是 6 路：%r" % (i, positions))
-        if j1_offset:
-            positions[0] += int(j1_offset)
-        positions, clamped = clip_positions(positions)
-        name = str(st.get("name") or ("步骤%d" % i))
-        note = "示教配方第 %d/%d 步" % (i, len(raw_steps))
-        if j1_offset:
-            note += "｜J1 偏移 %+d 位置单位" % int(j1_offset)
-        if clamped:
-            note += "；⚠ 被软限位裁：%s" % "/".join(clamped)
-            warnings.append("%s：目标越界，已裁 %s" % (name, "/".join(clamped)))
-        steps.append(Step(name=name, positions=tuple(positions), note=note))
-    return Plan(steps=steps, warnings=warnings)
-
-
-def j1_pos_from_xy(x, y, ik=None, az_bias_deg=0.0):
-    """工作台坐标 (x, y) → J1 总线位置（只算方位角，不做到达判定）。
-
-    🔴 为什么把 J1 单独拿出来：J1 只由方位角决定，跟伸多远、倾角多少、
-    能不能够到都没关系。所以「视觉定 J1 + 示教定 J2~J5」这条路里，J1 可以
-    直接用视觉结果——哪怕 IK 因为 J2~J4 越界而解不出来。
-
-    az_bias_deg：补偿视觉方位角的固定偏小。默认 0，**不静默改**。
-    """
-    ik = ik or _get_ik()
-    return ik.j1_pos_for_xy(x, y, az_bias_deg=az_bias_deg)
-
-
 def jaw_for_width(width_cm, grip_ref_positions=674, ref_cm=0.0,
                   pos_per_cm=None, margin_pos=10):
     """按物体宽度估 J6 夹持位置（两个实测点线性插值）。
@@ -299,30 +207,8 @@ def jaw_for_width(width_cm, grip_ref_positions=674, ref_cm=0.0,
                      + (float(ref_cm) - float(width_cm)) * pos_per_cm))
 
 
-def apply_tip_compensation(x, y, z):
-    """把「想打到的点」换算成「IK 该瞄的点」。
-
-    执行侧两个实测偏置（C 姿态族、方位角 96°、2026-11-12 量）：
-      TIP_BIAS_XY = (0.10, −0.95) cm —— 爪尖实际落点 = FK 点 + bias
-      SAG_DZ      = −3.88 cm        —— 爪尖实际高度 = 指令 z + SAG_DZ
-
-    想让爪尖真打到 (x, y, z)，IK 就得瞄 (x − dx, y − dy, z − dz)。
-    也就是：水平往回让 0.1 / 0.95 cm，垂直往上抬 3.88 cm。
-
-    🔴 为什么必须补 z（这条以前是刻意不补的）：11-16 实测「IK 算的悬停姿态
-      相对瓶子偏下 3cm」，与 |SAG_DZ|=3.88 完全吻合 —— 不补就永远矮 3.88cm。
-       代价是抬 z 会让 J3/J4 一起变，下垂量随之变，所以这是**一阶经验补偿**，
-       不是精确模型：越远离 C 姿态族越不准。
-    ⚠️ 绝不能在标定链路里调用它（X 里吸收的正是「未补偿的那版 sag」）。
-    """
-    from arm_ik import TIP_BIAS_XY, SAG_DZ
-    return (float(x) - TIP_BIAS_XY[0],
-            float(y) - TIP_BIAS_XY[1],
-            float(z) - SAG_DZ)
-
-
 def best_tilt(x, y, z, ik=None, prefer=96.0, floor=41.0, step=2.0,
-              compensate=True, j3_margin=60):
+              j3_margin=60):
     """给一个目标点，找「最接近水平、且 6 路都不越软限位」的 tilt。
 
     为什么需要它：抓竖直圆柱时爪指越接近水平越稳，但 J4 有软限位。
@@ -339,7 +225,7 @@ def best_tilt(x, y, z, ik=None, prefer=96.0, floor=41.0, step=2.0,
     🔴 扫描从大到小：先试最平的，不行才往斜了退，保证「尽可能水平」。
     """
     ik = ik or _get_ik()
-    tx, ty, tz = apply_tip_compensation(x, y, z) if compensate else (x, y, z)
+    tx, ty, tz = float(x), float(y), float(z)
     j3_hi = SAFE_LIMITS[2][1] - int(j3_margin)
     t = float(prefer)
     while t >= float(floor) - 1e-9:
@@ -356,7 +242,7 @@ def best_tilt(x, y, z, ik=None, prefer=96.0, floor=41.0, step=2.0,
     return None
 
 
-def plan_move(x, y, z, jaw=None, ik=None, tilt=0.0, compensate=True):
+def plan_move(x, y, z, jaw=None, ik=None, tilt=0.0):
     """工作台坐标 (x,y,z) → 一个「移过去」的 Step（纯函数，不发命令）。
 
     参数 jaw：不为 None 时用它覆盖 J6（夹爪），因为 IK 解出来的 J6 是
@@ -365,18 +251,11 @@ def plan_move(x, y, z, jaw=None, ik=None, tilt=0.0, compensate=True):
     参数 tilt：夹爪前倾角(度)。🔴 必须与「拍照那一刻」的真实姿态一致：
       solve() 里 r_w = r − L3·sin(tilt)，用错 tilt 会让可达判定与落点都偏。
       tilt=0（默认）只适用于真的垂直抓取；眼在手链路应由调用方用
-      `ik.tilt_from_positions(positions)` 从当前位置反算后传入（C 姿态 = 41.00°）。
+      `ik.tilt_from_positions(positions)` 从当前位置反算后传入。
       历史坑：默认 0 曾让 24cm 的目标报「超出可达范围 d=28.0」。
-
-    参数 compensate：是否扣执行侧重力偏置（见 apply_tip_compensation）。
-      🔴 默认 **True** —— 11-16 实测不扣会矮 3.88cm、近 0.95cm，
-      表现就是「4 步全到位却碰都没碰到」。传 False 只用于复现旧行为/单测。
     """
     ik = ik or _get_ik()
-    if compensate:
-        tx, ty, tz = apply_tip_compensation(x, y, z)
-    else:
-        tx, ty, tz = float(x), float(y), float(z)
+    tx, ty, tz = float(x), float(y), float(z)
     angles = ik.solve(tx, ty, z=tz, tilt=tilt)
     raw = ik.to_positions(angles)
     positions, clamped = clip_positions(raw)
@@ -386,15 +265,13 @@ def plan_move(x, y, z, jaw=None, ik=None, tilt=0.0, compensate=True):
         positions, clamped2 = clip_positions(position_list)
         clamped = clamped + clamped2
     note = "工作台 (%.1f, %.1f, %.1f) cm" % (x, y, z)
-    if compensate:
-        note += "｜已补重力偏置（瞄 %.2f, %.2f, %.2f）" % (tx, ty, tz)
     if clamped:
         note += "；⚠ 被软限位裁：%s" % "/".join(clamped)
     return Step(name="move", positions=positions, note=note), clamped
 
 
 def plan_pick(x, y, z=None, hover=4.0, jaw_open=JAW_OPEN, jaw_close=JAW_CLOSE,
-              ik=None, tilt=0.0, auto_tilt=False, compensate=True):
+              ik=None, tilt=0.0, auto_tilt=False):
     """规划一次抓取：移到上方 → 下降 → 合爪 → 抬起（纯函数）。
 
     hover = 在目标上方多少 cm 处开始下降。4 cm 是经验值：
@@ -408,13 +285,12 @@ def plan_pick(x, y, z=None, hover=4.0, jaw_open=JAW_OPEN, jaw_close=JAW_CLOSE,
     参数 auto_tilt：True 时不用调用方给的 tilt，而是对**抓取点**扫出
       「最接近水平且不越软限位」的那个（见 best_tilt）。这是「物体放到
       别的点也能抓」的关键 —— 写死 41° 爪指斜着夹不稳，写死 96° 又 J4 超限。
-    参数 compensate：透传给 plan_move（默认 True，扣重力偏置）。
     """
     ik = ik or _get_ik()
     if z is None:
         raise ValueError("需要显式 z（抓取高度 cm）；已取消 grab_height 默认值")
     if auto_tilt:
-        got = best_tilt(x, y, z, ik=ik, compensate=compensate)
+        got = best_tilt(x, y, z, ik=ik)
         if got is None:
             raise ValueError("目标 (%.2f, %.2f, %.2f) 在 41~96° 内找不到不越软限位的姿态"
                              % (x, y, z))
@@ -429,8 +305,7 @@ def plan_pick(x, y, z=None, hover=4.0, jaw_open=JAW_OPEN, jaw_close=JAW_CLOSE,
         ("抬起", z_top, jaw_close, "带着物体回到安全高度"),
     )
     for name, zz, jaw, note in seq:
-        step, clamped = plan_move(x, y, zz, jaw=jaw, ik=ik, tilt=tilt,
-                                  compensate=compensate)
+        step, clamped = plan_move(x, y, zz, jaw=jaw, ik=ik, tilt=tilt)
         step.name = name
         step.note = note + "｜" + step.note
         plan.steps.append(step)
@@ -446,17 +321,17 @@ def plan_pick(x, y, z=None, hover=4.0, jaw_open=JAW_OPEN, jaw_close=JAW_CLOSE,
 
 def plan_place(x, y, z=None, hover=4.0, jaw_open=JAW_OPEN,
                jaw_close=JAW_CLOSE, ik=None, tilt=0.0,
-               auto_tilt=False, compensate=True):
+               auto_tilt=False):
     """规划一次放置：移到上方 → 下降 → 张爪 → 抬起（纯函数）。
 
-    tilt / auto_tilt / compensate 语义同 plan_pick：前倾角要么显式给、
-    要么对目标点扫出「最平可用」的那个；重力偏置默认要扣。
+    tilt / auto_tilt 语义同 plan_pick：前倾角要么显式给、
+    要么对目标点扫出「最平可用」的那个。
     """
     ik = ik or _get_ik()
     if z is None:
         raise ValueError("需要显式 z（抓取高度 cm）；已取消 grab_height 默认值")
     if auto_tilt:
-        got = best_tilt(x, y, z, ik=ik, compensate=compensate)
+        got = best_tilt(x, y, z, ik=ik)
         if got is not None:
             tilt = got[0]
     z_top = z + hover
@@ -469,8 +344,7 @@ def plan_place(x, y, z=None, hover=4.0, jaw_open=JAW_OPEN,
         ("抬起", z_top, jaw_open, "空爪回到安全高度"),
     )
     for name, zz, jaw, note in seq:
-        step, clamped = plan_move(x, y, zz, jaw=jaw, ik=ik, tilt=tilt,
-                                  compensate=compensate)
+        step, clamped = plan_move(x, y, zz, jaw=jaw, ik=ik, tilt=tilt)
         step.name = name
         step.note = note + "｜" + step.note
         plan.steps.append(step)
@@ -501,8 +375,9 @@ def wait_arrive(target, timeout=None, tol=ARRIVE_TOL_US, check_j6=False,
     还是中止整段动作）。抓取途中抛异常会把臂留在半路，比继续更危险。
     """
     if timeout is None:
-        src = read_state()
-        timeout = estimate_travel_s(src, target) * 2.0 + 0.5
+        # 总线舵机运动时间由 $ARM 命令的 ms 参数决定（默认 800ms），
+        # 这里只给一个宽松的兜底超时，实际到位与否由回读位置判定。
+        timeout = 10.0
 
     deadline = time.time() + timeout
     last = None
@@ -531,8 +406,8 @@ def wait_jaw(target, timeout=None, tol=60, poll=0.08):
     """
     src = read_state()
     if timeout is None:
-        need = abs(int(target) - int(src[5])) / RAMP_US_PER_SEC
-        timeout = need + 0.8          # 斜坡时间 + 余量
+        # J6 运动时间由 $ARM 命令的 ms 参数决定，这里给兜底超时。
+        timeout = 5.0
     deadline = time.time() + timeout
     last = src[5]
     while time.time() < deadline:
@@ -847,12 +722,9 @@ def self_test():
     ik = _get_ik()
 
     # 1) pick 必须是 4 步，且 J6 先开、后合
-    # 坐标选 (10, 18)：3D 距离约 21.5 cm < L1+L2 = 25.2 cm，在可达范围内。
-    # 别用 (20,25)：水平距离就 32 cm，solve() 会直接抛「超出可达范围」。
-    # ⚠️ 这里传 compensate=False：本节点验的是**计划结构**，不是几何。
-    #    开补偿会把目标 z 抬 |SAG_DZ|=3.88cm，(10,18) 在 tilt=0 下 d 就变 25.4
-    #    而越界 —— 那是几何事实（补偿会吃可达范围），不是 bug，seed 见第 7 项。
-    plan = plan_pick(10.0, 18.0, z=2.0, compensate=False)
+    # 坐标选 (8, 12)：hover 后腕高 d≈20 cm < L1+L2 = 23.55 cm，可达。
+    # 别用太远的点：hover 抬高会让水平可达半径变小，solve() 会抛「超出可达范围」。
+    plan = plan_pick(8.0, 12.0, z=2.0)
     assert len(plan.steps) == 4, len(plan.steps)
     names = [s.name for s in plan.steps]
     assert names[0] == "移到上方" and names[-1] == "抬起", names
@@ -877,7 +749,7 @@ def self_test():
     assert zs[1] == zs[2], (zs[1], zs[2])
 
     # 4) place 必须是 4 步，且 J6 先合后开
-    p2 = plan_place(6.0, 20.0, z=2.0, compensate=False)
+    p2 = plan_place(5.0, 12.0, z=2.0)
     assert len(p2.steps) == 4, len(p2.steps)
     assert p2.steps[0].positions[5] == JAW_CLOSE, p2.steps[0].positions
     assert p2.steps[-1].positions[5] == JAW_OPEN, p2.steps[-1].positions
@@ -898,10 +770,7 @@ def self_test():
     h = plan_home().steps[0]
     assert h.positions == HOME_POSITIONS, h.positions
 
-    # 7) 🔴 estimate_travel_s 在总线舵机下已失效（运动时间由 $ARM 的 ms 参数决定），
-    #    保留函数仅兼容旧调用，不再断言固定斜坡速度。
-
-    # 8) 🔴 闭环自检：solve() → to_positions() → fk_positions() 必须回到原坐标。
+    # 7) 🔴 闭环自检：solve() → to_positions() → fk_positions() 必须回到原坐标。
     #    这一步能抓住「IK 和 FK 各写各的」—— 那种错在纸上永远看不出来，
     #    只有真把臂开过去才会发现差几厘米。
     #    实测：多数点 0.02~0.03 cm（位置 25 位置单位 量化极限）；
@@ -912,7 +781,7 @@ def self_test():
         kin = Kinematics(os.path.join(os.path.dirname(os.path.abspath(__file__)),
                                       "arm_params.json"), ik=ik)
         loop_worst = 0.0
-        for (px, py) in ((10.0, 18.0), (6.0, 20.0), (15.0, 15.0), (5.0, 12.0)):
+        for (px, py) in ((8.0, 12.0), (5.0, 12.0), (12.0, 12.0), (6.0, 15.0)):
             ang = ik.solve(px, py, z=2.0)
             T = kin.fk_positions(ik.to_positions(ang))
             err = ((T[0][3] - px) ** 2 + (T[1][3] - py) ** 2
@@ -921,15 +790,9 @@ def self_test():
             assert err < 1.0, "IK→FK 闭环误差 %.2f cm 超标 @ (%.0f,%.0f)" % (err, px, py)
     except ImportError:
         loop_worst = None
-        print("（跳过第 8 组：没装 numpy，无法跑 IK→FK 闭环）")
+        print("（跳过第 7 组：没装 numpy，无法跑 IK→FK 闭环）")
 
-    # 9) 🔴 执行侧补偿 + 姿态自适应（11-16 新增，这两项直接决定「换个位置还能不能抓」）
-    #    ① 补偿必须真的改动位置，否则等于没生效（11-16 的坑就是压根没补）；
-    #    ② best_tilt 必须返回「6 路都不越软限位」的解，且比默认 41° 更平。
-    p_raw = plan_pick(-5.0, 25.0, z=2.0, tilt=41.0, compensate=False)
-    p_cmp = plan_pick(-5.0, 25.0, z=2.0, tilt=41.0, compensate=True)
-    assert p_raw.steps[1].positions != p_cmp.steps[1].positions, \
-        "补偿没改变位置，等于没生效"
+    # 8) 🔴 姿态自适应：best_tilt 必须返回「6 路都不越软限位」的解，且比默认 41° 更平。
     got = best_tilt(-5.0, 25.0, 2.0)
     assert got is not None, "(-5, 25) 在 41~96° 内找不到可行姿态"
     bt, bp = got
@@ -940,12 +803,12 @@ def self_test():
     best_tilt_deg = bt
     best_tilt_positions = bp
 
-    print("SELF_TEST PASS（9 组断言全过，未联网、未动臂）")
+    print("SELF_TEST PASS（8 组断言全过，未联网、未动臂）")
     if loop_worst is not None:
         print("  IK→FK 闭环最大误差 %.2f cm（阈值 1.0，J1 折点区是已知偏差）" % loop_worst)
     print("  best_tilt(-5, 25) = %.0f°（不越软限位的最平姿态）→ %s"
           % (best_tilt_deg, list(best_tilt_positions)))
-    print("\npick(10, 18) 的计划（compensate=False，纯结构演示）：")
+    print("\npick(8, 12) 的计划（纯结构演示）：")
     for s in plan.steps:
         print("  %-12s %s" % (s.name, s.positions))
     return 0
@@ -968,24 +831,16 @@ def main():
     ap.add_argument("--hover", type=float, default=4.0, help="上方接近高度 cm，默认 4")
     ap.add_argument("--z", type=float, default=None, help="抓取高度 cm（必填；已取消 grab_height 默认值）")
     ap.add_argument("--tilt", type=float, default=None,
-                    help="夹爪前倾角(度)。不给就从当前 STATE 位置自动反算"
-                         "（C 姿态=41.00°）；显式给则用它覆盖。"
+                    help="夹爪前倾角(度)。不给就从当前 STATE 位置自动反算；"
+                         "显式给则用它覆盖。"
                          "写死 0 会让远处目标误报「超出可达范围」")
     ap.add_argument("--auto-tilt", action="store_true",
                     help="对抓取点自动扫「最接近水平且不越软限位」的 tilt（换位置抓取推荐）")
-    ap.add_argument("--no-compensate", action="store_true",
-                    help="不扣重力偏置 TIP_BIAS_XY/SAG_DZ（只用于复现旧行为，正常别加）")
-    ap.add_argument("--list-recipes", action="store_true",
-                    help="列出 pick_recipes.json 里的所有示教配方")
-    ap.add_argument("--j1-offset", type=int, default=0,
-                    help="J1 附加偏移 位置单位（1°≈9.4位置单位；符号未定，先用 ±20 小步试方向）")
     ap.add_argument("--base-url", default=BASE_URL, help="Flask 地址")
 
     sub = ap.add_subparsers(dest="cmd")
     p_state = sub.add_parser("state", help="读当前 6 路位置")
     p_home = sub.add_parser("home", help="回初始位")
-    p_recipe = sub.add_parser("recipe", help="回放示教配方（不走 IK，最可靠）")
-    p_recipe.add_argument("name", help="配方名，见 --list-recipes")
     p_grip = sub.add_parser("grip", help="电压引导分步合爪：夹到接触就停")
     p_grip.add_argument("--from", dest="from_pulse", type=int, default=None,
                         help="起始 J6 位置，默认当前实际值；离当前位置超过 %d位置单位 会被"
@@ -998,7 +853,7 @@ def main():
     p_grip.add_argument("--rise", dest="rise_mv", type=int, default=GRIP_RISE_MV,
                         help="「碰上」判据 mV，只记候选点不停爪，标定后默认 %s" % GRIP_RISE_MV)
     p_grip.add_argument("--lift", dest="lift_dj2", type=int, default=0,
-                        help="夹住后把 J2 抬多少 位置单位（+60 ≈ 示教悬停增量），0=不抬，默认 0")
+                        help="夹住后把 J2 抬多少 位置单位（+60 为经验值），0=不抬，默认 0")
     for nm in ("pick", "place"):
         p = sub.add_parser(nm, help="在 (x,y) 处%s" % ("抓取" if nm == "pick" else "放置"))
         p.add_argument("x", type=float, help="工作台 x，cm")
@@ -1010,26 +865,6 @@ def main():
 
     if args.self_test:
         return self_test()
-
-    # --list-recipes 要放在「cmd is None 就打 help」之前，否则单独用它会被拦掉
-    if args.list_recipes:
-        try:
-            data = load_recipes()
-        except RuntimeError as exc:
-            print("❌ %s" % exc, file=sys.stderr)
-            return 5
-        print("配方库：%s" % RECIPES_PATH)
-        jaw = data.get("jaw") or {}
-        if jaw:
-            print("夹爪标定：全张 %s（%s cm）｜几何贴合 %s（%s cm）｜默认抓取 %s 位置单位"
-                  % (jaw.get("open_full_positions"), jaw.get("open_full_cm"),
-                     jaw.get("grip_ref_positions"), jaw.get("grip_ref_cm"),
-                     jaw.get("default_grip_positions")))
-        for nm in sorted(data["recipes"]):
-            r = data["recipes"][nm]
-            print("  · %-16s %s" % (nm, r.get("desc", "")))
-            print("      验证：%s" % r.get("verified", "无（未在实机验证过，慎用）"))
-        return 0
 
     if args.cmd is None:
         ap.print_help()
@@ -1129,7 +964,7 @@ def main():
             sug[1] += 60
             sug_c, cut = clip_positions(sug + [jaw])
             print("  两条可直接粘贴（数字已填好，不用改）：")
-            print("   ① 抬起（J2 +60位置单位 ≈ 示教悬停增量）：")
+            print("   ① 抬起（J2 +60位置单位）：")
             print(_curl(sug_c))
             if cut:
                 print("      ⚠ J2 +60 越界已裁 %s" % "/".join(cut))
@@ -1141,31 +976,9 @@ def main():
     if args.cmd == "home":
         return run_plan(plan_home(), yes=args.yes, dry_run=args.dry_run)
 
-    if args.cmd == "recipe":
-        try:
-            data = load_recipes()
-        except RuntimeError as exc:
-            print("❌ %s" % exc, file=sys.stderr)
-            return 5
-        rec = data["recipes"].get(args.name)
-        if not rec:
-            print("❌ 没有配方 %r；可用：%s"
-                  % (args.name, ", ".join(sorted(data["recipes"]))), file=sys.stderr)
-            return 5
-        print("配方 %s —— %s" % (args.name, rec.get("desc", "")))
-        print("  验证记录：%s" % rec.get("verified", "无（未在实机验证过，慎用）"))
-        if rec.get("verified_boundary"):
-            print("  适用边界：%s" % rec["verified_boundary"])
-        try:
-            plan = build_recipe_plan(rec, j1_offset=args.j1_offset)
-        except RuntimeError as exc:
-            print("❌ %s" % exc, file=sys.stderr)
-            return 5
-        return run_plan(plan, yes=args.yes, dry_run=args.dry_run)
-
     # ---- tilt：不显式给就从当前真实位置反算（与拍照/定位那一刻的姿态一致）----
     # 🔴 为什么不能默认写死 0：solve() 里 r_w = r − L3·sin(tilt)，
-    #    C 姿态(41°) 下用 0 会让 r_w 少扣约 11cm，远处目标被误判「超出可达范围」。
+    #    用 0 会让 r_w 少扣约 11cm，远处目标被误判「超出可达范围」。
     tilt = args.tilt
     if tilt is None and not args.auto_tilt:
         try:
@@ -1182,12 +995,10 @@ def main():
     try:
         if args.cmd == "pick":
             plan = plan_pick(args.x, args.y, z=args.z, hover=args.hover,
-                             tilt=tilt, auto_tilt=args.auto_tilt,
-                             compensate=not args.no_compensate)
+                             tilt=tilt, auto_tilt=args.auto_tilt)
         else:
             plan = plan_place(args.x, args.y, z=args.z, hover=args.hover,
-                              tilt=tilt, auto_tilt=args.auto_tilt,
-                              compensate=not args.no_compensate)
+                              tilt=tilt, auto_tilt=args.auto_tilt)
     except ValueError as exc:
         print("❌ %s" % exc, file=sys.stderr)
         return 5

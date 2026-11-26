@@ -2,20 +2,13 @@
 # -*- coding: utf-8 -*-
 """test_pick_pipeline.py —— 用两个假 HTTP 服务把 pick_pipeline 整条链路跑一遍。
 
-🔴🔴🔴 待迁移（2026-11-26）🔴🔴🔴
-本测试的假 Flask 仍模拟旧 PWM 协议（$JOINT/$STATE + pulses 字段 + 旧 µs 姿态值
-[1580,1900,2400,700,1450,1500]），而 pick_pipeline.py 已迁到 $ARM,POS/$ARM,READ
-（positions 字段 + 位置 0~1000）。当前直接运行会因协议/字段/量程不匹配失败——
-不是主链路 bug，是测试替身停在旧协议。等 B 层（配方重录 + 电压标定）后重写。
-🔴🔴🔴 待迁移（2026-11-26）🔴🔴🔴
-
 为什么要有它（而不是只靠 pick_pipeline.py --self-test）：
     --self-test 只验纯函数（IoU、底角、闸门、计划）。但真正容易错的是
     **HTTP 这一层的契约**：字段名、返回结构、ok=false 怎么传、clamped 怎么报。
     这些只有真的发一次请求才能验出来。所以这里起两个 stdlib http.server：
         · 假 detector（8081）：/observe 返回合成的候选与画面尺寸
         · 假 Flask  （5001）：/api/state、/api/ik/eye、/api/ik/eye/solve、/api/cmd
-    然后让 pick_pipeline 走完整条路。
+    然后让 pick_pipeline 走完整条路（总线 $ARM 协议：positions 0~1000）。
 
 🔴 关键设计：假服务的「故障开关」是模块级变量（_S.xxx），每个用例改它，
    跑完还原。这样不用起一堆端口，也不会用例间互相污染。
@@ -46,8 +39,8 @@ class World(object):
         self.reset()
 
     def reset(self):
-        # 6 路脉宽：随便一个合法的站立姿态
-        self.pulses = [1580, 1900, 2400, 700, 1450, 1500]
+        # 6 路位置（总线舵机 0~1000）：六轴零位
+        self.positions = [460, 514, 516, 502, 494, 674]
         self.eye_enabled = True
         self.placeholder = False
         self.solve_mode = "normal"        # normal / clamped
@@ -97,35 +90,29 @@ class FlaskHandler(BaseHTTPRequestHandler):
         data = json.loads(self.rfile.read(n).decode("utf-8") or "{}")
 
         if self.path == "/api/state":
-            self._json({"ok": True, "pulses": list(_S.pulses)})
+            self._json({"ok": True, "positions": list(_S.positions)})
         elif self.path == "/api/ik/eye/solve":
             _S.solve_calls += 1
             u = float(data.get("u", 0))
             # 造一个「u 越大 x 越大」的线性映射：100 px ≈ 5 cm
             x = round((u - 320.0) * 0.05 + 12.0, 2)
-            # y 固定 14 cm：留出可达余量。为什么不是 20 —— 悬停点比抓取点高
-            # hover 厘米，腕也跟着高，水平可达半径只有约 20 cm
-            # （sqrt(25.2² - 14.9²)，见 pick_pipeline 里 Rejected 的注释）。
+            # y 固定 14 cm：留出可达余量。
             out = {"ok": True, "x": x, "y": 14.0, "z": float(data.get("plane_z", 0)),
-                   "depth": 30.0, "clamped": [], "source_pulses": data.get("pulses")}
+                   "depth": 30.0, "clamped": [], "source_positions": data.get("positions")}
             if _S.solve_mode == "clamped":
                 out["clamped"] = ["J4"]
             self._json(out)
         elif self.path == "/api/cmd":
             payload = data.get("payload") or ""
             _S.cmds.append(payload)
-            # 🔴 照固件的规矩校验：必须是 JOINT,六个数 的逗号格式。
-            #    这里故意严格，因为「用空格分隔」正是之前真机上踩过的坑
-            #    （固件 proto_dispatch 用 strchr(cmd, ',')，空格会让整串当命令名）。
+            # 🔴 照固件的规矩校验：必须是 ARM,POS,六个数 的逗号格式。
+            #    这里故意严格，因为「用空格分隔」正是之前真机上踩过的坑。
             parts = payload.split(",")
-            if len(parts) != 7 or parts[0] != "JOINT":
+            if len(parts) != 8 or parts[0] != "ARM" or parts[1] != "POS":
                 self._json({"ok": True, "resp": "ERR,2"})
             else:
-                # 模拟舵机立刻到位：把"当前脉宽"改成目标值。
-                # 🔴 真机有 1250 µs/s 的斜坡，这里不模拟延时，
-                #    否则每个用例要多等好几秒；斜坡本身由 wait_arrive 的
-                #    轮询逻辑覆盖（action_primitives 的自测里已经验过）。
-                _S.pulses = [int(v) for v in parts[1:]]
+                # 模拟舵机立刻到位：把"当前位置"改成目标值。
+                _S.positions = [int(v) for v in parts[2:]]
                 self._json({"ok": True, "resp": "OK"})
         else:
             self._json({"ok": False, "error": "not found"}, 404)
@@ -179,24 +166,20 @@ def run_pipeline(instruction, extra=()):
     stdout 和 stderr 一起收：阶段的正常输出在 stdout，
     拒绝原因（"已拒绝执行：…"）在 stderr，只看一半会漏断言。
     """
-    # 🔴 固定加 --no-compensate：本回归验的是「链路结构与各道闸门」，
-    #    假目标的 (11.6, 14.0) 本来就在可达边缘；开重力补偿后 z 还要再抬 3.88cm，
-    #    就真的越界了 —— 那是几何事实，不是 bug。补偿自身由
-    #    `action_primitives.py --self-test` 第 9 组单独覆盖。
     argv = ["--instruction", instruction, "--api", API, "--detector", DET,
-            "--backend", "mock", "--no-compensate"] + list(extra)
+            "--backend", "mock"] + list(extra)
     buf = io.StringIO()
     with contextlib.redirect_stdout(buf), contextlib.redirect_stderr(buf):
         code = pp.main(argv)
     return code, buf.getvalue()
 
 
-def check_joint_payload(payload):
-    """校验一条 JOINT 命令：6 个数、全在软限位内。"""
+def check_arm_payload(payload):
+    """校验一条 ARM,POS 命令：6 个数、全在软限位内。"""
     parts = payload.split(",")
-    assert parts[0] == "JOINT", payload
-    assert len(parts) == 7, payload
-    vals = [int(v) for v in parts[1:]]
+    assert parts[0] == "ARM" and parts[1] == "POS", payload
+    assert len(parts) == 8, payload
+    vals = [int(v) for v in parts[2:]]
     for i, v in enumerate(vals):
         lo, hi = pp.ap.SAFE_LIMITS[i]
         assert lo <= v <= hi, (payload, i, v, lo, hi)
@@ -207,7 +190,7 @@ def check_joint_payload(payload):
 # 五、用例
 # ---------------------------------------------------------------------------
 def case_dry_run_makes_no_command():
-    """① dry-run：链路全走通，但一条 JOINT 都不许发。"""
+    """① dry-run：链路全走通，但一条 ARM,POS 都不许发。"""
     _S.reset()
     code, out = run_pipeline("把杯子抓起来", ["--dry-run"])
     assert code == 0, "返回码 %s\n%s" % (code, out)
@@ -218,31 +201,31 @@ def case_dry_run_makes_no_command():
     print("  ① dry-run：0 条命令、2 次反投影、打印底面中心 ✓")
 
 
-def case_yes_sends_4_joint():
-    """② --yes：发 4 条 JOINT，格式和软限位都必须对。"""
+def case_yes_sends_4_arm():
+    """② --yes：发 4 条 ARM,POS，格式和软限位都必须对。"""
     _S.reset()
     code, out = run_pipeline("把杯子抓起来", ["--yes"])
     assert code == 0, "返回码 %s\n%s" % (code, out)
     assert len(_S.cmds) == 4, _S.cmds
-    vals = [check_joint_payload(p) for p in _S.cmds]
+    vals = [check_arm_payload(p) for p in _S.cmds]
     # 抓取序列：接近 / 下降 / 合爪 / 抬起。合爪那步 J6 必须是闭合值。
     assert vals[2][5] == pp.ap.JAW_CLOSE, vals[2]
     assert vals[0][5] == pp.ap.JAW_OPEN, vals[0]
     # 接近点和下降点高度不同（J4 变），合爪和下降点同高
     assert vals[0][3] != vals[1][3], vals
     assert vals[1][3] == vals[2][3], vals
-    print("  ② --yes：4 条 JOINT 全合规，J6 先开后合、接近点高于抓取点 ✓")
+    print("  ② --yes：4 条 ARM,POS 全合规，J6 先开后合、接近点高于抓取点 ✓")
 
 
 def case_with_place_sends_8():
     """③ 给 --place-x/-y：变成 8 条（抓 4 + 放 4），最后一步 J6 是张开。"""
     _S.reset()
-    code, out = run_pipeline("把杯子抓起来", ["--yes", "--place-x", "6", "--place-y", "18"])
+    code, out = run_pipeline("把杯子抓起来", ["--yes", "--place-x", "5", "--place-y", "12"])
     assert code == 0, "返回码 %s\n%s" % (code, out)
     assert len(_S.cmds) == 8, len(_S.cmds)
-    vals = [check_joint_payload(p) for p in _S.cmds]
+    vals = [check_arm_payload(p) for p in _S.cmds]
     assert vals[-1][5] == pp.ap.JAW_OPEN, vals[-1]
-    print("  ③ 带放置：8 条 JOINT，末步张爪 ✓")
+    print("  ③ 带放置：8 条 ARM,POS，末步张爪 ✓")
 
 
 def case_person_blocks():
@@ -341,11 +324,11 @@ def main():
     pp.wait_still = lambda api_base, **kw: pp.check_serial(api_base)
     try:
         print("=" * 60)
-        print("pick_pipeline 端到端回归（假 detector + 假 Flask）")
+        print("pick_pipeline 端到端回归（假 detector + 假 Flask，$ARM 总线协议）")
         print("=" * 60)
         cases = [
             case_dry_run_makes_no_command,
-            case_yes_sends_4_joint,
+            case_yes_sends_4_arm,
             case_with_place_sends_8,
             case_person_blocks,
             case_edge_blocks,

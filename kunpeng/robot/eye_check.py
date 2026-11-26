@@ -21,11 +21,11 @@ README 三行法
    实际上手眼矩阵 X 的旋转部分错了、或抓取平面高度给错，**只在换姿态时才暴露**，
    固定姿态下的恒定偏差根本看不出来（这正是之前 FK 姿态镜像 bug 骗过 selftest 的原因）。
 ------------------------------------------------------------------------------
-【总线舵机迁移状态 · 2026-11-26】
+【总线舵机迁移状态 · 2026-11-27】
 - 协议已迁：旧 $JOINT → $ARM,POS；回读字段 pulses → positions（$ARM,READ）。
-- 🔴 待重标（换总线臂 + 装车后）：_POSE_C 旧 µs 姿态、SAG_DZ 下垂常数、
-  手眼矩阵 X（相机内参/外参）、BIAS_POSE_PULSES。这些旧 PWM 值在本文件里
-  只作历史记录，总线臂实测前不要拿它们下结论。
+- 🔴 待重标（换总线臂 + 深度相机后）：手眼矩阵 X（相机内参/外参）。
+  旧 PWM 的 _POSE_C 姿态、SAG_DZ 下垂常数、BIAS_POSE_PULSES 已删除：
+  总线舵机位置闭环无开环下垂，深度相机直接测 3D、不再需要固定 C 姿态。
 ------------------------------------------------------------------------------
 """
 
@@ -182,18 +182,10 @@ def board_guard(u, v, depth_cm, K, img_w, img_h, cols, rows, square):
 # 三、主流程
 # ---------------------------------------------------------------------------
 # 🔴 项目规矩：任何棋盘结论、任何舵机指令，都必须先交代「棋盘摆在哪、当前位置多少」。
-# 这两个常量就是为了把「棋盘摆哪」从人脑记忆变成脚本自己说的话。
-# 依据：C 姿态下有效纵深窗口 y∈[26.2, 28.0]（再近棋盘下边缘就出画，
+# 依据：标定姿态下有效纵深窗口 y∈[26.2, 28.0]（再近棋盘下边缘就出画，
 # 再远则超出可达半径），实测见 docs/排障记录-手眼标定.md。
 _BOARD_NEAR_CM = 26.0
 _BOARD_FAR_CM = 28.0
-# 🔴 C 姿态旧 PWM µs 值（11-12 实测），总线舵机量程 0~1000 内全部越界、已作废。
-#    总线臂需重新示教对应「定位可过」姿态（J1 略右转、J4 前倾、J6 闭合）后回填。
-_POSE_C = (1636, 1470, 2177, 1106, 1450, 1567)
-_POSE_C_HINT = ("curl -s -X POST http://127.0.0.1:5000/api/cmd "
-                "-H 'Content-Type: application/json' "
-                "-d '{\"payload\":\"ARM,POS,%s\"}'"
-                % ",".join(str(p) for p in _POSE_C))
 # 找 arm_params.json 时优先看这里（--ik-dir，默认 ~/kunpeng_vision）
 _IK_DIR_HINT = "~/kunpeng_vision"
 
@@ -232,8 +224,8 @@ def describe_pose(positions):
     规范定义：正运动学（Forward Kinematics, FK）—— 已知各关节角求末端位姿；
              本函数调用 `arm_ik.ArmIK.forward(to_angles(positions))`。
 
-    ⚠️ 只做**量级提示**，不当作验收依据。原因（2026-11-14 实测）：
-      `forward()` 走的是理想几何，它给的爪尖半径 C 姿态只有 1.8~2.4 cm，
+    ⚠️ 只做**量级提示**，不当作验收依据。原因（2026-11-14 旧臂实测）：
+      `forward()` 走的是理想几何，前倾姿态下它给的爪尖半径只有 1.8~2.4 cm，
       而实测是 26 cm —— 模型对「绕 J1 的实际前伸」并没有建模对
       （L3=17 cm 被算成横向偏移，实际是沿臂前伸）。
       所以这里只报「相对初始位有没有往前/往上抬」，**绝对半径不可信**，
@@ -291,12 +283,12 @@ def do_hover(api, x, y, h, cur_positions, tilt, bias=(0.0, 0.0), plane_z=0.0, ti
         x/y 跟着变，测的就不是同一个点了。
     所以 x/y 取定位结果、z 单独给，本地逆解后只发一条 ARM,POS。
 
-    bias=(dx, dy)：末端重力偏置（见 arm_ik.TIP_BIAS_XY）。IK 瞄的是
-      (x−dx, y−dy) —— 因为爪尖实际会落在 FK 点 +bias 上，先扣掉才能真打到 (x,y)。
-      z 不参与补偿：改 z 会让 J3/J4 大幅变动、bias 又失真。
+    bias=(dx, dy)：末端水平偏置（总线舵机闭环下默认 (0,0)）。IK 瞄的是
+      (x−dx, y−dy) —— 若装车实测有残余偏置，可手动给 --bias 扣掉。
+      z 不参与补偿：改 z 会让 J3/J4 大幅变动、偏置又失真。
 
     ⚠️ h 是**工作台系绝对高度**（不是「离棋盘面多少」）：脚本里 z 直接取 --hover，
-      不叠加 --plane-z。所以真实净空 = h + SAG_DZ − plane_z，低于 0.5cm 直接拒发。
+      不叠加 --plane-z。总线舵机闭环无下垂，真实净空 = h − plane_z，低于 0.5cm 直接拒发。
 
     tip_dx：**执行侧**的横向偏置补偿（cm）。和上面的 bias 不是一回事：
       · bias 补的是「重力把爪尖拽偏」，来源是舵机扛不住力矩；
@@ -310,59 +302,20 @@ def do_hover(api, x, y, h, cur_positions, tilt, bias=(0.0, 0.0), plane_z=0.0, ti
     返回码：0 = 真的下发且固件回 OK；非 0 = 没动，调用方直接退出。
     """
     try:
-        from arm_ik import ArmIK, SAG_DZ
+        from arm_ik import ArmIK
     except Exception as e:
         print("  ⚠ 悬停跳过：import arm_ik 失败（%s）" % e)
         return 1
     ik = ArmIK()
 
-    # ---- 安全闸门：先算真实净空，撞平面就别发 ----
-    # 重力把爪尖往下拽，但拽多少**取决于力矩臂**、不是常数：
-    #   · C 姿态（力矩臂 15cm）实测 3.88cm；
-    #   · 臂伸到 r=29cm ⇒ 力矩臂 18.5cm ⇒ 约 4.8cm。
-    # 旧版闸门只认常数 3.88，于是远端「5−3.88=1.12 放行、实际只剩 0.2cm」——
-    # 这个漏洞在 30cm 那次实验里真实发生过（用户看到爪子擦着纸）。
-    # 现在按力矩臂折算，并取「折算值 vs 常数」的较大者：
-    # 宁可靠估得悲观一点（最多误拒），也不要放行之后蹭到台面。
-    try:
-        from arm_ik import BIAS_POSE_PULSES, BIAS_ARM_R   # 旧 PWM 臂 C 姿态历史常量（总线臂待重测）
-    except Exception:                    # 老版 arm_ik 没这两个常量，退回硬编码
-        BIAS_POSE_PULSES, BIAS_ARM_R = (1636, 1470, 2177), 14.97
-    r_tgt = math.hypot(float(x), float(y))
-    arm_r = r_tgt - ik.L3 * math.sin(math.radians(float(tilt or 0.0)))
-    arm_k = max(0.2, arm_r / float(BIAS_ARM_R))
-    sag_est = abs(SAG_DZ) * arm_k
-    sag_used = max(abs(SAG_DZ), sag_est)          # 保守：绝不低于 C 姿态常数
-    # 重力把爪尖往下拽 |SAG_DZ|，所以「指令 z=3」实际只有 3−sag = 负值。
-    # 之前连跑 7 次 --hover 3 压到手机屏，就是缺这道闸门。
-    clearance = float(h) - sag_used - float(plane_z)
+    # ---- 安全闸门：总线舵机有位置闭环，无开环下垂，净空 = 指令 z − 平面 ----
+    clearance = float(h) - float(plane_z)
     if clearance < 0.5:
         print("")
-        print("  🔴 拒绝下发：指令 z=%.2f cm，力矩臂 %.1f cm ⇒ 下垂估 %.2f cm（常数 %.2f）"
-              % (float(h), arm_r, sag_used, -SAG_DZ))
-        print("     减去棋盘面 %.2f cm ⇒ 净空 %.2f cm，会压到平面（手机/桌面）。"
-              % (float(plane_z), clearance))
-        print("     想要真实净空 3cm：--hover 写 %.1f（3 + 下垂 %.1f + 平面 %.1f）"
-              % (3.0 + sag_used + float(plane_z), sag_used, float(plane_z)))
+        print("  🔴 拒绝下发：指令 z=%.2f cm，减去平面 %.2f cm ⇒ 净空 %.2f cm，会压到平面。"
+              % (float(h), float(plane_z), clearance))
+        print("     想要真实净空 3cm：--hover 写 %.1f" % (3.0 + float(plane_z)))
         return 2
-
-    # ---- 姿态偏离预警：SAG_DZ 是旧 PWM 臂 C 姿态的实测常数，总线臂需重测 ----
-    # 旧 PWM 臂开环扛不住重力：C 姿态下 J2 少走 6.5°、J3 少走 2.2° ⇒ 爪尖低 3.88cm。
-    # 总线臂换装后 SAG_DZ / BIAS_POSE 需重测，此预警逻辑才重新有效。
-    d2 = d3 = 0
-    try:
-        d2 = int(cur_positions[1]) - int(BIAS_POSE_PULSES[1])
-        d3 = int(cur_positions[2]) - int(BIAS_POSE_PULSES[2])
-    except Exception:
-        pass                             # 位置格式不对就不报偏离，别挡住动作
-    if arm_k > 1.06 or abs(d2) > 100 or abs(d3) > 100:
-        print("  🔶 已离偏置标定区：当前姿态 J2 %+d / J3 %+d 位置单位（C 姿态 %d/%d），"
-              "目标力矩臂 %.1f cm（标定 %.1f）"
-              % (d2, d3, BIAS_POSE_PULSES[1], BIAS_POSE_PULSES[2],
-                 arm_r, float(BIAS_ARM_R)))
-        print("     ⇒ 下垂按 %.2f cm 估（C 姿态实测 %.2f，按力矩臂折算）；"
-              "偏置常数本身也在外推，横向可能差几毫米到 1cm"
-              % (sag_used, -SAG_DZ))
 
     tx, ty = float(x) - bias[0], float(y) - bias[1]      # IK 瞄点 = 目标 − 偏置
     # 执行侧横向偏置：直接推 IK 的瞄点，不动 (x, y) 本身 ——
@@ -382,15 +335,13 @@ def do_hover(api, x, y, h, cur_positions, tilt, bias=(0.0, 0.0), plane_z=0.0, ti
     if bias != (0.0, 0.0):
         print("  末端偏置：已扣 dx=%+.2f dy=%+.2f cm ⇒ IK 实际瞄 (%+.2f, %+.2f)"
               % (bias[0], bias[1], tx - float(tip_dx), ty))
-        print("             （旧 PWM 臂重力下垂，实测 C 姿态；总线臂待重测，--bias 0 可关闭）")
     else:
-        print("  末端偏置：未启用（爪尖会比 IK 落点近 1cm、低 4cm）")
+        print("  末端偏置：未启用（总线舵机闭环，无需下垂补偿）")
     if abs(float(tip_dx)) > 1e-9:
         print("  横向执行补偿：%+.2f cm（J1 转角与指令不符，实测偏右；最终 IK 瞄 x=%+.2f）"
               % (float(tip_dx), tx))
-    # z 只有提示意义：爪尖真实高度 ≈ 指令 z − 下垂（不参与补偿，见 arm_ik 注释）
-    print("  实际净空：约 %.2f cm（离棋盘面；指令 z=%.2f − 下垂 %.2f − 平面 %.2f）"
-          % (clearance, float(h), sag_used, float(plane_z)))
+    print("  实际净空：约 %.2f cm（离棋盘面；指令 z=%.2f − 平面 %.2f）"
+          % (clearance, float(h), float(plane_z)))
     print("  当前位置：%s" % ",".join(str(p) for p in cur_positions))
     print("  目标位置：%s" % ",".join(str(p) for p in tgt))
 
@@ -447,20 +398,14 @@ def main():
                          "这是**执行侧**误差（J1 实际转角与指令不符），不是定位误差，"
                          "所以不打进定位、只在 do_hover 里扣；0 = 不补偿")
     ap.add_argument("--bias", default="auto",
-                    help="末端水平偏置 dx,dy(cm)，下发前从靶点扣掉（重力下垂补偿）。"
-                         "默认 auto = 用 arm_ik.TIP_BIAS_XY 的实测值 0.10,-0.95；"
-                         "给 0 关闭；换结构或重标后要重新测")
+                    help="末端水平偏置 dx,dy(cm)，下发前从靶点扣掉。"
+                         "默认 auto = 无偏置 (0,0)（总线舵机位置闭环，无需下垂补偿）；"
+                         "也可手动给 dx,dy")
     ap.add_argument("--radial-fix", default="auto",
                     help="定位的径向修正系数（补「棋盘被算近」的系统偏差）。"
                          "默认 auto = 用服务端 web_control._EYE_RADIAL_K（实测 1.091）；"
                          "给 0 关闭；也可以直接给数，如 1.091。"
                          "换相机安装角、棋盘远近或重标手眼 X 之后，这个系数必须重测")
-    ap.add_argument("--allow-any-pose", action="store_true",
-                    help="允许在**非 C 姿态**下跑（换姿互差实验用）。默认拒绝："
-                         "当前位置不等于 C 姿态（旧 PWM 值 1636,...,1567 已作废，"
-                         "总线臂需重新示教 C 姿态）就直接退出，"
-                         "避免 --hover 跑完臂停新姿态后连跑 ⇒ 相机看不到棋盘。"
-                         "换姿态实验请显式加本开关，出画风险自负")
     args = ap.parse_args()
 
     # --radial-fix：auto 就不传字段（服务端有自己的默认值，单一数据源）；
@@ -480,15 +425,9 @@ def main():
             print("--radial-fix 必须是正数（1.0 = 不修正）")
             return 1
 
-    # --bias 三种写法：auto（用实测值）/ 0（关闭）/ "dx,dy"（手动给）
+    # --bias 三种写法：auto（无偏置）/ 0（关闭）/ "dx,dy"（手动给）
     _b = (args.bias or "auto").strip().lower()
-    if _b in ("auto", ""):
-        try:
-            from arm_ik import TIP_BIAS_XY
-            bias = tuple(TIP_BIAS_XY)
-        except Exception:
-            bias = (0.0, 0.0)
-    elif _b in ("0", "none", "off"):
+    if _b in ("auto", "", "0", "none", "off"):
         bias = (0.0, 0.0)
     else:
         try:
@@ -547,28 +486,6 @@ def main():
     where_now, claw_now = describe_pose(positions)
     print("当前爪尖：%s｜夹爪 %s" % (where_now, claw_now))
 
-    # ---- ②b 姿态闸门：不是 C 姿态就别拍，把「人为记得回位」变成脚本强制 ----
-    # 🔴 --hover 是真下发，跑完臂停在新位姿（约 13cm 高、J4 41°→46°）；不回 C 姿态
-    #    就再跑一次，相机根本看不到棋盘 ⇒「等 8 秒没找到棋盘」，11-14 因此栽了 3 次。
-    #    而且连跑会把上次结果当输入（闭环），连跑 7 次 y 极差 2.66cm。
-    # 这一条闸门同时堵住「出画」和「连跑」两个坑：回位后位置一致才放行。
-    # 容差 ±3位置单位 是给总线舵机位置量化/运动末拍留的，不影响拦截没停稳的情况。
-    if len(positions) == 6:
-        _pose_dev = max(abs(int(a) - int(b)) for a, b in zip(positions, _POSE_C))
-    else:
-        _pose_dev = 999
-    if _pose_dev > 3 and not args.allow_any_pose:
-        print("")
-        print("🔴 当前不是 C 姿态，拒绝继续（相机看不到棋盘，拍了也是白拍）。")
-        print("   当前位置：%s" % ",".join(str(p) for p in positions))
-        print("   C 姿态  ：%s" % ",".join(str(p) for p in _POSE_C))
-        print("   ⇒ 先回位并静置 3 秒：")
-        print("      %s" % _POSE_C_HINT)
-        print("   确需换姿态做互差实验：显式加 --allow-any-pose（出画/连跑风险自负）")
-        return 2
-    if args.allow_any_pose:
-        print("⚠️ 已放行非 C 姿态（--allow-any-pose）：出画/连跑风险自负")
-
     # ---- ③ 内参（K / dist / square）----
     kp = os.path.expanduser(args.intrinsics)
     with open(kp, "r", encoding="utf-8") as f:
@@ -605,10 +522,7 @@ def main():
                   % (args.wait, args.cols, args.rows))
             if claw_now:
                 print("  棋盘该摆哪：棋盘要在相机的取景范围里，**整块 9×6 内角点全部可见**。")
-                print("     经验窗口（C 姿态实测）：离 J1 轴水平 26~28 cm 那一段最稳；"
-                      "再近棋盘下沿就出画。")
-                print("  ⇒ 先送 C 姿态再看（J4 前倾 41°，此时爪尖在 %s）：" % where_now)
-                print("     %s" % _POSE_C_HINT)
+                print("     经验窗口：离 J1 轴水平 26~28 cm 那一段最稳；再近棋盘下沿就出画。")
             if frame is not None:
                 _save_look(frame, args.save)
             return 1
@@ -704,9 +618,7 @@ def main():
             if rc:
                 return rc          # 相机由外层 finally 统一 release
             print("")
-            print("  ⚠️ --hover 已真下发，臂停在新位姿。下次跑本脚本前必须回 C 姿态：")
-            print("      %s" % _POSE_C_HINT)
-            print("     回位后静置 ≥3 秒；脚本入场会再校验位置，不对会直接拒跑。")
+            print("  ⚠️ --hover 已真下发，臂停在新位姿。下次跑本脚本前先确认相机仍能看到棋盘。")
 
         # ---- ⑥ 可选：存一张标注图，方便事后回看「点的是不是棋盘中心」----
         if args.save and frame is not None:
