@@ -7,8 +7,8 @@
   * 串口：USB-TTL/USART1（PC 串口）
   * WiFi：ESP-01S TCP server（手机/电脑连 ESP 自建热点后直连 192.168.4.1:9000）
 
-帧格式与上位机一致：$<CMD>[,<ARG>...]*<CK><CR><LF>，CK 为 $ 与 * 之间所有字节的 XOR（2 位大写十六进制）
-与 kunpeng/robot/arm_host.py 同一套协议约定。
+帧格式与固件一致：$<CMD>[,<ARG>...]*<CK><CR><LF>，CK 为 $ 与 * 之间所有字节的 XOR（2 位大写十六进制）
+机械臂命令已迁 $ARM 协议（$ARM,POS/$ARM,READ/$ARM,J/$ARM,HOME/$ARM,STOP/$ARM,RESUME）。
 
 依赖：
   pip install flask pyserial
@@ -26,14 +26,14 @@
   python web_control.py --host 0.0.0.0 --port 5000  # 让手机通过同一 WiFi 访问
 
 视频是「另一条链路」：摄像头 --> MJPEG --> 浏览器 <img>，和 STM32 串口的
-PING/MOVE/STATE 完全独立。所以页面怎么改都不会影响已经跑通的控制链路。
+PING/$ARM 完全独立。所以页面怎么改都不会影响已经跑通的控制链路。
 
 注意（2026-11-04 适配鲲鹏项目）：本项目 STM32 执行端经串口直连鲲鹏（默认 serial 模式即可，
 端口传 /dev/ttyXXX，如 /dev/ttyUSB0 或板载 UART）；旧项目的 ESP-01S WiFi 模式在本项目由
 ESP32-S3 替代（语音+联网），此处 wifi / tcp-server 模式仅作旧项目兼容保留，新项目请走 serial。
 2026-11-12 起：串口号可整段省略 —— 自动探测 /dev/serial/by-id/usb-1a86_*（CH341 稳定别名），
 所以 CH341 被 USB 复位、编号在 ttyUSB0/ttyUSB1 之间来回翻都不影响，启动时也会自动连接。
-脉宽范围已对齐固件 main.h 的软限位（J6 上限 2000，为另行收窄的安全限位；
+位置范围已对齐固件 main.h 的软限位（J6 上限 2000，为另行收窄的安全限位；
 物理实测闭合端点 2100 仍记在 arm_params.json / docs/舵机标定记录.md 第六节，两者不是一回事）。
 """
 
@@ -71,32 +71,30 @@ except ImportError:
 CHANNEL_COUNT = 6
 JOINT_NAMES = ["J1", "J2", "J3", "J4", "J5", "J6"]
 
-# 页面滑杆脉宽范围：(MIN, MAX, 初始位)。
-# MIN/MAX 来自 Core/Inc/main.h 的 SERVO_Jx_MIN/MAX（软限位，两边必须逐路一致）。
-# 第三列是「初始位」= 上电 / HOME 命令的目标脉宽，也是滑杆默认值和
-# 「初始位」按钮的基准；必须与 main.h 的 SERVO_Jx_INIT 逐路一致，
-# 否则网页按钮会把臂送到一个和固件不一样的位置。
-PULSE_RANGES = [
-    (800, 2300, 1580),   # J1
-    (750, 2150, 1900),   # J2
-    (520, 2500, 2400),   # J3
-    (500, 1850, 700),    # J4（软限位收窄；标定映射仍 520~2500，见 arm_params.json）
-    (500, 2500, 1450),   # J5
-    (900, 2000, 1500),   # J6（软限位收窄；物理实测闭合端点 2100 仍记在 arm_params.json）
+# 页面滑杆位置范围：(MIN, MAX, 初始位=零位)。单位：总线舵机位置 0~1000（0~240°，1 单位=0.24°）。
+# 零位与 servo_bus.h 的 SB_HOME_POS_LIST 逐路一致；J6 软限位 300~674 为 2026-11-26 实测。
+# J1~J5 暂用驱动安全限位 10~990 占位（servo_bus.h SB_POS_SAFE_MIN/MAX），装车实测后收紧。
+POS_RANGES = [
+    (10, 990, 460),   # J1 底座回转（软限位待实测）
+    (10, 990, 514),   # J2 大臂（软限位待实测）
+    (10, 990, 516),   # J3 小臂（软限位待实测）
+    (10, 990, 502),   # J4 腕俯仰（软限位待实测）
+    (10, 990, 494),   # J5 腕回转（软限位待实测）
+    (300, 674, 674),  # J6 夹爪（实测：全张=300，全闭=674；零位=完全闭合）
 ]
 
 JOINT_LIMITS = {
-    JOINT_NAMES[i]: PULSE_RANGES[i] for i in range(CHANNEL_COUNT)
+    JOINT_NAMES[i]: POS_RANGES[i] for i in range(CHANNEL_COUNT)
 }
 
 
 # ---------------------------------------------------------------------------
-# A 方案：点击画面取点 -> 逆解 -> 六路脉宽 -> JOINT 下发（可选功能）
+# A 方案：点击画面取点 -> 逆解 -> 六路位置 -> $ARM,POS 下发（可选功能）
 #
 # ① 用了什么语法：模块级可选 import + 字典配置 + 纯函数（不碰任何已有全局状态）。
 # ② 为什么这么设计：逆解依赖 arm_ik.py / arm_params.json 两个文件，鲲鹏板最小上传集
 #    本来不含它们；做成「找不到就 _IK=None、接口返回明确原因」的软降级，不传文件
-#    也不会影响已跑通的 PING/MOVE/STATE/视频/检测框链路，删掉文件即可回滚。
+#    也不会影响已跑通的 PING/$ARM/视频/检测框链路，删掉文件即可回滚。
 # ③ 不这么写会怎样：若在模块顶部硬 import，板上缺文件会让整个 Flask 起不来，
 #    连网页都打不开 —— 一个可选功能拖垮主链路，是典型的耦合事故。
 # ---------------------------------------------------------------------------
@@ -148,10 +146,10 @@ def pixel_to_table(u, v, w, h):
 
 
 def solve_to_positions(x, y):
-    """工作台 (x,y) -> 6 路脉宽，并裁到固件软限位 PULSE_RANGES。
+    """工作台 (x,y) -> 6 路位置，并裁到固件软限位 POS_RANGES。
 
-    返回 (pulses, clamped)：clamped 列出被裁的关节，供页面提示「目标超出可达范围」。
-    为什么 Python 侧也裁一遍：固件 cmd_joint 也会 clamp_pulse，但那是静默裁剪；
+    返回 (positions, clamped)：clamped 列出被裁的关节，供页面提示「目标超出可达范围」。
+    为什么 Python 侧也裁一遍：固件 arm_robot 也会做软限位钳位，但那是静默裁剪；
     这边显式裁并回报，人才能知道 IK 解其实越界了，而不是以为「算得很准」。
     """
     if _IK is None:
@@ -159,14 +157,14 @@ def solve_to_positions(x, y):
     angles = _IK.solve(x, y, z=_IK_MAP["z"], wrist=_IK_MAP["wrist"],
                        claw=_IK_MAP["claw"], tilt=_IK_MAP["tilt"])
     raw = _IK.to_positions(angles)
-    pulses, clamped = [], []
+    positions, clamped = [], []
     for i, p in enumerate(raw):
-        lo, hi, _ = PULSE_RANGES[i]
+        lo, hi, _ = POS_RANGES[i]
         q = max(lo, min(hi, int(p)))
         if q != int(p):
             clamped.append(JOINT_NAMES[i])
-        pulses.append(q)
-    return pulses, clamped
+        positions.append(q)
+    return positions, clamped
 
 
 # ---------------------------------------------------------------------------
@@ -245,7 +243,7 @@ def init_eye_in_hand(robot_dir, x_path, k_path, plane_z=None):
             sys.path.insert(0, d)
         from handeye_geometry import load_calib, Kinematics, EyeInHandLocalizer
         cal = load_calib(xp, kp)
-        # 复用已经加载好的 ArmIK 实例，保证「脉宽->角度」用的是同一份标定表；
+        # 复用已经加载好的 ArmIK 实例，保证「位置->角度」用的是同一份标定表；
         # 若逆解模块没就绪（_IK is None），Kinematics 会自己新建一个。
         kin = Kinematics(os.path.join(d, "arm_params.json"), ik=_IK)
         _EYE = EyeInHandLocalizer(cal, kin)
@@ -262,7 +260,7 @@ def init_eye_in_hand(robot_dir, x_path, k_path, plane_z=None):
 
 
 # ---------------------------------------------------------------------------
-# 协议层（与 arm_host.py 一致）
+# 协议层（$<CMD>,...*<CK><CR><LF>，机械臂走 $ARM 子命令）
 # ---------------------------------------------------------------------------
 def compute_ck(payload: str) -> int:
     ck = 0
@@ -277,7 +275,7 @@ def make_frame(payload: str) -> bytes:
 
 
 # ---------------------------------------------------------------------------
-# 串口封装（后台读取线程，MOVE 只写不等，避免拖动时被应答阻塞卡顿）
+# 串口封装（后台读取线程，$ARM,J 只写不等，避免拖动时被应答阻塞卡顿）
 # ---------------------------------------------------------------------------
 # 单行字节上限。正常协议帧最长约 40 字节（"OK,S,C,1636,1470,..."），512 宽松到
 # 不可能误伤；设上限只为防「噪声里一直没有换行符」时 line 无界增长吃内存。
@@ -437,7 +435,7 @@ class SerialHost:
             # 没有换行符的裸文本（噪声、被截断的提示语），它就会和下一帧粘成一行；
             # 而下面要求「整行以 $ 开头」，于是那一帧被整条丢弃，上层只能看到
             # "600 ms 内未收到任何字节"。2026-11-12 实测：PING 正常、紧随其后的
-            # STATE 偶发超时，原样重发即恢复 —— 就是这一帧被吃掉。
+            # $ARM,READ 偶发超时，原样重发即恢复 —— 就是这一帧被吃掉。
             # 安全性：协议里 "$" 只作帧头，载荷字符集是 A-Z/0-9/逗号/负号/点/冒号，
             # 不含 "$"，所以「见到 $ 就重来」不会切坏正常帧。
             if ch == b"$":
@@ -447,7 +445,7 @@ class SerialHost:
                 if line:
                     s = bytes(line).decode("ascii", errors="replace").strip()
                     # 只收 "$" 开头的协议帧。printf 重定向到 huart1 与协议共用链路，
-                    # 上电 banner / RC522·KEY0 提示 / 每 3s 的 "STATE ... | PULSE ..."
+                    # 上电 banner / RC522·KEY0 提示 / 周期状态打印（非协议帧的裸文本）
                     # 及 ESP AT 回显都是裸文本；必须丢弃，否则 send() 会误取为应答导致解析失败。
                     if s.startswith("$"):
                         s = s[1:]                 # 去掉帧头 $
@@ -489,10 +487,10 @@ class SerialHost:
         self.ser.write(make_frame(payload))
 
     def send(self, payload, timeout=0.6):
-        """写帧并等待一条新应答（MOVE 等无应答命令由调用侧走 fire 短路）。"""
+        """写帧并等待一条新应答（$ARM,J 等无应答命令由调用侧走 fire 短路）。"""
         with self.wlock:
             with self.rlock:
-                self.rxq.clear()          # 丢弃历史残留（含 MOVE 应答），保证读到的就是本次应答
+                self.rxq.clear()          # 丢弃历史残留（含 $ARM,J 应答），保证读到的就是本次应答
             self._write(payload)
         deadline = time.time() + timeout
         while time.time() < deadline:
@@ -511,7 +509,7 @@ class SerialHost:
                            % int(timeout * 1000))
 
     def fire(self, payload):
-        """只写不等应答：供 MOVE 拖动用，绝不阻塞。"""
+        """只写不等应答：供 $ARM,J 拖动用，绝不阻塞。"""
         with self.wlock:
             self._write(payload)
 
@@ -559,7 +557,7 @@ class TcpHost:
                 line, _, self.buf = self.buf.partition(b"\n")
                 s = line.decode("ascii", errors="replace").strip().strip("\r")
                 # 只收 "$" 开头的协议帧。printf 重定向到 huart1 与协议共用链路，
-                # 上电 banner / RC522·KEY0 提示 / 每 3s 的 "STATE ... | PULSE ..."
+                # 上电 banner / RC522·KEY0 提示 / 周期状态打印（非协议帧的裸文本）
                 # 及 ESP AT 回显都是裸文本；必须丢弃，否则 send() 会误取为应答导致解析失败。
                 if s.startswith("$"):
                     s = s[1:]                 # 去掉帧头 $
@@ -581,7 +579,7 @@ class TcpHost:
         self.sock.sendall(make_frame(payload))
 
     def send(self, payload, timeout=0.6):
-        """写帧并等待一条新应答（MOVE 等无应答命令由调用侧走 fire 短路）。"""
+        """写帧并等待一条新应答（$ARM,J 等无应答命令由调用侧走 fire 短路）。"""
         with self.wlock:
             with self.rlock:
                 self.rxq.clear()
@@ -597,7 +595,7 @@ class TcpHost:
                            "WiFi/ESP 模式请检查 ESP 链路）" % int(timeout * 1000))
 
     def fire(self, payload):
-        """只写不等应答：供 MOVE 拖动用，绝不阻塞。"""
+        """只写不等应答：供 $ARM,J 拖动用，绝不阻塞。"""
         with self.wlock:
             self._write(payload)
 
@@ -674,7 +672,7 @@ class TcpServerHost:
                 line, _, self.buf = self.buf.partition(b"\n")
                 s = line.decode("ascii", errors="replace").strip().strip("\r")
                 # 只收 "$" 开头的协议帧。printf 重定向到 huart1 与协议共用链路，
-                # 上电 banner / RC522·KEY0 提示 / 每 3s 的 "STATE ... | PULSE ..."
+                # 上电 banner / RC522·KEY0 提示 / 周期状态打印（非协议帧的裸文本）
                 # 及 ESP AT 回显都是裸文本；必须丢弃，否则 send() 会误取为应答导致解析失败。
                 if s.startswith("$"):
                     s = s[1:]                 # 去掉帧头 $
@@ -737,7 +735,7 @@ def auto_reconnect():
     为什么允许「自动」：CH341 被 USB 复位后 ttyUSB 编号会变，旧 fd 只会静默返回
     b''。设备全场只有一台，重连的目标没有任何歧义，让人再手打一次端口号毫无意义。
     为什么必须限定条件：只有「根本没连」或「读线程已判定链路失效（_dead_reason）」
-    才重连。普通 600ms 应答超时可能只是 STM32 正在跑斜坡，乱重连会把命令打断。
+    才重连。普通 600ms 应答超时可能只是 STM32 正在运动，乱重连会把命令打断。
     """
     global _HOST
     if _MODE != "serial":
@@ -843,7 +841,7 @@ app = Flask(__name__)
 #          LogRecord 的 getMessage() 返回 bool，粒度是消息级、不改变 level，
 #          故启动 banner（INFO）、开发服务器 WARNING、真错误（ERROR）都保留。
 class _NoAccessLog(logging.Filter):
-    """前端 1s 轮询 /api/state + 拖动 60ms 节流发 MOVE，会把终端刷满
+    """前端 1s 轮询 /api/state + 拖动 60ms 节流发 $ARM,J，会把终端刷满
     "POST /api/... 200"；这里只丢这一类访问日志，其余原样打印。"""
 
     def filter(self, record):
@@ -996,7 +994,7 @@ PAGE = r"""
         <span class="pill warn" id="ikState">检测中…</span>
       </div>
       <div style="font-size:11px;color:#ffc37a;margin-top:8px;line-height:1.6">
-        ⚠ 只做「像素 → 桌面平面 → 逆解 → 脉宽」，没有深度相机、没有力控、没有关节回读。
+        ⚠ 只做「像素 → 桌面平面 → 逆解 → 位置」，没有深度相机、没有力控、没有关节回读。
         确认下发会让<b>六路舵机同时运动</b>，请先确认臂周围无人、无障碍物。
       </div>
       <div class="row" style="margin-top:8px">
@@ -1009,7 +1007,7 @@ PAGE = r"""
         <div class="ph">画面 → 桌面 标定参数（现场调，改完点「保存参数」生效）</div>
         <div class="tip" style="margin-top:8px;line-height:1.6">
           大白话：这 5 个数是给「点击画面取点」用的一把尺子 —— 告诉网页整幅画面对应桌面多宽多高、中心在哪、抓取高度多少；
-          点一下画面才能把像素换成厘米，再交给逆解算六路脉宽。属平面约束单目定位，<b>不是真 3D</b>。
+          点一下画面才能把像素换成厘米，再交给逆解算六路位置。属平面约束单目定位，<b>不是真 3D</b>。
         </div>
         <div class="g" style="margin-top:8px">
           <div class="cf">
@@ -1069,17 +1067,17 @@ PAGE = r"""
       {% endif %}
       <div class="row" style="margin-top:8px">
         <button onclick="api('PING')">PING</button>
-        <button onclick="api('STATE')">读状态</button>
-        <button onclick="api('HOME')">回初始位</button>
+        <button onclick="api('ARM,READ')">读位置</button>
+        <button onclick="api('ARM,HOME')">回零位</button>
       </div>
     </section>
 
     <section class="panel">
-      <h2><span>关节控制 · 6 路</span><span class="tip">实际值 1s 回填，滑杆即真实脉宽</span></h2>
+      <h2><span>关节控制 · 6 路</span><span class="tip">实际值 1s 回填，滑杆即真实位置</span></h2>
       {% for i in range(6) %}
       <div class="jcard" data-i="{{i}}">
         <div class="jtop">
-          <span class="jname">{{names[i]}} <span class="jlim">{{mins[i]}} ~ {{maxs[i]}} μs</span></span>
+          <span class="jname">{{names[i]}} <span class="jlim">{{mins[i]}} ~ {{maxs[i]}}</span></span>
           <span class="jval" id="v{{i}}">{{inits[i]}}</span>
         </div>
         <input type="range" id="s{{i}}" min="{{mins[i]}}" max="{{maxs[i]}}" value="{{inits[i]}}"
@@ -1098,18 +1096,11 @@ PAGE = r"""
     <section class="panel">
       <h2><span>夹爪 / 运动 / 示教</span></h2>
       <div class="g">
-        <button onclick="apiRaw('MOVE,5,900')">夹爪张开 900</button>
-        <button onclick="apiRaw('MOVE,5,1500')">夹爪半开 1500</button>
-        <button onclick="apiRaw('MOVE,5,1900')">夹爪闭合 1900</button>
-        <button class="ok" onclick="autoInit()">六轴回初始位</button>
-        <button onclick="api('STOP')">停止</button>
-        <button onclick="api('RESUME')">继续</button>
-      </div>
-      <div class="row" style="margin-top:8px">
-        <button onclick="api('MANUAL')">进入手动</button>
-        <button onclick="api('REC')">示教开始</button>
-        <button onclick="api('RECEND')">示教结束</button>
-        <button onclick="api('PLAY')">回放</button>
+        <button onclick="apiRaw('ARM,J,6,300')">夹爪张开 300</button>
+        <button onclick="apiRaw('ARM,J,6,674')">夹爪闭合 674</button>
+        <button class="ok" onclick="autoInit()">六轴回零位</button>
+        <button onclick="api('ARM,STOP')">停止</button>
+        <button onclick="api('ARM,RESUME')">继续</button>
       </div>
     </section>
   </div>
@@ -1117,11 +1108,11 @@ PAGE = r"""
 </div>
 
 <div class="metrics">
-  <div class="metric"><div class="lb">目标 / 实际最大偏差</div><div class="vl" id="mDev">0 μs</div></div>
+  <div class="metric"><div class="lb">目标 / 实际最大偏差</div><div class="vl" id="mDev">0 单位</div></div>
   <div class="metric"><div class="lb">识别帧率</div><div class="vl" id="mFps">-- fps</div></div>
   <div class="metric"><div class="lb">当前目标</div><div class="vl" id="mTarget" style="color:var(--ok)">—</div></div>
   <div class="metric" style="padding:0;border:none;background:none">
-    <button class="estop" onclick="api('STOP')">紧急停止<br>STOP</button>
+    <button class="estop" onclick="api('STOP'); api('ARM,STOP')">紧急停止<br>底盘+机械臂</button>
   </div>
 </div>
 
@@ -1173,7 +1164,7 @@ function apiRaw(payload){ doCmd(payload); }
 // 拖动实时跟随：固定间隔节流，连续拖动也每 ~60ms 至少发一次最新值
 // dragAt[i] 记「这路滑杆最后一次被拖的时间」，给下面 syncPulses() 判断要不要跳过回填。
 const dragTimers={}, dragBusy={}, dragNext={}, dragAt={};
-function sendDrag(i,v){ dragNext[i]=null; doCmd('MOVE,'+i+','+v); }
+function sendDrag(i,v){ dragNext[i]=null; doCmd('ARM,J,'+(i+1)+','+v); }
 function drag(i,el){
   tag('v'+i, el.value);
   dragNext[i]=el.value;            // 记住最新目标
@@ -1200,24 +1191,24 @@ function endDrag(i,el){
   dragBusy[i]=false;
   dragNext[i]=null;
   dragAt[i]=Date.now();
-  api('MOVE,'+i+','+el.value);
+  api('ARM,J,'+(i+1)+','+el.value);
 }
 
-// 读实际脉宽回填界面（HOME/MOVE 后滑杆位置与实际一致）
+// 读实际位置回填界面（HOME/$ARM 后滑杆位置与实际一致）
 let lastPollErr='';   // 上次轮询失败的原因：只在「原因变了」时写日志，避免 1 秒一条刷屏
 async function syncPulses(){
   if(!connected) return;
   const r=await post('/api/state');
-  if(r&&r.ok&&Array.isArray(r.pulses)&&r.pulses.length===6){
+  if(r&&r.ok&&Array.isArray(r.positions)&&r.positions.length===6){
     lastPollErr='';
     for(let i=0;i<6;i++){
       const s=document.getElementById('s'+i);
       if(!s) continue;
-      // 刚拖过这路就先别覆盖：STATE 回的是斜坡过程中的中间值，
+      // 刚拖过这路就先别覆盖：$ARM,READ 回的是运动过程中的中间值，
       // 强行写回会把滑块拉回去，看起来像「拖不动 / 弹回去」。
       if(dragAt[i] && Date.now()-dragAt[i] < DRAG_HOLD_MS) continue;
-      s.value=String(r.pulses[i]);
-      tag('v'+i, r.pulses[i]);
+      s.value=String(r.positions[i]);
+      tag('v'+i, r.positions[i]);
     }
   } else if(r&&r.ok===false){
     // 链路坏了必须让人看见：以前这里静默失败，界面 LED 还绿着、滑杆一动不动，
@@ -1247,20 +1238,18 @@ function step(i,d){
   let v=parseInt(s.value)+d;
   v=Math.max(parseInt(s.min),Math.min(parseInt(s.max),v));
   s.value=v; tag('v'+i,v);
-  doCmd('MOVE,'+i+','+v);
+  doCmd('ARM,J,'+(i+1)+','+v);
 }
-function goInit(i){ api('MOVE,'+i+','+({{inits|tojson}})[i]); }
+function goInit(i){ api('ARM,J,'+(i+1)+','+({{inits|tojson}})[i]); }
 
 async function autoInit(){
-  {% for i in range(6) %}
-  await doCmd('MOVE,{{i}},{{inits[i]}}');
-  {% endfor %}
+  await doCmd('ARM,HOME');
 }
 
 // =========================================================================
 // 以下为 UI 升级新增部分（视频链路 / 检测叠加 / 遥测）
 // 设计原则：上面的串口收发函数一个字都不改，只在这里「包装」和「追加」。
-// 好处：即使新功能全挂了，PING/MOVE/STATE 仍然按原来已实机验证的方式工作。
+// 好处：即使新功能全挂了，PING/$ARM 仍然按原来已实机验证的方式工作。
 // =========================================================================
 
 // 从滑杆 DOM 读限位和初始位，避免再往模板里塞一份数据（单一数据源）
@@ -1272,7 +1261,7 @@ for (let i = 0; i < 6; i++) {
 
 const stat = {
   cmds: 0,                 // 累计下发指令数
-  targets: INITS.slice(),  // 最后一次给每路下达的目标脉宽（初值=初始位）
+  targets: INITS.slice(),  // 最后一次给每路下达的目标位置（初值=初始位）
   lastFrameId: 0,          // 上一次识别帧号（用来算 FPS）
   lastFrameT: 0
 };
@@ -1284,11 +1273,11 @@ let overlayOn = true;
 const _doCmd0 = doCmd;
 doCmd = function (payload) {
   stat.cmds++;
-  const m = /^MOVE,(\d),(\d+)/.exec(payload);
-  if (m) stat.targets[+m[1]] = +m[2];
-  const modeText = payload === 'STOP' ? '急停' : payload === 'RESUME' ? '已恢复'
-                 : payload === 'REC' ? '示教' : payload === 'PLAY' ? '回放'
-                 : payload === 'MANUAL' ? '手动' : '指令态';
+  const m = /^ARM,J,(\d),(\d+)/.exec(payload);
+  if (m) stat.targets[+m[1] - 1] = +m[2];
+  const modeText = payload === 'STOP' || payload === 'ARM,STOP' ? '急停'
+                 : payload === 'RESUME' || payload === 'ARM,RESUME' ? '已恢复'
+                 : '指令态';
   tag('pillMode', modeText);
   return _doCmd0(payload);
 };
@@ -1423,15 +1412,15 @@ function startDetections() {
   }, 400);
 }
 
-// 偏差 = 最后一次 MOVE 目标 vs 1s 回填的真实脉宽，取 6 路最大值。
-// 只读 DOM，不额外发 STATE —— 绝不增加串口流量。
+// 偏差 = 最后一次 $ARM 目标 vs 1s 回填的真实位置，取 6 路最大值。
+// 只读 DOM，不额外发 $ARM,READ —— 绝不增加串口流量。
 setInterval(function () {
   let mx = 0;
   for (let i = 0; i < 6; i++) {
     const s = document.getElementById('s' + i);
     if (s) mx = Math.max(mx, Math.abs(stat.targets[i] - +s.value));
   }
-  tag('mDev', mx + ' μs');
+  tag('mDev', mx + ' 单位');
 }, 300);
 
 setInterval(function () { tag('clock', new Date().toLocaleTimeString('zh-CN', { hour12: false })); }, 1000);
@@ -1494,7 +1483,7 @@ async function ikSolve(apply) {
   if (apply) {
     if (!connected) { log('⚠ 串口未连接，先点「连接」'); return; }
     if (!ikLast || !ikLast.ok) { log('⚠ 请先「① 试算」成功再下发'); return; }
-    if (!confirm('确认下发 JOINT 到机械臂？\n六路目标脉宽：' + ikLast.pulses.join(', ')
+    if (!confirm('确认下发 $ARM,POS 到机械臂？\n六路目标位置：' + ikLast.positions.join(', ')
         + '\n\n六路舵机会同时运动，请确认臂周围无人、无障碍物。')) return;
   }
   const body = { u: ikPoint.u, v: ikPoint.v, w: ikPoint.w, h: ikPoint.h, apply: !!apply };
@@ -1505,24 +1494,24 @@ async function ikSolve(apply) {
   ikLast = r;
   let s = '像素 (' + ikPoint.u + ',' + ikPoint.v + ')  →  桌面 (x=' + r.x
         + ', y=' + r.y + ', z=' + r.z + ') cm\n'
-        + '目标脉宽(μs)：' + r.pulses.map(function (p, i) {
+        + '目标位置：' + r.positions.map(function (p, i) {
             return IK_NAMES[i] + '=' + p;
           }).join('  ') + '\n';
   s += (r.clamped && r.clamped.length)
      ? '⚠ 超出软限位被裁剪：' + r.clamped.join(',') + '（IK 解不完全可达）\n'
      : '✓ 六路均在软限位内\n';
   if (r.applied) {
-    s += '\n已下发：JOINT,' + r.pulses.join(',') + '\n固件应答：' + (r.resp || '(空)') + '\n';
-    if (r.state_pulses && r.state_pulses.length === 6)
-      s += 'STATE 瞬时值：' + r.state_pulses.join(',') + '\n  → ' + r.state_note + '\n';
+    s += '\n已下发：ARM,POS,' + r.positions.join(',') + '\n固件应答：' + (r.resp || '(空)') + '\n';
+    if (r.state_positions && r.state_positions.length === 6)
+      s += '$ARM,READ 瞬时值：' + r.state_positions.join(',') + '\n  → ' + r.state_note + '\n';
     s += r.note;
   } else {
     s += '\n【仅试算，未下发】确认无误后再点「② 确认下发」。';
   }
   tagIk(s);
   document.getElementById('btnIkApply').disabled = r.applied;   // 下发过就禁用，防连点
-  log(r.applied ? ('<< ' + r.resp + ' | 目标 ' + r.pulses.join(','))
-                : ('<< 试算完成 目标 ' + r.pulses.join(',')));
+  log(r.applied ? ('<< ' + r.resp + ' | 目标 ' + r.positions.join(','))
+                : ('<< 试算完成 目标 ' + r.positions.join(',')));
 }
 
 function ikClear() {
@@ -1706,9 +1695,9 @@ def index():
         mode=_MODE,
         wifi_addr=_WIFI_ADDR,
         names=JOINT_NAMES,
-        mins=[r[0] for r in PULSE_RANGES],
-        maxs=[r[1] for r in PULSE_RANGES],
-        inits=[r[2] for r in PULSE_RANGES],
+        mins=[r[0] for r in POS_RANGES],
+        maxs=[r[1] for r in POS_RANGES],
+        inits=[r[2] for r in POS_RANGES],
     )
 
 
@@ -1797,10 +1786,10 @@ def api_cmd():
         auto_reconnect()                  # 没连就先自动连一次（端口自动探测，无需端口名）
     if _HOST is None:
         return jsonify(ok=False, error="未连接：没找到串口（先确认 CH341 已插入）")
-    is_move = payload.upper().startswith("MOVE")
+    is_move = payload.upper().startswith("ARM,J")
 
     def _send_once():
-        # MOVE 下位机不回应答，走 fire 只写不等待，保证拖动实时跟手
+        # $ARM,J 拖动高频下发，走 fire 只写不等待，保证拖动实时跟手
         if is_move:
             _HOST.fire(payload)
             return ""
@@ -1827,24 +1816,24 @@ def api_state():
     if _HOST is None:
         return jsonify(ok=False, error="未连接：没找到串口（先确认 CH341 已插入）")
     try:
-        resp = _HOST.cmd("STATE")
+        resp = _HOST.cmd("ARM,READ")
     except Exception as e:
         if not auto_reconnect():
             return jsonify(ok=False, error=str(e))
         try:
-            resp = _HOST.cmd("STATE")
+            resp = _HOST.cmd("ARM,READ")
         except Exception as e2:
             return jsonify(ok=False, error=str(e2))
     parts = resp.split(",")
-    # 必须显式校验长度：parts 不足 9 段时 Python 切片的 out-of-range 不会抛异常，
-    # 只会悄悄返回少于 6 路脉宽，页面拿到长度不对的数组就等于白问一次。
-    if len(parts) < 9:
-        return jsonify(ok=False, error="STATE 响应异常：%r（应形如 OK,S,C,p0..p5）" % resp)
+    # 必须显式校验长度：$OK,POS,p1..p6 共 8 段；不足时切片 out-of-range 不抛异常，
+    # 只会悄悄返回少于 6 路位置，页面拿到长度不对的数组就等于白问一次。
+    if len(parts) < 8:
+        return jsonify(ok=False, error="$ARM,READ 响应异常：%r（应形如 OK,POS,p1..p6）" % resp)
     try:
-        pulses = [int(tok) for tok in parts[3:9]]
+        positions = [int(tok) for tok in parts[2:8]]
     except ValueError:
-        return jsonify(ok=False, error="STATE 响应异常：%r（脉宽不是整数）" % resp)
-    return jsonify(ok=True, pulses=pulses)
+        return jsonify(ok=False, error="$ARM,READ 响应异常：%r（位置不是整数）" % resp)
+    return jsonify(ok=True, positions=positions)
 
 
 @app.route("/api/config")
@@ -1865,7 +1854,7 @@ def api_config():
 #
 # ① 用了什么语法：Flask 路由 + request.get_json + 字典组装 jsonify + 分层 try/except。
 # ② 为什么这么设计：拆成「看状态 / 改标定 / 解算」三个独立接口，且解算默认
-#    apply=False 只试算 —— 六路舵机会同时运动，必须让人先看到脉宽再确认下发。
+#    apply=False 只试算 —— 六路舵机会同时运动，必须让人先看到位置再确认下发。
 # ③ 不这么写会怎样：点一下画面就让臂猛甩；逆解抛 ValueError（目标超出可达范围）
 #    还会变成 500 错误页，页面拿不到任何有用提示。
 # ---------------------------------------------------------------------------
@@ -1877,7 +1866,7 @@ def api_ik_config():
         ready=_IK is not None,
         error=_IK_ERROR,
         map=dict(_IK_MAP),
-        ranges=PULSE_RANGES,
+        ranges=POS_RANGES,
         eye=dict(_EYE_INFO, error=_EYE_ERROR),
     )
 
@@ -1895,17 +1884,17 @@ def api_ik_eye():
 
 @app.route("/api/ik/eye/solve", methods=["POST"])
 def api_ik_eye_solve():
-    """像素 + 当前关节角 -> 手眼链 -> 工作台 3D 点 -> IK -> 6 路脉宽。
+    """像素 + 当前关节角 -> 手眼链 -> 工作台 3D 点 -> IK -> 6 路位置。
 
     与 /api/ik/solve 的区别（这是「A」相对「A 退化版」的核心升级）：
         · 旧：x = center_x + (u/w-0.5)*span_x —— 5 个手工常量，隐含「拍照姿态固定」；
-        · 新：K 反投影出射线 → 用**当前 6 路实际脉宽**做 FK 得 T_base_end
+        · 新：K 反投影出射线 → 用**当前 6 路实际位置**做 FK 得 T_base_end
               → T_base_cam = T_base_end·X → 与 z=Z 平面求交。
     因此臂换个姿态再点同一个像素，结果会跟着变 —— 这是对的，因为相机跟着动了。
 
-    可靠性说明：关节角必须来自真实串口 STATE。若串口没连，宁可直接报错，
+    可靠性说明：关节角必须来自真实串口 $ARM,READ。若串口没连，宁可直接报错，
     也不拿初始位顶替 —— 那会算出"看起来对、其实差十几厘米"的坐标。
-    apply=True 时才下发 JOINT，且与旧接口一样先试算后确认。
+    apply=True 时才下发 $ARM,POS，且与旧接口一样先试算后确认。
     """
     if _EYE is None:
         return jsonify(ok=False, error=_EYE_ERROR or "眼在手链路未启用（启动加 --eye-in-hand）")
@@ -1914,33 +1903,33 @@ def api_ik_eye_solve():
     u = float(data.get("u", 0))
     v = float(data.get("v", 0))
 
-    # 关节角来源：优先页面传来的 pulses（刚轮询到的），否则向串口要一次。
-    # 为什么不默认用 _IK_MAP 的常量：STATE 是唯一能反映"相机此刻在哪"的信息源。
-    pulses = data.get("pulses")
-    if not (isinstance(pulses, list) and len(pulses) == 6):
+    # 关节角来源：优先页面传来的 positions（刚轮询到的），否则向串口要一次。
+    # 为什么不默认用 _IK_MAP 的常量：$ARM,READ 是唯一能反映"相机此刻在哪"的信息源。
+    positions = data.get("positions")
+    if not (isinstance(positions, list) and len(positions) == 6):
         if _HOST is None:
             return jsonify(ok=False,
-                           error="串口未连接，拿不到当前关节角：眼在手定位必须有真实脉宽"
-                                 "（先点页面「连接」，或等 1s 轮询拿到 STATE）")
+                           error="串口未连接，拿不到当前关节角：眼在手定位必须有真实位置"
+                                 "（先点页面「连接」，或等 1s 轮询拿到 $ARM,READ）")
         try:
-            sresp = _HOST.cmd("STATE")
+            sresp = _HOST.cmd("ARM,READ")
             parts = sresp.split(",")
-            if len(parts) < 9:
-                return jsonify(ok=False, error="STATE 响应异常，取不到 6 路脉宽：%r" % sresp)
-            pulses = [int(t) for t in parts[3:9]]
+            if len(parts) < 8:
+                return jsonify(ok=False, error="$ARM,READ 响应异常，取不到 6 路位置：%r" % sresp)
+            positions = [int(t) for t in parts[2:8]]
         except Exception as e:
             return jsonify(ok=False, error="读取当前关节角失败：%s" % e)
     else:
-        pulses = [int(p) for p in pulses]
+        positions = [int(p) for p in positions]
 
     plane_z = data.get("plane_z")
     plane_z = float(plane_z) if plane_z is not None else (_EYE_PLANE_Z if _EYE_PLANE_Z is not None else _IK_MAP["z"])
 
     try:
-        est = _EYE.localize(u, v, pulses, plane_z=plane_z)
+        est = _EYE.localize(u, v, positions, plane_z=plane_z)
     except ValueError as e:
         # 目标在视野外 / 视线与桌面平行 / 深度离谱，都归成一句能看懂的话
-        return jsonify(ok=False, error=str(e), pulses=pulses)
+        return jsonify(ok=False, error=str(e), positions=positions)
 
     x_raw, y_raw, z = est["x"], est["y"], est["z"]
 
@@ -1964,20 +1953,20 @@ def api_ik_eye_solve():
     # tilt：夹爪前倾角。0=垂直向下；>0 时腕关节不必退到爪尖正上方 L3 处，
     # 所以可达半径会明显变大（tilt=5° 约 +1.5cm，tilt=20° 约 +6cm）。
     #
-    # 🔴 单一真相源（11-16 改）：默认**从当前真实脉宽反算**，不再用 _IK_MAP["tilt"]（恒 0）。
+    # 🔴 单一真相源（11-16 改）：默认**从当前真实位置反算**，不再用 _IK_MAP["tilt"]（恒 0）。
     # 为什么：tilt 是「当前姿态的固有属性」，不是可自由挑的参数 —— 相机骑在腕上，
     # 拍照那一刻的倾角决定相机位姿，抓取必须用同一个倾角。用常量 0 会在 C 姿态(41°) 下
     # 让 r_w 少扣 L3·sin41°≈11cm，d 虚高十几厘米，把明明够得着的目标误判成
     # 「超出可达范围」（11-16 实测：报 d=26.7，实际 d≈14.8）。
-    # 优先级：请求显式给 tilt > 从 pulses 反算 > （无 IK 时）不进来。
+    # 优先级：请求显式给 tilt > 从 positions 反算 > （无 IK 时）不进来。
     _tilt_req = data.get("tilt")
     if _tilt_req is not None:
         try:
             tilt = float(_tilt_req)
         except (TypeError, ValueError):
-            tilt = _IK.tilt_from_positions(pulses)
+            tilt = _IK.tilt_from_positions(positions)
     else:
-        tilt = _IK.tilt_from_positions(pulses)
+        tilt = _IK.tilt_from_positions(positions)
     try:
         angles = _IK.solve(x, y, z=z, wrist=_IK_MAP["wrist"],
                            claw=_IK_MAP["claw"], tilt=tilt)
@@ -1988,13 +1977,13 @@ def api_ik_eye_solve():
                        x_raw=round(x_raw, 2), y_raw=round(y_raw, 2),
                        radial_k=round(_k, 4), radial_shift=round(radial_shift, 2))
 
-    out_pulses, clamped = [], []
+    out_positions, clamped = [], []
     for i, p in enumerate(raw):
-        lo, hi, _ = PULSE_RANGES[i]
+        lo, hi, _ = POS_RANGES[i]
         q = max(lo, min(hi, int(p)))
         if q != int(p):
             clamped.append(JOINT_NAMES[i])
-        out_pulses.append(q)
+        out_positions.append(q)
 
     out = dict(
         ok=True,
@@ -2005,9 +1994,9 @@ def api_ik_eye_solve():
         radial_k=round(_k, 4), radial_shift=round(radial_shift, 2),
         tilt=round(tilt, 2),
         depth=round(est["depth"], 2),
-        pulses=out_pulses,
+        positions=out_positions,
         clamped=clamped,
-        source_pulses=pulses,
+        source_positions=positions,
         placeholder=est["placeholder"],
         flag=est["flag"],
         applied=False,
@@ -2028,17 +2017,17 @@ def api_ik_eye_solve():
         out["error"] = "串口未连接：试算结果已保留，先点页面「连接」再下发"
         return jsonify(out)
 
-    payload = "JOINT,%s" % ",".join(str(int(p)) for p in out_pulses)
+    payload = "ARM,POS,%s" % ",".join(str(int(p)) for p in out_positions)
     try:
         out["resp"] = _HOST.cmd(payload)
     except Exception as e:
         out["ok"] = False
-        out["error"] = "JOINT 下发失败：%s" % e
+        out["error"] = "$ARM,POS 下发失败：%s" % e
         return jsonify(out)
 
     out["applied"] = True
     out["frame"] = payload
-    out["note"] = ("固件已回 OK；六路正走斜坡逼近目标"
+    out["note"] = ("固件已回 OK（作业已受理），六轴由 ArmTask 异步运动"
                    if out["resp"].startswith("OK")
                    else "固件未回 OK，请检查链路（帧已发出）")
     return jsonify(out)
@@ -2070,12 +2059,12 @@ def api_ik_calib():
 
 @app.route("/api/ik/solve", methods=["POST"])
 def api_ik_solve():
-    """像素 (u,v,w,h) -> 桌面 (x,y) -> IK -> 6 路脉宽。
+    """像素 (u,v,w,h) -> 桌面 (x,y) -> IK -> 6 路位置。
 
     apply=False（默认）：只试算，一个字节都不往串口发。
-    apply=True：构造 JOINT,<p0>..<p5> 下发，并回读一次 STATE 的瞬时值。
+    apply=True：构造 ARM,POS,<p0>..<p5> 下发，并回读一次 $ARM,READ 的瞬时值。
 
-    诚实边界：STATE 返回的是斜坡推进中的「当前脉宽」，不是「已到位确认」；
+    诚实边界：$ARM,READ 返回的是运动推进中的「当前位置」，不是「已到位确认」；
     到位与否靠页面已有的 1s 轮询 /api/state 持续观察，这里绝不假装确认。
     """
     data = request.get_json(force=True, silent=True) or {}
@@ -2083,7 +2072,7 @@ def api_ik_solve():
         x, y = pixel_to_table(
             float(data.get("u", 0)), float(data.get("v", 0)),
             float(data.get("w", 0)), float(data.get("h", 0)))
-        pulses, clamped = solve_to_positions(x, y)
+        positions, clamped = solve_to_positions(x, y)
     except (ValueError, RuntimeError) as e:
         # 目标过近 / 超出可达范围 / 逆解模块没就绪，都归成「能看懂的一句话」
         return jsonify(ok=False, error=str(e))
@@ -2091,7 +2080,7 @@ def api_ik_solve():
         return jsonify(ok=False, error="逆解异常：%s" % e)
 
     out = dict(ok=True, x=round(x, 2), y=round(y, 2), z=_IK_MAP["z"],
-               pulses=pulses, clamped=clamped, applied=False, resp="")
+               positions=positions, clamped=clamped, applied=False, resp="")
 
     if not data.get("apply"):
         out["note"] = "仅试算，未下发任何串口命令"
@@ -2102,12 +2091,12 @@ def api_ik_solve():
         out["error"] = "串口未连接：试算结果已保留，先点页面「连接」再下发"
         return jsonify(out)
 
-    payload = "JOINT,%s" % ",".join(str(int(p)) for p in pulses)
+    payload = "ARM,POS,%s" % ",".join(str(int(p)) for p in positions)
     try:
         out["resp"] = _HOST.cmd(payload)
     except Exception as e:
         out["ok"] = False
-        out["error"] = "JOINT 下发失败：%s" % e
+        out["error"] = "$ARM,POS 下发失败：%s" % e
         return jsonify(out)
 
     out["applied"] = True
@@ -2115,19 +2104,19 @@ def api_ik_solve():
     if not out["resp"].startswith("OK"):
         out["note"] = "固件未回 OK，请检查链路（帧已发出）"
     else:
-        out["note"] = "固件已回 OK；六路正走斜坡逼近目标，页面 1s 轮询会持续刷新实际值"
+        out["note"] = "固件已回 OK（作业已受理）；六轴由 ArmTask 异步运动，页面 1s 轮询会持续刷新实际位置"
 
-    # 回读一次 STATE：只展示「当下瞬时值」，绝不冒充到位确认。
-    out["state_pulses"] = []
+    # 回读一次 $ARM,READ：只展示「当下瞬时值」，绝不冒充到位确认。
+    out["state_positions"] = []
     out["state_note"] = ""
     try:
-        sresp = _HOST.cmd("STATE")
+        sresp = _HOST.cmd("ARM,READ")
         parts = sresp.split(",")
-        if len(parts) >= 9:
-            out["state_pulses"] = [int(t) for t in parts[3:9]]
-            out["state_note"] = "斜坡中的瞬时值，非最终到位；最终值看页面 1s 轮询"
+        if len(parts) >= 8:
+            out["state_positions"] = [int(t) for t in parts[2:8]]
+            out["state_note"] = "运动中的瞬时值，非最终到位；最终值看页面 1s 轮询"
     except Exception:
-        out["state_note"] = "STATE 回读失败（不影响已下发的目标）"
+        out["state_note"] = "$ARM,READ 回读失败（不影响已下发的目标）"
     return jsonify(out)
 
 
@@ -2257,7 +2246,7 @@ def main():
             print("  [警告] 启动时打开串口失败：%s" % e)
             print("         可稍后在页面点「连接」，或 POST /api/open（不传 port 即自动探测）")
 
-    # ---- 视频链路（和串口控制链路完全独立，怎么改都不影响 PING/MOVE/STATE）----
+    # ---- 视频链路（和串口控制链路完全独立，怎么改都不影响 PING/$ARM）----
     # 优先级：外部 --video-url > 本地 --camera；都不给 = 页面显示占位卡。
     # 只开一个摄像头：给了外部流就绝不再碰本地摄像头（摄像头是独占设备，
     # 开两次会失败；鲲鹏阶段更不能和 detector_service 抢同一个 /dev/video0）。
@@ -2284,7 +2273,7 @@ def main():
     # ① 用了什么语法：函数调用 + 模块级全局软引用（_IK 允许是 None）。
     # ② 为什么这么设计：arm_ik.py / arm_params.json 不在板上最小上传集里，
     #    硬 import 会让缺文件时整个 5000 起不来；这里「找不到就只关掉点选抓取」。
-    # ③ 不这么写会怎样：一个可选的抓取功能拖垮已跑通的 PING/MOVE/STATE/视频链路。
+    # ③ 不这么写会怎样：一个可选的抓取功能拖垮已跑通的 PING/$ARM/视频链路。
     ik_ok = init_ik(args.ik_dir)
     if ik_ok:
         ik_desc = "已就绪（%s）" % os.path.expanduser(args.ik_dir or "~/kunpeng_vision")
@@ -2292,7 +2281,7 @@ def main():
         ik_desc = "未启用：%s" % _IK_ERROR
 
     # ---- A+ 眼在手链路（必须显式 --eye-in-hand，默认不碰旧通路）----
-    # 依赖 _IK 先加载好：Kinematics 复用它做「脉宽->角度」，保证标定表只有一份。
+    # 依赖 _IK 先加载好：Kinematics 复用它做「位置->角度」，保证标定表只有一份。
     if args.eye_in_hand:
         eye_ok = init_eye_in_hand(args.ik_dir, args.handeye_X, args.intrinsics,
                                   plane_z=args.plane_z)

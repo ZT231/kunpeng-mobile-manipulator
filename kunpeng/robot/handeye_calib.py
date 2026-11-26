@@ -42,9 +42,9 @@
       solvePnP 都不依赖 DISPLAY，只有 imshow / waitKey / destroyAllWindows 依赖。
 
    ③ collect 不再直接打开串口（2026-11-09 19:15，核准批 2 时倒逼的第二次改造）。
-      旧版 collect 用 ArmHost(serial.Serial("/dev/ttyUSB0")) 独占串口读 STATE，
-      但它是「只读」的：STATE 返的是固件脉宽目标值，姿态必须靠 web_control.py
-      下发 JOINT 才会变；停掉 5000 就没有下发通道，不停则两个进程抢同一帧。
+      旧版 collect 用 ArmHost(serial.Serial("/dev/ttyUSB0")) 独占串口读 $ARM,READ，
+      但它是「只读」的：$ARM,READ 返的是固件位置目标值，姿态必须靠 web_control.py
+      下发 $ARM,POS 才会变；停掉 5000 就没有下发通道，不停则两个进程抢同一帧。
       改法：collect 改走 HTTP POST /api/state，串口只由 web_control.py 一个人管，
       本程序只拿结果。概念（大白话）：不抢话筒，改问主持人要答案。
       规范定义：进程间单一资源独占 + HTTP 代理读取，避免串口帧被两个读者竞争消费。
@@ -59,9 +59,9 @@
 
 =====================================================================
 复用资产（从原视觉机械臂项目抽取并适配，接口不变）：
-   arm_ik.py        —— ArmIK 逆解/正解（本模块用 to_angles() 把脉宽还原成物理角）
-   arm_params.json  —— 舵机脉宽↔角度标定表（保留不动）
-   arm_host.py      —— 旧版 collect 直连串口读 STATE 用；本版 collect 不再 import 它
+   arm_ik.py        —— ArmIK 逆解/正解（本模块用 to_angles() 把位置还原成物理角）
+   arm_params.json  —— 舵机位置↔角度标定表（保留不动）
+   arm_host.py      —— 旧版 collect 直连串口读 $ARM,READ 用；本版 collect 不再 import 它
                       （板上留着无妨，其它工具仍可用）
 
 依赖：
@@ -195,10 +195,10 @@ def fk_gripper2base(angles_deg):
     return T
 
 
-def positions_to_physical(pulses, ik):
-    """6 路脉宽(us) → 6 路物理关节角(度)，喂给 fk_gripper2base 用。
+def positions_to_physical(positions, ik):
+    """6 路位置(位置单位) → 6 路物理关节角(度)，喂给 fk_gripper2base 用。
 
-    串口 STATE 读上来的是脉宽；arm_ik.ArmIK.to_angles 返回的是"舵机相对角"
+    串口 $ARM,READ 读上来的是位置；arm_ik.ArmIK.to_angles 返回的是"舵机相对角"
     （J3=相对大臂、J4=相对小臂，见 ik.py 的 to_positions 补偿逻辑），不是物理绝对角。
     这里做它的逆运算还原成物理角：
         θ1 = s1
@@ -207,7 +207,7 @@ def positions_to_physical(pulses, ik):
         θ4 = s4 + 180 + θ3        （tilt 已含在 s4 里，公式来自 ik.py）
     其中 s1..s6 = to_angles 输出。
     """
-    s = ik.to_angles(pulses)
+    s = ik.to_angles(positions)
     th1 = s[0]
     th2 = s[1]
     th3 = s[2] + th2
@@ -329,7 +329,7 @@ _STATUS_ADVICE = {
     STATUS_OK: "",
     STATUS_WEAK: "多摆几个「转轴不同、角度更大」的姿态重采（J1 与 J4 都要覆盖，别只绕一个轴）",
     STATUS_NO_SOLUTION: "不是多摆几个姿态能救的：先查 J4 重力下垂、标定板是否被碰动、"
-                        "arm_params.json 的脉宽↔角度映射是否与实际相符",
+                        "arm_params.json 的位置↔角度映射是否与实际相符",
 }
 
 
@@ -699,7 +699,7 @@ def cmd_selftest(args=None):
         samples = []
         for i in range(len(Rg)):
             samples.append({
-                "pulses": [1500, 1500, 1500, 1500, 1500, 1500],
+                "positions": [460, 514, 516, 502, 494, 674],
                 "R_gripper2base": np.asarray(Rg[i]).tolist(),
                 "t_gripper2base": np.asarray(tg[i]).reshape(3).tolist(),
                 "R_target2cam": np.asarray(Rc[i]).tolist(),
@@ -733,7 +733,7 @@ def cmd_selftest(args=None):
             if i % 3 == 1:
                 tt[0] += 0.05      # 只破坏 1/3 的样本，方程就不再自洽了
             bad.append({
-                "pulses": [1500] * 6,
+                "positions": [460, 514, 516, 502, 494, 674],
                 "R_gripper2base": np.asarray(Rg[i]).tolist(),
                 "t_gripper2base": np.asarray(tg[i]).reshape(3).tolist(),
                 "R_target2cam": np.asarray(Rc[i]).tolist(),
@@ -817,14 +817,14 @@ def _reconcile_square(args, intr_doc):
     return args.square
 
 
-def _read_state_pulses(url, timeout=1.0):
-    """从 web_control.py 的 /api/state 读 6 路当前脉宽（POST，纯标准库）。
+def _read_state_positions(url, timeout=1.0):
+    """从 web_control.py 的 /api/state 读 6 路当前位置（POST，纯标准库）。
 
     概念（大白话）：不去抢串口，改问网页后台「现在六路是多少」。
-    串口只由 web_control.py 一个人管，网页滑杆下发 JOINT、它自己回读 STATE，
+    串口只由 web_control.py 一个人管，网页滑杆下发 $ARM,POS、它自己回读 $ARM,READ，
     本程序只通过 HTTP 拿结果 —— 两个进程不再抢同一帧 ``$OK,S,...``。
     规范定义：HTTP POST + JSON。web_control.py 的 ``api_state()`` 返回
-    ``{"ok": true, "pulses": [6 路脉宽]}``，其中 pulses 来自 STATE 帧
+    ``{"ok": true, "positions": [6 路位置]}``，其中 positions 来自 $ARM,READ 帧
     ``parts[3:9]``，是斜坡推进过程中的当前值（不是「已到位确认」，
     所以摆完姿态要等到位再采）。未连串口时返回
     ``{"ok": false, "error": "未连接"}``，这里直接抛异常让本组跳过。
@@ -837,10 +837,10 @@ def _read_state_pulses(url, timeout=1.0):
     d = json.loads(raw)
     if not d.get("ok"):
         raise RuntimeError("api/state 未就绪: %s" % d.get("error", d))
-    pulses = d.get("pulses")
-    if not isinstance(pulses, list) or len(pulses) != 6:
-        raise RuntimeError("api/state pulses 异常: %r" % (pulses,))
-    return [int(p) for p in pulses]
+    positions = d.get("positions")
+    if not isinstance(positions, list) or len(positions) != 6:
+        raise RuntimeError("api/state positions 异常: %r" % (positions,))
+    return [int(p) for p in positions]
 
 
 def _chess_objp(cols, rows, square):
@@ -929,10 +929,10 @@ def cmd_intrinsics(args):
 def cmd_collect(args):
     """采集手眼数据（无头友好）：定时自动采一组，同时记关节角位姿 + 标定板位姿。
 
-    每 --interval 秒采一组：POST /api/state 读 6 路脉宽 → to_angles → FK 得末端位姿；
+    每 --interval 秒采一组：POST /api/state 读 6 路位置 → to_angles → FK 得末端位姿；
     拍棋盘格 → solvePnP 得标定板位姿。
     概念（大白话）：摆好一个姿态等一下，程序自己记一组，不用按键。
-    规范定义：关节角不走串口，改由 web_control.py 独占串口、本程序 HTTP 取（见 _read_state_pulses），
+    规范定义：关节角不走串口，改由 web_control.py 独占串口、本程序 HTTP 取（见 _read_state_positions），
     避免两个进程抢同一帧 $OK,S,...。
     ⚠️ 姿态之间要有明显旋转变化（不能只平移），否则 AX=XB 退化解不出唯一 X。
     """
@@ -953,7 +953,7 @@ def cmd_collect(args):
     # 进循环前先探一次状态源：若 /api/state 还没连串口（ok=false, error=未连接），
     # 立刻明确报错退出，别让下面的采集循环每组都跳过、刷屏到 --timeout 才结束。
     try:
-        _read_state_pulses(args.state_url)
+        _read_state_positions(args.state_url)
     except Exception as e:
         print("状态源不可用（%s）；请先在 web_control.py 上 POST /api/open 连串口" % e)
         return 1
@@ -995,14 +995,14 @@ def cmd_collect(args):
             cv2.imshow("collect", disp)
             cv2.waitKey(1)
         if found and now >= next_t:
-            # --- 机器人端：HTTP 读 6 路脉宽 → 关节角 → 末端相对基座位姿 ---
+            # --- 机器人端：HTTP 读 6 路位置 → 关节角 → 末端相对基座位姿 ---
             try:
-                pulses = _read_state_pulses(args.state_url)
+                positions = _read_state_positions(args.state_url)
             except Exception as e:
                 print("  状态读取失败（%s），本组跳过" % e)
                 next_t = now + args.interval
                 continue
-            phys = positions_to_physical(pulses, ik)
+            phys = positions_to_physical(positions, ik)
             T = fk_gripper2base(phys)
             R_g2b = T[:3, :3]
             t_g2b = T[:3, 3] / 100.0        # cm → m，和相机侧单位一致
@@ -1015,7 +1015,7 @@ def cmd_collect(args):
             R_t2c, _ = cv2.Rodrigues(rvec)
             t_t2c = tvec.reshape(3)
             samples.append({
-                "pulses": [int(p) for p in pulses],
+                "positions": [int(p) for p in positions],
                 "R_gripper2base": R_g2b.tolist(),
                 "t_gripper2base": t_g2b.tolist(),
                 "R_target2cam": R_t2c.tolist(),
@@ -1202,7 +1202,7 @@ def main():
     p = sub.add_parser("collect")
     p.add_argument("--camera", type=int, default=0)
     p.add_argument("--state-url", default="http://127.0.0.1:5000/api/state",
-                   help="web_control.py 的 /api/state，POST 读 6 路脉宽（不打开串口）")
+                   help="web_control.py 的 /api/state，POST 读 6 路位置（不打开串口）")
     p.add_argument("--intrinsics", default="camera_intrinsics.json")
     p.add_argument("--cols", type=int, default=9)
     p.add_argument("--rows", type=int, default=6)

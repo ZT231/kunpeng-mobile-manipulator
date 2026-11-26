@@ -22,12 +22,12 @@ voice_gateway.py —— 鲲鹏侧语音入口网关（阶段 2 / B 项，2026-11
   ⇒ 本文件是**独立进程**，只通过 HTTP 调它已有的 `/api/cmd`，主链路一行不碰，删掉即完整回滚。
 
 🔴 为什么只发 HOME / STOP / RESUME 三个命令字（最重要的一条架构判断）：
-  固件 `Core/Src/uart_protocol.c:428-451` 原生支持 PING/STATE/**HOME/STOP/RESUME**/JOINT，
+  固件 `Core/Src/arm_robot.c` 总线舵机命令层支持 $ARM,READ/$ARM,POS/$ARM,HOME/$ARM,STOP/$ARM,RESUME 等，
   且都回 `OK`。这三个命令字**不带任何数值参数** ⇒ 从根上不需要「软限位裁剪 / to_positions()
   反解校验 / 重力下垂净空折算」，也就不会踩项目里那些「静默夹紧」「算错符号」的坑。
   意图层的 PICK / PLACE / MOVE_LEFT / MOVE_RIGHT 一律**不授权**：
     - PICK/PLACE：需要先定位 + 抓取序列（未实现），且涉及下降高度与 SAG_DZ 净空闸门；
-    - MOVE_*：相对位移要读 STATE + 逐轴软限位 + to_positions() 反解，属未授权的脉宽改写；
+    - MOVE_*：相对位移要读 $ARM,READ + 逐轴软限位 + to_positions() 反解，属未授权的位置改写；
     - LOOK：只观察、不下发（会说话的东西不该动臂）。
   ⇒ 「会动的东西」被收敛成三个无参数命令字，这是把风险从「靠人记」变成「结构上不可能」。
 
@@ -35,10 +35,10 @@ voice_gateway.py —— 鲲鹏侧语音入口网关（阶段 2 / B 项，2026-11
   1) `source` 恒 "mock"（沿用 intent_parser），**没接云端大模型、没接 ASR；ESP32 已接入但只发链路自检帧**；
   2) 帧格式 `$ASR,<文本>*<CK>` 沿用 `llm/text_gateway.py` 的**建议草案**，未与 ESP32 实机对齐；
   3) ✅ **阶段 2 网关链路 2026-11-14 16:40 已上板实机验证**：38 项本机单测 + 四层硬判据全绿
-     （假帧 `$ASR,回初始位*61` → `$OK,HOME*27` → `/api/state` 脉宽回初始位 → 日志 `sent:true` → 肉眼见臂动），
+     （假帧 `$ASR,回初始位*61` → `$OK,ARM,HOME*27` → `/api/state` 位置回初始位 → 日志 `sent:true` → 肉眼见臂动），
      记录见 `docs/上板验收-语音网关阶段2.md`。🔴 但**语音入口整体仍 🔶**：ESP32 已烧录实机（TCP 9000/采音），
      帧草案未与 ESP32 对齐，**不许写成「语音控制已实现 / 语音→动作闭环 / 已接 ESP32」**；
-  4) 急停只在**网关层**冻结后续下发，并转发 `STOP` 给固件；仍是开环，无位置反馈。
+  4) 急停只在**网关层**冻结后续下发，并转发 `$ARM,STOP` 给固件；位置反馈由 $ARM,READ 提供。
 
 🔴 11-14 代码审查加固（两处「本机 UTF-8 测不出、上板 LANG=C 才炸」的真问题）：
   a) **locale 无关输出**：板端 `LANG=C` / `PYTHONIOENCODING=ascii` 时，
@@ -140,10 +140,10 @@ DEFAULT_BASE_URL = "http://127.0.0.1:5000"
 HTTP_TIMEOUT_S = 5.0
 MAX_FRAME_BYTES = 256               # 超长帧直接拒，别让一个坏客户端把缓冲撑爆
 
-# 固件原生命令字（uart_protocol.c:428-451，均回 "OK"）
-CMD_HOME = "HOME"
-CMD_STOP = "STOP"        # = ESTOP，冻结输出，仅 RESUME 可解除
-CMD_RESUME = "RESUME"
+# 总线舵机 $ARM 命令字（arm_robot.c，POS/J/HOME 只投作业立刻回 OK）
+CMD_HOME = "ARM,HOME"
+CMD_STOP = "ARM,STOP"        # = ESTOP，冻结输出，仅 RESUME 可解除
+CMD_RESUME = "ARM,RESUME"
 
 # 急停 / 恢复词：🔴 故意放在**意图解析之前**做文本匹配。
 # 急停必须最快，不能等一个可能返回 unknown 的翻译员慢慢查表。

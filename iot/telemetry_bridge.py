@@ -15,7 +15,7 @@ telemetry_bridge.py —— 阶段 1：把 5000 控制台的真实数据经 MQTT 
   而重启会把 _IK_MAP 标定参数清回默认值、打断正在跑的实机现场。
   独立脚本只「读」已有的 HTTP 接口，一行主链路代码都不碰，Ctrl+C 停掉就回滚干净。
 
-代价（诚实交代）：/api/state 是 POST，每次调用会真的往串口发一条 STATE 命令。
+代价（诚实交代）：/api/state 是 POST，每次调用会真的往串口发一条 $ARM,READ 命令。
   所以默认 5 秒才取一次；相对页面已有的 1 秒轮询，只多约 20% 的串口帧，可忽略。
   串口没连时接口返回 ok=False，build_payload() 只跳过该字段、不崩；
   🔴 阶段 1.2b 起，六路不完整时 is_publishable() 判 False、整条发布直接跳过 ——
@@ -74,14 +74,14 @@ def build_payload(state, det, cfg):
     payload = {
         "deviceId": DEVICE_ID,
         "ts": int(time.time()),
-        "pulses": None,
-        # 阶段 1.2 新增：把六路脉宽再拆成六个标量 j1~j6。
+        "positions": None,
+        # 阶段 1.2 新增：把六路位置再拆成六个标量 j1~j6。
         # 大白话：InfluxDB 一格只能装一个数，装不下一整个数组；
         #         所以除了留着原数组给人看，再拆成 6 个单独的数字给数据库用。
         # 规范定义：InfluxDB 2.x 的 field value 只允许
         #         float / integer / unsignedInteger / string / boolean 五种标量，
         #         没有 array 类型；eKuiper 的 influx2 sink 也只能按字段名逐个写。
-        # 纯新增、不改原有 pulses：阶段 1.1 的发布/订阅截图与订阅端解析都还成立。
+        # 纯新增、不改原有 positions：历史发布/订阅截图与订阅端解析都还成立。
         "j1": None,
         "j2": None,
         "j3": None,
@@ -95,17 +95,17 @@ def build_payload(state, det, cfg):
         "camera_on": None,
     }
 
-    # 六路脉宽来自 /api/state：它返回 {"ok":true,"pulses":[p0..p5]}
+    # 六路位置来自 /api/state：它返回 {"ok":true,"positions":[p0..p5]}（$ARM,READ 读回）
     if isinstance(state, dict) and state.get("ok"):
-        pulses = state.get("pulses")
-        if isinstance(pulses, list) and len(pulses) == 6:
-            payload["pulses"] = pulses
+        positions = state.get("positions")
+        if isinstance(positions, list) and len(positions) == 6:
+            payload["positions"] = positions
             # 用 enumerate 逐路拆，别手写 6 行赋值：
             # 好处是以后改路数只改一处，也不会把 j3、j4 写串。
-            for i, value in enumerate(pulses):
+            for i, value in enumerate(positions):
                 payload["j%d" % (i + 1)] = value
         else:
-            print("[warn] STATE 里 pulses 不是 6 路，跳过", file=sys.stderr)
+            print("[warn] /api/state 的 positions 不是 6 路，跳过", file=sys.stderr)
 
     # 帧号和检测数来自 /api/detections：外层是 {"ok":true,"data":{...}}，
     # data 里的字段名与页面 showDetections(d) 用的完全一致（d.frame_id / d.detections）。
@@ -129,11 +129,11 @@ def build_payload(state, det, cfg):
 def is_publishable(payload):
     """这条 payload 能不能发上 MQTT（纯函数，方便自测）。
 
-    大白话：六路脉宽必须六个都是真数字才发。串口一断，/api/state 回「未连接」，
+    大白话：六路位置必须六个都是真数字才发。串口一断，/api/state 回「未连接」，
             build_payload() 会把 j1~j6 填成 null；这种点发出去不是「少几个数」，
             而是会把整批写库拖垮。
     规范定义：InfluxDB 2.x 每个 measurement + field 的类型在首次写入时锁定，
-            历史 j1=1580 已把 j1 锁成 float；eKuiper influx2 sink 不跳过 nil，
+            历史 j1 已把 j1 锁成 float；eKuiper influx2 sink 不跳过 nil，
             会把 JSON null 序列化成 string 写进 line protocol，撞上 float 后返回
             422 partial write: field type conflict ... dropped=1，整批写不出去。
             ⇒ 进程不崩不等于数据无害，脏数据要在发布端就挡掉（第 11 条排障）。
@@ -150,7 +150,7 @@ def collect_once():
     """取一轮数据。三个接口互相独立，任意一个挂了都不影响另外两个。"""
     cfg = fetch_json("/api/config", "GET")
     det = fetch_json("/api/detections", "GET")
-    # 🔴 这个 POST 会真的往串口发一条 STATE，是全脚本唯一有副作用的地方
+    # 🔴 这个 POST 会真的往串口发一条 $ARM,READ，是全脚本唯一有副作用的地方
     state = fetch_json("/api/state", "POST")
     return build_payload(state, det, cfg)
 
@@ -176,15 +176,15 @@ def make_client(broker, port):
 
 def self_test():
     """纯逻辑自测：喂假数据，逐个字段检查 build_payload，不联网、不依赖 paho。"""
-    state = {"ok": True, "pulses": [1580, 1900, 2400, 700, 1450, 1500]}
+    state = {"ok": True, "positions": [460, 514, 516, 502, 494, 674]}
     det = {"ok": True, "data": {"frame_id": 1238,
                                 "detections": [{"label": "book"}, {"label": "banana"}]}}
     cfg = {"ok": True, "mode": "serial", "baud": 115200, "camera_on": False}
     p = build_payload(state, det, cfg)
     assert p["deviceId"] == DEVICE_ID, "deviceId"
-    assert p["pulses"] == [1580, 1900, 2400, 700, 1450, 1500], "pulses"
-    # 阶段 1.2：六个标量必须和 pulses 数组逐位对上，写串了看板曲线就是错的
-    assert [p["j%d" % i] for i in range(1, 7)] == [1580, 1900, 2400, 700, 1450, 1500], "j1~j6"
+    assert p["positions"] == [460, 514, 516, 502, 494, 674], "positions"
+    # 阶段 1.2：六个标量必须和 positions 数组逐位对上，写串了看板曲线就是错的
+    assert [p["j%d" % i] for i in range(1, 7)] == [460, 514, 516, 502, 494, 674], "j1~j6"
     assert p["frame_id"] == 1238, "frame_id"
     assert p["det_count"] == 2, "det_count"
     assert p["mode"] == "serial", "mode"
@@ -195,22 +195,22 @@ def self_test():
 
     # 降级用例：串口没连（ok=False）或整个服务没起时，字段应为 None 且不能崩
     p2 = build_payload({"ok": False, "error": "未连接"}, None, None)
-    assert p2["pulses"] is None and p2["mode"] is None, "降级容错"
+    assert p2["positions"] is None and p2["mode"] is None, "降级容错"
     assert all(p2["j%d" % i] is None for i in range(1, 7)), "降级时 j1~j6 也应为 None"
 
-    # 畸形用例：pulses 不是 6 路时跳过，绝不把错数据发上云
-    p3 = build_payload({"ok": True, "pulses": [1, 2]}, None, None)
-    assert p3["pulses"] is None, "畸形 pulses"
+    # 畸形用例：positions 不是 6 路时跳过，绝不把错数据发上云
+    p3 = build_payload({"ok": True, "positions": [1, 2]}, None, None)
+    assert p3["positions"] is None, "畸形 positions"
     assert all(p3["j%d" % i] is None for i in range(1, 7)), "畸形时 j1~j6 也应跳过"
 
     # 阶段 1.2b：六路不完整时绝不能发上 MQTT（InfluxDB field 类型冲突，第 11 条排障）
     assert is_publishable(p) is True, "正常六路应可发布"
     assert is_publishable(p2) is False, "串口未连接时六路为 null, 必须跳过发布"
-    assert is_publishable(p3) is False, "畸形 pulses 时六路为 null, 必须跳过发布"
+    assert is_publishable(p3) is False, "畸形 positions 时六路为 null, 必须跳过发布"
     # 边界：bool 混进来不能当成数字（bool 是 int 子类）
     p4 = dict(p)
     p4["j1"] = True
-    assert is_publishable(p4) is False, "bool 不是合法脉宽"
+    assert is_publishable(p4) is False, "bool 不是合法位置"
 
     print("SELF_TEST PASS")
     print(json.dumps(p, ensure_ascii=False, indent=2))
@@ -246,7 +246,7 @@ def main():
             if not is_publishable(payload) and client is not None:
                 # 正式运行：六路不完整就整条跳过，绝不把带 null 的点发上 MQTT。
                 # （dry-run 是诊断模式，仍会打印出来，下面照常走到打印分支。）
-                print("[warn] 六路脉宽不完整，跳过本次发布（避免 InfluxDB field 类型冲突）",
+                print("[warn] 六路位置不完整，跳过本次发布（避免 InfluxDB field 类型冲突）",
                       file=sys.stderr)
             elif client is not None:
                 client.publish(args.topic, line, qos=1)

@@ -35,7 +35,7 @@
         │  用 K 反投影
         ▼
     相机系射线 + 尺度 s          →  P_cam = s · K^-1 · [u, v, 1]
-        │  用 6 路脉宽做正运动学
+        │  用 6 路位置做正运动学
         ▼
     T_base_end(q)                →  T_base_cam = T_base_end · X
         │  射线变到基座系
@@ -213,10 +213,10 @@ def load_calib(X_path, K_path):
 
 
 # ---------------------------------------------------------------------------
-# 正运动学：脉宽 -> 末端位姿（与 handeye_calib.fk_gripper2base 同一模型）
+# 正运动学：位置 -> 末端位姿（与 handeye_calib.fk_gripper2base 同一模型）
 # ---------------------------------------------------------------------------
 class Kinematics:
-    """把 6 路脉宽换算成末端位姿 T_base_end，供手眼链使用。
+    """把 6 路位置换算成末端位姿 T_base_end，供手眼链使用。
 
     大白话：给定六个舵机各自被推到哪，算出"手尖现在在底座坐标系的哪里、朝哪"。
     规范定义：正运动学（Forward Kinematics, FK）q ↦ T_base_end(q) ∈ SE(3)。
@@ -236,7 +236,7 @@ class Kinematics:
         self.wrist_ecc = float(p.get("wrist_ecc", 0.0))
         self.ecc_dir = float(p.get("ecc_dir", 0.0))
         self.params_path = os.path.abspath(params_path)
-        # ik 用于"脉宽 -> 物理角"的反向插值；复用 ArmIK.to_angles 免得再写一份标定表解析
+        # ik 用于"位置 -> 物理角"的反向插值；复用 ArmIK.to_angles 免得再写一份标定表解析
         if ik is None:
             import sys
             here = os.path.dirname(os.path.abspath(params_path))
@@ -246,8 +246,8 @@ class Kinematics:
             ik = ArmIK(params_path)
         self.ik = ik
 
-    def positions_to_angles(self, pulses):
-        """6 路脉宽(us) -> 6 路物理绝对角(度)。
+    def positions_to_angles(self, positions):
+        """6 路位置(位置单位) -> 6 路物理绝对角(度)。
 
         为什么要这一步：arm_params.json 存的是"舵机角度"（J3 相对大臂、J4 相对小臂），
         而 FK 公式用的是"绝对俯仰角"。换算关系与 handeye_calib.positions_to_physical 一致：
@@ -257,7 +257,7 @@ class Kinematics:
             θ4 = s4 + 180 + θ3
         若两处不统一，手眼 X 会与定位链错位一个关节角，表现为"越靠近边缘偏得越多"。
         """
-        s = self.ik.to_angles([int(p) for p in pulses])
+        s = self.ik.to_angles([int(p) for p in positions])
         th1, th2 = s[0], s[1]
         th3 = s[2] + th2
         th4 = s[3] + 180.0 + th3
@@ -295,9 +295,9 @@ class Kinematics:
         Ry = np.array([[c4, 0, -s4], [0, 1, 0], [s4, 0, c4]], dtype=float)
         return pose_from_rt(Rz @ Ry, [x, y, z])
 
-    def fk_positions(self, pulses):
-        """脉宽一步到位的便捷封装（内部就是 to_angles + fk）。"""
-        return self.fk(self.positions_to_angles(pulses))
+    def fk_positions(self, positions):
+        """位置一步到位的便捷封装（内部就是 to_angles + fk）。"""
+        return self.fk(self.positions_to_angles(positions))
 
 
 # ---------------------------------------------------------------------------
@@ -335,7 +335,7 @@ def ray_plane_intersect(origin, direction, plane_z):
 
 
 class EyeInHandLocalizer:
-    """把"像素 + 当前脉宽 + 标定数据"变成"工作台坐标"，就是眼在手定位器。
+    """把"像素 + 当前位置 + 标定数据"变成"工作台坐标"，就是眼在手定位器。
 
     大白话：给它一张照片上的点、再告诉它机械臂此刻的姿势，
            它就能说出这个点在桌面上哪儿（单位 cm）。
@@ -351,12 +351,12 @@ class EyeInHandLocalizer:
         self.min_depth = float(min_depth)
         self.max_depth = float(max_depth)
 
-    def localize(self, u, v, pulses, plane_z=None):
+    def localize(self, u, v, positions, plane_z=None):
         """像素 -> 工作台 (x, y, z) cm。返回 dict，含可视化需要的中间量。
 
         参数：
             u, v     像素坐标（原图分辨率下的整数）
-            pulses   6 路脉宽（来自 /api/state，即当前构型）
+            positions   6 路位置（来自 /api/state，即当前构型）
             plane_z  抓取平面高度 cm，必须显式传入（已取消 grab_height 默认值）
 
         返回字段：
@@ -368,14 +368,14 @@ class EyeInHandLocalizer:
         """
         if plane_z is None:
             raise ValueError("localize() 需要显式 plane_z（抓取平面高度 cm）；已取消 grab_height 默认值")
-        if len(pulses) != 6:
-            raise ValueError("需要 6 路脉宽，实际收到 %d 个" % len(pulses))
+        if len(positions) != 6:
+            raise ValueError("需要 6 路位置，实际收到 %d 个" % len(positions))
 
         # ① 相机系射线（无量纲方向）
         d_cam = pixel_to_ray_cam(u, v, self.calib.K)
 
         # ② 当前构型下末端位姿：用 FK 得 T_base_end（cm）
-        T_base_end = self.kin.fk_positions(pulses)
+        T_base_end = self.kin.fk_positions(positions)
 
         # ③ 手眼链：T_base_cam = T_base_end · X。
         #    X 的平移单位是 m（handeye_calib solve 存的），末端位姿是 cm，
@@ -397,7 +397,7 @@ class EyeInHandLocalizer:
         depth_cm = lam_m * 100.0
         if not (self.min_depth <= depth_cm <= self.max_depth):
             raise ValueError("视线长度 %.1f cm 超出合理范围 [%.1f, %.1f]："
-                             "检查 Z、手眼矩阵或缺省脉宽是否对得上当前臂姿"
+                             "检查 Z、手眼矩阵或缺省位置是否对得上当前臂姿"
                              % (depth_cm, self.min_depth, self.max_depth))
 
         p_base_m = origin_cm / 100.0 + lam_m * d_base
@@ -423,7 +423,7 @@ def T_base_cam_to_list(T_m):
 # ---------------------------------------------------------------------------
 # 自检：没有硬件也要能验证这条链路算得对
 # ---------------------------------------------------------------------------
-def _probe_visible_pixel(loc, calib, kin, pulses, plane_z=None):
+def _probe_visible_pixel(loc, calib, kin, positions, plane_z=None):
     """找一个"真的在相机视野内、且落在抓取平面上"的像素，供自检复用。
 
     大白话：随手戳一个屏幕点不一定是桌子，先算准一个肯定打在桌上的点再测。
@@ -432,7 +432,7 @@ def _probe_visible_pixel(loc, calib, kin, pulses, plane_z=None):
     """
     if plane_z is None:
         raise ValueError("_probe_visible_pixel() 需要显式 plane_z（抓取平面高度 cm）")
-    T_be = kin.fk_positions(pulses)
+    T_be = kin.fk_positions(positions)
     T_be_m = T_be.copy()
     T_be_m[:3, 3] = T_be_m[:3, 3] / 100.0
     T_bc = T_be_m @ calib.X
@@ -487,13 +487,14 @@ def selftest(verbose=True):
     kin = Kinematics(params)
     loc = EyeInHandLocalizer(cal, kin)
 
-    # ---- 2) 选两个真实可达的臂姿（用初始位脉宽，FK 出来一定在合理范围内）----
-    pulses_a = [1580, 1900, 2400, 700, 1450, 1500]
-    pulses_b = [1250, 1780, 2260, 760, 1520, 1500]
+    # ---- 2) 选两个真实可达的臂姿（用初始位位置，FK 出来一定在合理范围内）----
+    # 🔴 旧 PWM 初始位 [1580,1900,2400,700,1450,1500] 已作废；总线零位见下。
+    positions_a = [460, 514, 516, 502, 494, 674]   # 总线六轴零位（2026-11-26 实测）
+    positions_b = [560, 514, 516, 502, 494, 674]   # J1 +100 位置单位 侧摆（待实机确认）
     ok_all = True
 
-    for tag, pulses in (("A 初始位", pulses_a), ("B 侧摆位", pulses_b)):
-        T_be = kin.fk_positions(pulses)
+    for tag, positions in (("A 初始位", positions_a), ("B 侧摆位", positions_b)):
+        T_be = kin.fk_positions(positions)
         # 反推"相机在哪、朝哪"，再手工造一个桌面上的目标点，正投影成像素
         T_be_m = T_be.copy()
         T_be_m[:3, 3] = T_be_m[:3, 3] / 100.0
@@ -523,7 +524,7 @@ def selftest(verbose=True):
         u, v = float(uvw[0]), float(uvw[1])
 
         # ---- 3) 正解：本模块应还原出 target ----
-        out = loc.localize(u, v, pulses, plane_z=PLANE_Z)
+        out = loc.localize(u, v, positions, plane_z=PLANE_Z)
         err = math.hypot(out["x"] - target_cm[0], out["y"] - target_cm[1])
         good = err < 1e-6
         ok_all = ok_all and good
@@ -534,7 +535,7 @@ def selftest(verbose=True):
     # ---- 4) 占位标记必须能透传到结果里（防止把占位当实测）----
     # 用自检 2 里实际算出的那个合法像素，别硬编码 (320,240)——初始位下画面中心
     # 并不在桌面上（相机朝前而不是朝下），硬编码会得到"交点在背后"。
-    ok_ph, note_ph = _probe_visible_pixel(loc, cal, kin, pulses_a)
+    ok_ph, note_ph = _probe_visible_pixel(loc, cal, kin, positions_a)
     if not ok_ph:
         print("自检 3：无法构造视野内的像素：%s  FAIL" % note_ph)
         ok_all = False
@@ -543,7 +544,7 @@ def selftest(verbose=True):
         cal_ph = CalibData(X=X_true, K=K_true, dist=[0, 0, 0, 0, 0],
                            X_placeholder=True, K_placeholder=False, sources={})
         loc_ph = EyeInHandLocalizer(cal_ph, kin)
-        out_ph = loc_ph.localize(u_ok, v_ok, pulses_a, plane_z=plane_ok)
+        out_ph = loc_ph.localize(u_ok, v_ok, positions_a, plane_z=plane_ok)
         good = out_ph["placeholder"] is True and "占位" in out_ph["flag"]
         ok_all = ok_all and good
         print("自检 3：占位标记透传 -> placeholder=%s  flag=%s  %s"
@@ -555,10 +556,10 @@ def selftest(verbose=True):
     # 不改变几何方向，护栏根本不触发 —— 对着错误的对象测，测了等于没测。
     cases = []
     try:
-        loc.localize(320.0, 240.0, [1580, 1900], plane_z=PLANE_Z)
-        cases.append(("脉宽不足 6 路", False, "未报错"))
+        loc.localize(320.0, 240.0, [300, 674], plane_z=PLANE_Z)
+        cases.append(("位置不足 6 路", False, "未报错"))
     except ValueError as e:
-        cases.append(("脉宽不足 6 路", True, str(e)))
+        cases.append(("位置不足 6 路", True, str(e)))
 
     for name, direction, origin, plane in (
             ("视线与平面平行", [0.0, 1.0, 0.0], [0.0, 0.0, 0.1], 0.02),
@@ -580,7 +581,7 @@ def selftest(verbose=True):
         print("自检 4（%s）：%s  %s" % (name, "PASS" if passed else "FAIL", msg))
 
     # ---- 6) 往返一致性：FK -> X -> FK 再取回，等价于 inv_pose 是否写对 ----
-    T = kin.fk_positions(pulses_a)
+    T = kin.fk_positions(positions_a)
     T_inv = inv_pose(T)
     back = T_inv @ T
     err = float(np.max(np.abs(back - np.eye(4))))
@@ -610,8 +611,8 @@ if __name__ == "__main__":
         cal = load_calib(Xp, Kp)
         kin = Kinematics(os.path.join(here, "arm_params.json"))
         loc = EyeInHandLocalizer(cal, kin)
-        pulses = [1580, 1900, 2400, 700, 1450, 1500]
-        out = loc.localize(320.0, 240.0, pulses, plane_z=2.0)
+        positions = [460, 514, 516, 502, 494, 674]
+        out = loc.localize(320.0, 240.0, positions, plane_z=2.0)
         print("数据状态：%s" % out["flag"])
         print("示例（画面正中心像素 320,240）：x=%.2f y=%.2f z=%.2f cm，视线长 %.1f cm"
               % (out["x"], out["y"], out["z"], out["depth"]))

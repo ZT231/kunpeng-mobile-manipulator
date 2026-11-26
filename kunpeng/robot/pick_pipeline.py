@@ -27,7 +27,7 @@ README 三行法
    占位标定数据、臂还在动时拍帧、bbox 被画面裁掉、目标越软限位。
    它们都不会报错，只会让你「抓偏一点」，而抓偏是没法用眼睛判断是
    哪一环错的。所以本文件把每一个都做成**显式闸门**：宁可拒绝执行并
-   说清原因，也不发出一条自己都不信的 JOINT。
+   说清原因，也不发出一条自己都不信的 $ARM,POS。
 ③ 不这么写会怎样：会出现「命令发出去、臂动了、杯子没抓到」这种最难查的
    故障 —— 因为每一步都"成功"了。开环舵机 + 单目相机的组合里，
    唯一的真相来源是 /api/state 回读和几何自洽，不是"我觉得应该对了"。
@@ -71,8 +71,8 @@ import vlm_decider as vd                # noqa: E402  语义决策（../llm/扁�
 # 🔴 桌面就是 z=0 平面（arm_params.json 的 shoulder_height=8.1 是 J2 轴高）。
 TABLE_PLANE_Z = 0.0
 
-# 判定「臂已静止」的脉宽容差。8 µs = 软件步长 25 µs 的三分之一，
-# 比舵机死区（5 µs）略宽 —— 用它区分「还在斜坡上走」和「已经站住」。
+# 判定「臂已静止」的位置容差。8 位置单位 = 软件步长 25 位置单位 的三分之一，
+# 比舵机死区（5 位置单位）略宽 —— 用它区分「还在斜坡上走」和「已经站住」。
 STILL_TOL_US = 8
 STILL_TRIES = 4
 STILL_GAP_S = 0.35
@@ -251,7 +251,7 @@ def check_eye_ready(api_base):
 
 
 def check_serial(api_base):
-    """确认串口连着，并返回一次 /api/state 的脉宽。
+    """确认串口连着，并返回一次 /api/state 的位置。
 
     为什么先读一次：串口没 open 时后面每条命令都会失败，先探一下能把
     "没连串口"和"几何算错"两种故障分开 —— 它们的处理方式完全不同。
@@ -261,14 +261,14 @@ def check_serial(api_base):
         raise Fatal("读 /api/state 失败：%s\n"
                     "  ⇒ 串口没连？先 POST /api/open {\"port\":\"/dev/serial/by-id/"
                     "usb-1a86_USB_Serial-if00-port0\"}" % got.get("error"))
-    pulses = got.get("pulses")
-    if not (isinstance(pulses, list) and len(pulses) == 6):
-        raise Fatal("状态格式异常：%r" % (pulses,))
-    return tuple(int(p) for p in pulses)
+    positions = got.get("positions")
+    if not (isinstance(positions, list) and len(positions) == 6):
+        raise Fatal("状态格式异常：%r" % (positions,))
+    return tuple(int(p) for p in positions)
 
 
 def wait_still(api_base, tol=STILL_TOL_US, tries=STILL_TRIES, gap=STILL_GAP_S):
-    """等 6 路脉宽连续两次读数一致，返回稳定后的脉宽。
+    """等 6 路位置连续两次读数一致，返回稳定后的位置。
 
     🔴 为什么必须等：拍照和解算是两个时刻。若拍帧时臂还在斜坡上走，
        相机看到的画面和随后算坐标用的关节角**不是同一瞬间**，
@@ -289,8 +289,8 @@ def wait_still(api_base, tol=STILL_TOL_US, tries=STILL_TRIES, gap=STILL_GAP_S):
 # ---------------------------------------------------------------------------
 # 六、定位：两个底角反投影 → 桌面坐标
 # ---------------------------------------------------------------------------
-def localize_pixel(api_base, u, v, pulses, plane_z=TABLE_PLANE_Z, timeout=8.0):
-    """一个像素 + 当前脉宽 → 工作台坐标。走后端 /api/ik/eye/solve。
+def localize_pixel(api_base, u, v, positions, plane_z=TABLE_PLANE_Z, timeout=8.0):
+    """一个像素 + 当前位置 → 工作台坐标。走后端 /api/ik/eye/solve。
 
     大白话：把像素当成"从相机的眼睛射出去的一条线"，问它"打到桌面（z=0）上哪一点"。
     规范定义：d_cam = K⁻¹·[u,v,1]ᵀ；转到基座系 d_base = R_bc·d_cam；
@@ -300,7 +300,7 @@ def localize_pixel(api_base, u, v, pulses, plane_z=TABLE_PLANE_Z, timeout=8.0):
        这里只做「调接口 + 校验返回值」，单一事实来源。
     """
     payload = {"u": float(u), "v": float(v),
-               "pulses": [int(p) for p in pulses],
+               "positions": [int(p) for p in positions],
                "plane_z": float(plane_z)}
     got = http_json(api_base + "/api/ik/eye/solve", payload, timeout=timeout)
     if not got.get("ok"):
@@ -315,7 +315,7 @@ def localize_pixel(api_base, u, v, pulses, plane_z=TABLE_PLANE_Z, timeout=8.0):
     return got
 
 
-def locate_object(api_base, bbox, pulses, plane_z=TABLE_PLANE_Z):
+def locate_object(api_base, bbox, positions, plane_z=TABLE_PLANE_Z):
     """bbox → 物体底面中心在工作台的 (x, y)，顺带估一个地面宽度。
 
     返回 dict：x, y, z, span_cm, corner_a, corner_b, pixel_v
@@ -325,8 +325,8 @@ def locate_object(api_base, bbox, pulses, plane_z=TABLE_PLANE_Z):
     如果 span 算出 20cm，那多半是框歪了或是反光把轮廓拉长了。
     """
     (ua, va), (ub, vb) = bottom_corners(bbox)
-    ra = localize_pixel(api_base, ua, va, pulses, plane_z)
-    rb = localize_pixel(api_base, ub, vb, pulses, plane_z)
+    ra = localize_pixel(api_base, ua, va, positions, plane_z)
+    rb = localize_pixel(api_base, ub, vb, positions, plane_z)
 
     xa, ya = float(ra["x"]), float(ra["y"])
     xb, yb = float(rb["x"]), float(rb["y"])
@@ -533,8 +533,8 @@ def run(args):
     # ===== 阶段 1：停稳 + 拍帧 + 决策 =====
     print("-" * 66)
     print("阶段 1 · 等臂停稳 → 拍帧 → 让模型选目标")
-    pulses = wait_still(api_base)
-    print("  臂已静止，脉宽：%s" % ",".join(str(p) for p in pulses))
+    positions = wait_still(api_base)
+    print("  臂已静止，位置：%s" % ",".join(str(p) for p in positions))
 
     backend = make_backend(args.backend, args.model, args.base_url, args.model_timeout)
     t0 = time.time()
@@ -585,7 +585,7 @@ def run(args):
     # ===== 阶段 3：像素 → 桌面坐标 =====
     print("-" * 66)
     print("阶段 3 · 底边两角反投影到桌面（z=%.1f）" % TABLE_PLANE_Z)
-    loc = locate_object(api_base, bbox, pulses, plane_z=TABLE_PLANE_Z)
+    loc = locate_object(api_base, bbox, positions, plane_z=TABLE_PLANE_Z)
     print("  左底角 3D：%s" % (loc["corner_a"],))
     print("  右底角 3D：%s" % (loc["corner_b"],))
     print("  ⇒ 底面中心：x=%+.2f  y=%+.2f  z=%+.2f cm（地面宽度约 %.1f cm，前倾 %.2f°）"
@@ -615,7 +615,7 @@ def run(args):
     if getattr(args, "recipe", ""):
         # 🔴 C 方案：J1 用视觉、J2~J5 用示教。
         #    为什么这么做：实测同一点上，IK 给的下降位是 J2=1532/J4=1103，
-        #    而人工示教抓到过的是 J2=1279/J4=1850（差 253/747 µs），
+        #    而人工示教抓到过的是 J2=1279/J4=1850（旧 PWM µs 值，总线臂待重测），
         #    且 J4=1850 已顶软限位——说明 IK 模型与真实机构在那一段有系统偏差，
         #    调参消不掉。J1 反而两边一致（1673 vs 1691），所以只信 J1。
         try:
@@ -630,7 +630,7 @@ def run(args):
         r_steps = rec.get("steps") or []
         if not r_steps:
             raise Rejected("配方「%s」没有 steps" % args.recipe, code=15)
-        j1_recipe = int(r_steps[0]["pulses"][0])
+        j1_recipe = int(r_steps[0]["positions"][0])
         az_raw = math.degrees(math.atan2(loc["y"], loc["x"]))
         az_bias = float(getattr(args, "az_bias", 0.0))
         j1_vision, j1_deg, az = ap.j1_pos_from_xy(loc["x"], loc["y"],
@@ -645,9 +645,9 @@ def run(args):
                   % (az_raw, az_bias, az, j1_deg, j1_vision))
         else:
             print("    方位角 %.2f° → J1 角度 %.2f° → J1=%d"
-                  "（未补 --az-bias；实测偏小约 2.9° ⇒ 传 2.9 会让 J1 大 %.0fµs）"
+                  "（未补 --az-bias；实测偏小约 2.9° ⇒ 传 2.9 会让 J1 大 %.0f位置单位）"
                   % (az_raw, j1_deg, j1_vision, 2.9 * 9.375))
-        print("    配方示教 J1=%d，偏移 %+d µs" % (j1_recipe, offset))
+        print("    配方示教 J1=%d，偏移 %+d 位置单位" % (j1_recipe, offset))
         plan = ap.build_recipe_plan(rec, j1_offset=offset)
         notes = ["J2~J5 来自示教、J1 来自视觉方位角；不经 IK"]
     else:
@@ -765,7 +765,7 @@ def self_test():
     real_http = http_json
     try:
         http_json = fake_http
-        loc = locate_object("http://x", (100, 200, 300, 400), (1580, 1900, 2400, 700, 1450, 1500))
+        loc = locate_object("http://x", (100, 200, 300, 400), (460, 514, 516, 502, 494, 674))
         assert abs(loc["x"] - 13.0) < 1e-9, loc
         assert abs(loc["y"] - 20.0) < 1e-9, loc
         assert abs(loc["span_cm"] - 6.0) < 1e-9, loc
@@ -780,7 +780,7 @@ def self_test():
 
         http_json = fake_far
         try:
-            locate_object("http://x", (100, 200, 300, 400), (1580, 1900, 2400, 700, 1450, 1500))
+            locate_object("http://x", (100, 200, 300, 400), (460, 514, 516, 502, 494, 674))
             raise AssertionError("宽度 50cm 居然没被拒绝")
         except Rejected:
             pass
@@ -796,24 +796,24 @@ def self_test():
     names = [s.name for s in plan.steps]
     assert names[0] == "移到上方" and names[3] == "抬起", names
     assert names[4] == "移到上方" and names[7] == "抬起", names
-    assert plan.steps[0].pulses[5] == ap.JAW_OPEN
-    assert plan.steps[2].pulses[5] == ap.JAW_CLOSE
-    assert plan.steps[6].pulses[5] == ap.JAW_OPEN
+    assert plan.steps[0].positions[5] == ap.JAW_OPEN
+    assert plan.steps[2].positions[5] == ap.JAW_CLOSE
+    assert plan.steps[6].positions[5] == ap.JAW_OPEN
     for s in plan.steps:
-        assert len(s.pulses) == 6
-        for i, p in enumerate(s.pulses):
+        assert len(s.positions) == 6
+        for i, p in enumerate(s.positions):
             lo, hi = ap.SAFE_LIMITS[i]
             assert lo <= p <= hi, (s.name, i, p, lo, hi)
     assert notes and "示教值" in notes[0]
     ok += 1
     print("  ⑥ 计划：抓 4 步 + 放 4 步，J6 开→合→开，全程不越软限位 ✓")
 
-    # 7) 悬停高度真的抬高了（用 J4 脉宽间接看）
+    # 7) 悬停高度真的抬高了（用 J4 位置间接看）
     hover_hi = ap.plan_pick(10.0, 18.0, z=2.0, hover=4.0, compensate=False)
     hover_lo = ap.plan_pick(10.0, 18.0, z=2.0, hover=1.0, compensate=False)
-    assert hover_hi.steps[0].pulses != hover_lo.steps[0].pulses, "hover 没起作用"
+    assert hover_hi.steps[0].positions != hover_lo.steps[0].positions, "hover 没起作用"
     ok += 1
-    print("  ⑦ 悬停：hover 4cm 与 1cm 的接近点脉宽不同 ✓")
+    print("  ⑦ 悬停：hover 4cm 与 1cm 的接近点位置不同 ✓")
 
     print("\n✅ 自测 %d 组全过（不联网 / 不动臂 / 不需要模型）" % ok)
     return 0
@@ -858,7 +858,7 @@ def build_parser():
                          "想让 J1 对着尺子就传 2.9")
     g3.add_argument("--recipe", default="",
                     help="用示教姿态执行（C 方案）：J2~J5 取配方值、J1 由视觉方位角算。"
-                         "绕开「IK 给的 J2/J4 与真实机构差几百 µs」这个已知问题。"
+                         "绕开「IK 给的 J2/J4 与真实机构差几百 位置单位」这个已知问题。"
                          "配方名见 python3 action_primitives.py --list-recipes")
 
     g4 = p.add_argument_group("安全闸")
@@ -868,14 +868,14 @@ def build_parser():
                     help="夹爪最大开口 cm，超过只警告（默认 5.0）")
 
     g5 = p.add_argument_group("执行")
-    g5.add_argument("--yes", action="store_true", help="真的下发 JOINT")
+    g5.add_argument("--yes", action="store_true", help="真的下发 $ARM,POS")
     g5.add_argument("--dry-run", action="store_true", help="只打印计划，不发命令")
     g5.add_argument("--allow-clamp", action="store_true",
                     help="计划里有软限位裁剪也照发（默认拒绝）")
     g5.add_argument("--save-frame", default="", help="把决策用的那一帧存成 jpg")
     g5.add_argument("--dynamic-grip", action="store_true",
-                    help="合爪改用电流判据（grip_until_contact）当场决定夹持脉宽，"
-                         "不再用写死的 JAW_CLOSE=1550。需要 ACS712 已接好并标过零")
+                    help="合爪改用电压判据（grip_until_contact）当场决定夹持位置，"
+                         "不再用写死的全闭 674。需要 $ARM,VIN 电压堵转阈值已标定")
     g5.add_argument("--keep-proxy", action="store_true",
                     help="保留系统代理（默认强制直连；只有调云端 VLM 时才需要）")
     return p
