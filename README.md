@@ -188,7 +188,8 @@ RoboticArm_Kunpeng/
 │   │   └── test_voice_gateway.py 🆕 网关回归考卷：38 项 unittest，不动臂不联网
 │   ├── web/                     ✅ web_control.py 网页遥控（Flask + 滑杆 + 点选抓取）
 │   ├── llm/                     🔶 意图解析 + VLM 决策层（vlm_decider.py 只选编号不输出坐标，8 组自测过）
-│   └── docs/                    stage1_README.md 识别部署说明、A档执行计划
+│   ├── docs/                    stage1_README.md 识别部署说明、A档执行计划
+│   └── gamepad/                 🆕 手柄遥控（固件零改动）：gp_teleop.py 驾驶/机械臂双模式 + 键位表 README（✅ 本机自检/模拟通过，🔶 未实机）
 ├── esp32/                       ★支柱② ESP32-S3 语音入口（P0 核心）：14 文件骨架（含 11-14 晚新增 tcp_client.c/.h Wi-Fi TCP 上行）；成品板已可用、软件已烧录、链路已实机；口径见 esp32/README.md
 ├── iot/                         ✅ 板内可观测性闭环（EMQX→eKuiper→InfluxDB→Grafana + 真实串口遥测）：已实证，收口 e6cd194
 ├── protocol_engine_cpp/         项目 3：C++ 跨平台串口协议引擎（243 断言，三方协议金标准）

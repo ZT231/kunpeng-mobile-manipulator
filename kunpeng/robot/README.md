@@ -106,7 +106,7 @@
 
 ### 五、改 FK 之后必须重算样本（`refk_samples.py`，第五轮改动）
 
-① **用了什么语法/技术**：`json.load` 读回 `pulses` → `pulses_to_physical()` → `fk_gripper2base()`
+① **用了什么语法/技术**：`json.load` 读回 `pulses` → `positions_to_physical()` → `fk_gripper2base()`
 → 覆盖 `R_gripper2base`/`t_gripper2base`，相机侧 `R_target2cam`/`t_target2cam` 原样不动；
 自检用 `rot_angle_deg(R_old.T @ R_new)` 报"改了多大"、`dot(R_new[:,0], 工具指向)` 确认不再镜像。
 
@@ -283,13 +283,13 @@ FK 给 1.8~2.4cm，真值 26cm）—— 所以输出标签特意写成「相对�
 
 ② **为什么这么设计**：
 - **不改 `web_control.py`、不直连串口**：5000 是已实机验收的主链路（眼在手全链、14 次重复性、三条闸门都在它上面），串口由它独占，第二个进程再开串口会抢帧（标定链踩过）；本文件是**独立进程**，只通过 HTTP 调它已有的 `/api/cmd`，主链路一行不碰，**删掉即完整回滚**。
-- **只授权 `HOME / STOP / RESUME` 三个固件原生命令字**（`Core/Src/uart_protocol.c:428-451`，均回 `OK`）：它们**不带任何数值参数** ⇒ 从根上不需要软限位裁剪 / `to_pulses()` 反解 / `SAG_DZ` 净空折算，把项目里「静默夹紧」「算错符号」这些坑变成**结构上不可能**。`PICK / PLACE / MOVE_LEFT / MOVE_RIGHT` 一律 `ERR,3`、`LOOK` 为 NOOP，落实「LLM / 意图层只**提议**、本地仲裁器才**授权**」（原「快慢双通道」方案文档已删除）。
+- **只授权 `HOME / STOP / RESUME` 三个固件原生命令字**（`Core/Src/uart_protocol.c:428-451`，均回 `OK`）：它们**不带任何数值参数** ⇒ 从根上不需要软限位裁剪 / `to_positions()` 反解 / `SAG_DZ` 净空折算，把项目里「静默夹紧」「算错符号」这些坑变成**结构上不可能**。`PICK / PLACE / MOVE_LEFT / MOVE_RIGHT` 一律 `ERR,3`、`LOOK` 为 NOOP，落实「LLM / 意图层只**提议**、本地仲裁器才**授权**」（原「快慢双通道」方案文档已删除）。
 - **默认 dry-run，`--apply` 才真下发**：把「会不会动臂」从「靠人记」变成显式开关，与 `eye_check.py` 三条入场闸门同一思路。
 - **急停最优先**：文本匹配放在 `parse_intent()` 之前，不等一个可能返回 `unknown` 的翻译员；`$ESTOP*CK` / `$RESUME*CK` 走 `special_text()` 快速通道，否则会被 `parse_frame()` 判 `NOT_ASR` 丢掉。
 - 规范定义：本模块是**协议适配层（Gateway / Anti-Corruption Layer）+ 本地仲裁器（Local Arbiter）**，隔离外部语音协议与内部执行链路；互斥量保护共享可变状态避免竞态条件。
 
 ③ **不这么写会怎样**：
-- 按路线图原写法直接下发 `$JOINT,...` ⇒ 一步踩进脉宽越界、`to_pulses()` 符号、软限位静默夹紧、下垂净空折算四个雷区（阶段 2 判据已据此订正，见 `docs/排障记录-语音网关.md` 第 5 条）。
+- 按路线图原写法直接下发 `$JOINT,...` ⇒ 一步踩进脉宽越界、`to_positions()` 符号、软限位静默夹紧、下垂净空折算四个雷区（阶段 2 判据已据此订正，见 `docs/排障记录-语音网关.md` 第 5 条）。
 - 把归一化塞进 `text_gateway.parse_frame()` ⇒ 牵动它 18 项既有单测，且底层纯函数不该替调用方猜格式；shell 单引号里的 `\r\n` 是 4 个普通字符，好帧会被判 `bad_ck_len`（本次真踩到）。
 - 多线程 TCP 下急停标志不上锁 ⇒ A 刚判完「没急停」、B 紧接着发急停会漏判；`nohup` 重定向时 `print` 不 `flush` ⇒ 日志看不见（11-14 启动事故同源）。
 - 只看 `/api/cmd` 的 `ok:true` 不看 `resp` ⇒ 把「帧写进串口」当成「固件执行成功」（`action_primitives.send_joint()` 同一套口径）；Flask 没起时不兜异常 ⇒ 客户端连接直接断、收不到任何应答。
@@ -643,7 +643,7 @@ b) `EMERGENCY_WORDS` 含裸词「急停」，而 `RESUME_WORDS` 里的「解除�
 
 - `json` 读配置 + `os.path.dirname(os.path.abspath(__file__))` 定位同目录文件（不受当前工作目录影响）；
 - 复用已有 `Step` / `Plan` dataclass 与 `run_plan()`，回读确认、超时、通信异常**一行都不重写**；
-- `jaw_for_width()` 两个实测点线性插值，`int(round(...))` 后交给 `clip_pulses()` 兜软限位。
+- `jaw_for_width()` 两个实测点线性插值，`int(round(...))` 后交给 `clip_positions()` 兜软限位。
 
 **② 为什么这么设计**
 
@@ -714,7 +714,7 @@ python3 action_primitives.py --yes grip         # 真合爪，打印停住的 J6
 示教验证过的抓取姿态是 `J2=1279、J4=1850`（tilt≈96），两者差 250~750 µs。
 
 **C 方案 `--recipe <名字>`（11-16 新增）**：J1 用视觉、J2~J5 用示教。
-`ArmIK.j1_pulse_for_xy()` 只用方位角算 J1——工作台原点在 J1 轴心上，所以 J1 与臂伸多远、
+`ArmIK.j1_pos_for_xy()` 只用方位角算 J1——工作台原点在 J1 轴心上，所以 J1 与臂伸多远、
 倾角多少、够不够得到**无关**，也不需要 `solve()` 成功（solve 常因 J2~J4 越界失败，那跟 J1 没关系）。
 实测三点校验：`(−5.26,25.0)→1691`（与当初示教一致）、`(−4.19,23.65)→1674`（IK 给 1673）、
 `(0,25.0)→1580`（正好是初始位的 J1）。⚠️ 只修 J1 意味着**径向距离仍锁死在示教工位**，

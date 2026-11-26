@@ -4,6 +4,7 @@
 MDK-ARM/RoboticArm_Kunpeng/
 MDK-ARM/*.lst
 MDK-ARM/build_log*.txt
+MDK-ARM/build.log
 MDK-ARM/JLinkLog.txt
 MDK-ARM/*.uvguix.*
 MDK-ARM/*.uvoptx
