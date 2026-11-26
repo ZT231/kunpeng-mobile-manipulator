@@ -23,11 +23,11 @@ voice_gateway.py —— 鲲鹏侧语音入口网关（阶段 2 / B 项，2026-11
 
 🔴 为什么只发 HOME / STOP / RESUME 三个命令字（最重要的一条架构判断）：
   固件 `Core/Src/uart_protocol.c:428-451` 原生支持 PING/STATE/**HOME/STOP/RESUME**/JOINT，
-  且都回 `OK`。这三个命令字**不带任何数值参数** ⇒ 从根上不需要「软限位裁剪 / to_pulses()
+  且都回 `OK`。这三个命令字**不带任何数值参数** ⇒ 从根上不需要「软限位裁剪 / to_positions()
   反解校验 / 重力下垂净空折算」，也就不会踩项目里那些「静默夹紧」「算错符号」的坑。
   意图层的 PICK / PLACE / MOVE_LEFT / MOVE_RIGHT 一律**不授权**：
     - PICK/PLACE：需要先定位 + 抓取序列（未实现），且涉及下降高度与 SAG_DZ 净空闸门；
-    - MOVE_*：相对位移要读 STATE + 逐轴软限位 + to_pulses() 反解，属未授权的脉宽改写；
+    - MOVE_*：相对位移要读 STATE + 逐轴软限位 + to_positions() 反解，属未授权的脉宽改写；
     - LOOK：只观察、不下发（会说话的东西不该动臂）。
   ⇒ 「会动的东西」被收敛成三个无参数命令字，这是把风险从「靠人记」变成「结构上不可能」。
 
@@ -328,7 +328,7 @@ def arbitrate(text, estop_active=False):
         return ArbiterVerdict(reason="非 mock 来源，阶段 2 未验证该链路 ⇒ 不授权",
                               err_code=ERR_ARBITER, command=cmd)
 
-    # ⑤ 量程闸门：带数值参数的动作需要逐轴软限位 + to_pulses() 反解，未实现 ⇒ 不授权
+    # ⑤ 量程闸门：带数值参数的动作需要逐轴软限位 + to_positions() 反解，未实现 ⇒ 不授权
     if cmd["params"]:
         return ArbiterVerdict(reason="带数值参数的动作需量程闸门（软限位 + 反解），未授权",
                               err_code=ERR_ARBITER, command=cmd)
@@ -349,7 +349,7 @@ def arbitrate(text, estop_active=False):
                               err_code=ERR_ARBITER, command=cmd)
 
     if action in ("move_left", "move_right"):
-        return ArbiterVerdict(reason="相对位移需读 STATE + 逐轴软限位裁剪 + to_pulses() 反解，未授权",
+        return ArbiterVerdict(reason="相对位移需读 STATE + 逐轴软限位裁剪 + to_positions() 反解，未授权",
                               err_code=ERR_ARBITER, command=cmd)
 
     if action == "unknown":

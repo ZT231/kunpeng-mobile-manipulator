@@ -431,7 +431,7 @@ def interactive_menu(host: ArmHost, duration_s: float, out_dir: str):
  [13]  CLEAR       清空轨迹
  [14]  LOG开关      周期遥测开关 (输入 0/1)
  [15]  一键示教回放 (记录 %.0f s + 回放 + 对比图)
- [16]  SCAN姿态    移动到扫描姿态 (读同目录 scan_config.json 的 scan_pulses)
+ [16]  SCAN姿态    移动到扫描姿态 (读同目录 scan_config.json 的 scan_positions)
  [17]  SCAN保存    把当前 6 路脉宽保存为扫描姿态 (眼在手用)
  [q]   退出
 ------------------------------------------------------"""
@@ -488,15 +488,15 @@ def interactive_menu(host: ArmHost, duration_s: float, out_dir: str):
                 run_teach_playback(host, duration_s, out_dir)
             elif k == "16":
                 cfg = _load_scan_cfg()
-                sp = cfg.get("scan_pulses")
+                sp = cfg.get("scan_positions")
                 if isinstance(sp, list) and len(sp) == 6:
                     print("  扫描姿态 ->", host.joint(*[int(p) for p in sp]))
                 else:
-                    print("  vision/config.json 无 scan_pulses：先用 [8] JOINT 摆到扫描姿态，再按 [17] 保存")
+                    print("  vision/config.json 无 scan_positions：先用 [8] JOINT 摆到扫描姿态，再按 [17] 保存")
             elif k == "17":
                 _, p = host.state_pulses()
                 cfg = _load_scan_cfg()
-                cfg["scan_pulses"] = p
+                cfg["scan_positions"] = p
                 with open(_scan_cfg_path(), "w", encoding="utf-8") as f:
                     json.dump(cfg, f, indent=2, ensure_ascii=False)
                 print("  已保存扫描姿态 %s -> %s" % (p, _scan_cfg_path()))

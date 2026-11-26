@@ -107,7 +107,7 @@ _IK_MAP = {
     "span_y": 22.5,        # 画面高度对应工作台多少 cm（4:3 时约 span_x*3/4）
     "center_x": 0.0,       # 画面中心对应的工作台 x（cm）
     "center_y": 18.0,      # 画面中心对应的工作台 y（cm），正前方
-    "z": 2.0,              # 抓取高度 cm（init_ik 成功后用 arm_params.json 的 grab_height 覆盖）
+    "z": 2.0,              # 抓取高度 cm（默认值，深度相机/前端可覆盖）
     "tilt": 0.0,           # 夹爪前倾角（度），0 = 垂直向下
     "claw": 0.0,           # J6 夹爪开合（度），0 = 闭合
     "wrist": 0.0,          # J5 夹爪朝向（度）
@@ -124,7 +124,6 @@ def init_ik(ik_dir):
         from arm_ik import ArmIK
         _IK = ArmIK()          # 默认读同目录 arm_params.json；标定文件全程只读
         _IK_ERROR = ""
-        _IK_MAP["z"] = _IK.grab_h
         return True
     except Exception as e:
         _IK = None
@@ -148,7 +147,7 @@ def pixel_to_table(u, v, w, h):
     return x, y
 
 
-def solve_to_pulses(x, y):
+def solve_to_positions(x, y):
     """工作台 (x,y) -> 6 路脉宽，并裁到固件软限位 PULSE_RANGES。
 
     返回 (pulses, clamped)：clamped 列出被裁的关节，供页面提示「目标超出可达范围」。
@@ -159,7 +158,7 @@ def solve_to_pulses(x, y):
         raise RuntimeError(_IK_ERROR or "逆解模块未就绪")
     angles = _IK.solve(x, y, z=_IK_MAP["z"], wrist=_IK_MAP["wrist"],
                        claw=_IK_MAP["claw"], tilt=_IK_MAP["tilt"])
-    raw = _IK.to_pulses(angles)
+    raw = _IK.to_positions(angles)
     pulses, clamped = [], []
     for i, p in enumerate(raw):
         lo, hi, _ = PULSE_RANGES[i]
@@ -192,7 +191,7 @@ _EYE_INFO = {              # 给页面显示的元数据（是否占位、文件
     "x_path": "",
     "k_path": "",
 }
-_EYE_PLANE_Z = None        # 抓取平面高度 cm；None = 用 arm_params.json 的 grab_height
+_EYE_PLANE_Z = None        # 抓取平面高度 cm；None = 用 _IK_MAP["z"]（默认 2.0，深度相机可覆盖）
 
 # 定位径向系统偏差修正系数（2026-11-13 实测标定，只用于「眼在手」这条链）。
 #
@@ -1031,7 +1030,7 @@ PAGE = r"""
           </div>
           <div class="cf">
             <label for="ik_z"><b>z</b> · 抓取高度 (cm)</label>
-            <input type="text" id="ik_z" placeholder="如 2" title="抓取高度；逆解模块就绪后会被 arm_params.json 的 grab_height 覆盖">
+            <input type="text" id="ik_z" placeholder="如 2" title="抓取高度 cm（深度相机可给）">
           </div>
         </div>
         <div class="row" style="margin-top:8px">
@@ -1862,7 +1861,7 @@ def api_config():
 
 
 # ---------------------------------------------------------------------------
-# A 方案：点选抓取的三个接口（逆解实现见文件顶部 _IK / pixel_to_table / solve_to_pulses）
+# A 方案：点选抓取的三个接口（逆解实现见文件顶部 _IK / pixel_to_table / solve_to_positions）
 #
 # ① 用了什么语法：Flask 路由 + request.get_json + 字典组装 jsonify + 分层 try/except。
 # ② 为什么这么设计：拆成「看状态 / 改标定 / 解算」三个独立接口，且解算默认
@@ -1935,7 +1934,7 @@ def api_ik_eye_solve():
         pulses = [int(p) for p in pulses]
 
     plane_z = data.get("plane_z")
-    plane_z = float(plane_z) if plane_z is not None else _EYE_PLANE_Z
+    plane_z = float(plane_z) if plane_z is not None else (_EYE_PLANE_Z if _EYE_PLANE_Z is not None else _IK_MAP["z"])
 
     try:
         est = _EYE.localize(u, v, pulses, plane_z=plane_z)
@@ -1976,13 +1975,13 @@ def api_ik_eye_solve():
         try:
             tilt = float(_tilt_req)
         except (TypeError, ValueError):
-            tilt = _IK.tilt_from_pulses(pulses)
+            tilt = _IK.tilt_from_positions(pulses)
     else:
-        tilt = _IK.tilt_from_pulses(pulses)
+        tilt = _IK.tilt_from_positions(pulses)
     try:
         angles = _IK.solve(x, y, z=z, wrist=_IK_MAP["wrist"],
                            claw=_IK_MAP["claw"], tilt=tilt)
-        raw = _IK.to_pulses(angles)
+        raw = _IK.to_positions(angles)
     except Exception as e:
         return jsonify(ok=False, error="逆解失败：%s" % e, tilt=tilt,
                        x=round(x, 2), y=round(y, 2), z=round(z, 2),
@@ -2084,7 +2083,7 @@ def api_ik_solve():
         x, y = pixel_to_table(
             float(data.get("u", 0)), float(data.get("v", 0)),
             float(data.get("w", 0)), float(data.get("h", 0)))
-        pulses, clamped = solve_to_pulses(x, y)
+        pulses, clamped = solve_to_positions(x, y)
     except (ValueError, RuntimeError) as e:
         # 目标过近 / 超出可达范围 / 逆解模块没就绪，都归成「能看懂的一句话」
         return jsonify(ok=False, error=str(e))
@@ -2206,7 +2205,7 @@ def main():
     ap.add_argument("--intrinsics", default="", metavar="FILE",
                     help="相机内参文件，默认 <ik-dir>/camera_intrinsics.json")
     ap.add_argument("--plane-z", type=float, default=None, metavar="CM",
-                    help="抓取平面高度 cm；默认用 arm_params.json 的 grab_height")
+                    help="抓取平面高度 cm（深度相机给；缺省用默认 z=2.0）")
     ap.add_argument("--radial-fix", type=float, default=None, metavar="K",
                     help="眼在手定位的径向修正系数：默认 %.3f（实测值）；给 1.0 关闭；"
                          "换相机安装/重标手眼 X 后必须重测" % _EYE_RADIAL_K)
