@@ -245,7 +245,7 @@ def describe_pose(pulses):
         ang = None
         txt = "(FK 算不出来：%s)" % e
     # J4 = tilt（0=垂直向下）。to_angles 给的是**相对角**，tilt 要按
-    # arm_ik.to_pulses 的逆运算还原：tilt = ang4 + 180 + ang3（别直接拿 ang4 当倾角）。
+    # arm_ik.to_positions 的逆运算还原：tilt = ang4 + 180 + ang3（别直接拿 ang4 当倾角）。
     try:
         tilt = ang[3] + 180.0 + ang[2]
         claw = "前倾 %.0f°（J4=%d）" % (tilt, pulses[3])
@@ -364,7 +364,7 @@ def do_hover(api, x, y, h, cur_pulses, tilt, bias=(0.0, 0.0), plane_z=0.0, tip_d
         tx += float(tip_dx)
     try:
         ang = ik.solve(tx, ty, z=float(h), tilt=float(tilt or 0.0))
-        tgt = [int(round(p)) for p in ik.to_pulses(ang)]
+        tgt = [int(round(p)) for p in ik.to_positions(ang)]
     except Exception as e:
         print("  ⚠ 悬停逆解失败（x=%+.2f y=%+.2f z=%.2f）：%s" % (tx, ty, h, e))
         print("     把棋盘朝 J1 挪 1~2 cm 再跑；或加 --tilt 10 放宽可达半径")

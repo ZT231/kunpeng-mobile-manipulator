@@ -106,9 +106,10 @@ ARM_L1 = 10.6
 ARM_L2 = 14.6
 ARM_L3 = 17.0
 ARM_H = 8.1
-# 腕部偏心（夹取点相对 J5 轴线的横向偏移 cm，与 arm_params.json 一致；新臂重测后改）
-ARM_WRIST_ECC = 1.0
-ARM_ECC_DIR = 0.0
+# 腕轴固定侧偏（J5 旋转轴线偏离臂中心线的横向距离 cm，与 arm_params.json 一致；
+# 2026-11-26 实测 0.95cm，不随 J5 滚转，只随基座方位转。左/右方向待实测 ±90）
+ARM_WRIST_ECC = 0.95
+ARM_ECC_DIR = 90.0
 
 
 # ---------------------------------------------------------------------------
@@ -169,10 +170,10 @@ def fk_gripper2base(angles_deg):
     y = radial * math.sin(t1)
     z = vert
 
-    # 腕部偏心补偿（与 ik.forward 同公式）：夹取点相对 J5 轴线偏了 wrist_ecc，
-    # 方向随基座方位+腕旋转+ecc_dir 旋转。tilt = 腕俯仰 th4（竖直向下=0）。
+    # 腕轴固定侧偏补偿（与 ik.forward 同公式）：J5 轴线偏离臂中心线 wrist_ecc，
+    # 方向只随基座方位+ecc_dir 转，不随 J5 滚转。tilt = 腕俯仰 th4（竖直向下=0）。
     if ARM_WRIST_ECC > 1e-6:
-        psi = math.radians(angles_deg[0] + 90.0 + angles_deg[4] + ARM_ECC_DIR)
+        psi = math.radians(angles_deg[0] + 90.0 + ARM_ECC_DIR)
         ec = ARM_WRIST_ECC * math.cos(math.radians(angles_deg[3]))
         x += ec * math.cos(psi)
         y += ec * math.sin(psi)
@@ -194,11 +195,11 @@ def fk_gripper2base(angles_deg):
     return T
 
 
-def pulses_to_physical(pulses, ik):
+def positions_to_physical(pulses, ik):
     """6 路脉宽(us) → 6 路物理关节角(度)，喂给 fk_gripper2base 用。
 
     串口 STATE 读上来的是脉宽；arm_ik.ArmIK.to_angles 返回的是"舵机相对角"
-    （J3=相对大臂、J4=相对小臂，见 ik.py 的 to_pulses 补偿逻辑），不是物理绝对角。
+    （J3=相对大臂、J4=相对小臂，见 ik.py 的 to_positions 补偿逻辑），不是物理绝对角。
     这里做它的逆运算还原成物理角：
         θ1 = s1
         θ2 = s2
@@ -1001,7 +1002,7 @@ def cmd_collect(args):
                 print("  状态读取失败（%s），本组跳过" % e)
                 next_t = now + args.interval
                 continue
-            phys = pulses_to_physical(pulses, ik)
+            phys = positions_to_physical(pulses, ik)
             T = fk_gripper2base(phys)
             R_g2b = T[:3, :3]
             t_g2b = T[:3, 3] / 100.0        # cm → m，和相机侧单位一致

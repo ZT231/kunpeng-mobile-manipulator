@@ -84,7 +84,7 @@ def refk(samples, ik, verbose=True):
             if verbose:
                 print("%3d  缺少 pulses，跳过" % i)
             continue
-        phys = hc.pulses_to_physical([int(p) for p in pulses], ik)
+        phys = hc.positions_to_physical([int(p) for p in pulses], ik)
         T = hc.fk_gripper2base(phys)
         R_new = T[:3, :3]
         t_new = T[:3, 3] / 100.0            # cm → m，与相机侧单位一致
