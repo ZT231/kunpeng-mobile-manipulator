@@ -320,9 +320,11 @@ class ServoArm:
             else:
                 nt = t + j["dir"] * v * step
                 nt = min(hi, max(lo, nt))
-            if abs(nt - t) >= 0.4:
+            if abs(nt - t) > 1e-9:
                 j["target"] = nt
-                self._dirty[name] = True
+                # 目标连续积分；只有「取整后的舵机位置」变了才发帧 —— 小推力也能累积成一格
+                if int(round(nt)) != int(round(t)):
+                    self._dirty[name] = True
 
     def home_step(self, dt, scale=1.0):
         '''一键回 HOME：每拍向 home 靠，全部到位返回 True（home 必在 [lo,hi] 内，不会越界）'''
@@ -353,18 +355,21 @@ class ServoArm:
             self.ser.reset_input_buffer()       # 丢掉上一拍残留/回声
         except Exception:
             pass
-        self._tx(j["id"], SB_CMD_POS_READ)
-        buf = bytearray()
-        t0 = time.monotonic()
-        while time.monotonic() - t0 < timeout:
-            n = self.ser.in_waiting
-            if n:
-                buf.extend(self.ser.read(n))
-                pos = parse_pos_reply(buf)
-                if pos is not None:
-                    return pos
-            else:
-                time.sleep(0.002)
+        try:
+            self._tx(j["id"], SB_CMD_POS_READ)
+            buf = bytearray()
+            t0 = time.monotonic()
+            while time.monotonic() - t0 < timeout:
+                n = self.ser.in_waiting
+                if n:
+                    buf.extend(self.ser.read(n))
+                    pos = parse_pos_reply(buf)
+                    if pos is not None:
+                        return pos
+                else:
+                    time.sleep(0.002)
+        except Exception:                        # 串口被拔/写超时：当读回失败处理，不炸主循环
+            return None
         return None
 
     def adopt(self, name, pos):
@@ -975,7 +980,7 @@ def main():
     ap.add_argument("--car-port", default=CAR_PORT_DEFAULT, help="底盘 CH341 串口")
     ap.add_argument("--arm-port", default=None, help="总线舵机转接板串口；不给=只控底盘")
     ap.add_argument("--arm-home", action="store_true", help="读回失败时，允许以配置 HOME 为起点")
-    ap.add_argument("--dry-run", action="store_true", help="只打印帧，不写串口")
+    ap.add_argument("--dry-run", action="store_true", help="只打印速度摘要，不写串口")
     ap.add_argument("--probe", action="store_true", help="认键模式：打印原始轴/键编号")
     ap.add_argument("--list", action="store_true", help="列出手柄节点与串口")
     ap.add_argument("--selftest", action="store_true", help="离线自检：配置/帧/回包/限位/回零，不碰硬件")
