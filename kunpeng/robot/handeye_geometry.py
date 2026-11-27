@@ -466,14 +466,16 @@ def selftest(verbose=True):
     PLANE_Z = 2.0   # 合成数据自检的桌面高度 cm，与真实抓取无关（真实高度由深度相机给）
 
     # ---- 1) 编一份"已知答案"的标定数据 ----
-    # X：相机装在末端上，光轴朝下（绕 Y 轴转 180°，即"倒挂俯视桌面"），
-    #    再偏 x 1.5cm、抬 z 3cm —— 这是 eye-in-hand 真实装法，光轴必须指向桌面，
-    #    否则相机根本看不见标定板（第一版自检用 15° 俯角就踩了这个坑，光轴朝上）。
+    # X：与 gen_placeholder_calib.py 的**名义安装假设保持一致**（绕 Y 转 180°、t=(0,+2,+3)cm），
+    #    这样自检、占位 JSON、mock 测试三处用的是同一套假设，改一处不会互相打架。
+    #    🔴 2026-11-27 修正：姿态不能再用六轴零位 —— 总线臂零位是「整臂竖直、爪朝上」，
+    #    这副 X 在该姿态下光轴是水平的（与桌面平行），求交无解 ⇒ 自检 2 全跳过、自检直接失败。
+    #    改用「爪朝下」的抓取位（见下），相机也就朝下看桌面了。
     th = math.radians(180.0)
-    Rz15 = np.array([[math.cos(th), 0, math.sin(th)],
-                     [0, 1, 0],
-                     [-math.sin(th), 0, math.cos(th)]], dtype=float)
-    X_true = pose_from_rt(Rz15, [0.015, 0.0, 0.03])
+    R_tool2cam = np.array([[math.cos(th), 0, math.sin(th)],
+                           [0, 1, 0],
+                           [-math.sin(th), 0, math.cos(th)]], dtype=float)
+    X_true = pose_from_rt(R_tool2cam, [0.0, 0.02, 0.03])
     K_true = np.array([[600.0, 0.0, 320.0],
                        [0.0, 600.0, 240.0],
                        [0.0, 0.0, 1.0]], dtype=float)
@@ -487,13 +489,14 @@ def selftest(verbose=True):
     kin = Kinematics(params)
     loc = EyeInHandLocalizer(cal, kin)
 
-    # ---- 2) 选两个真实可达的臂姿（用初始位位置，FK 出来一定在合理范围内）----
-    # 🔴 旧 PWM 初始位 [1580,1900,2400,700,1450,1500] 已作废；总线零位见下。
-    positions_a = [460, 514, 516, 502, 494, 674]   # 总线六轴零位（2026-11-26 实测）
-    positions_b = [560, 514, 516, 502, 494, 674]   # J1 +100 位置单位 侧摆（待实机确认）
+    # ---- 2) 选两个「爪朝下、相机看得见桌面」的合成臂姿 ----
+    # 🔴 不能用六轴零位：总线臂零位是「整臂竖直、爪朝上」，相机光轴与桌面平行，求交无解。
+    # 这里用两个抓取位（J2 前倾 / J3 后折 / J4 把爪压向桌面），位置都在 0~1000 内、不碰软限位。
+    positions_a = [460, 620, 420, 200, 494, 674]   # 抓取位 A（J1=零位）：相机近垂直朝下，交点距 J1 约 19cm
+    positions_b = [560, 620, 420, 200, 494, 674]   # 抓取位 B（J1 +100 位置单位 侧摆）
     ok_all = True
 
-    for tag, positions in (("A 初始位", positions_a), ("B 侧摆位", positions_b)):
+    for tag, positions in (("A 抓取位", positions_a), ("B 侧摆位", positions_b)):
         T_be = kin.fk_positions(positions)
         # 反推"相机在哪、朝哪"，再手工造一个桌面上的目标点，正投影成像素
         T_be_m = T_be.copy()
@@ -533,9 +536,9 @@ def selftest(verbose=True):
                  "PASS" if good else "FAIL"))
 
     # ---- 4) 占位标记必须能透传到结果里（防止把占位当实测）----
-    # 用自检 2 里实际算出的那个合法像素，别硬编码 (320,240)——初始位下画面中心
-    # 并不在桌面上（相机朝前而不是朝下），硬编码会得到"交点在背后"。
-    ok_ph, note_ph = _probe_visible_pixel(loc, cal, kin, positions_a)
+    # 用自检 2 里实际算出的那个合法像素，别硬编码 (320,240)——换回六轴零位时，
+    # 画面中心并不落在桌面上（相机朝前而不是朝下），硬编码会得到"交点在背后"。
+    ok_ph, note_ph = _probe_visible_pixel(loc, cal, kin, positions_a, PLANE_Z)
     if not ok_ph:
         print("自检 3：无法构造视野内的像素：%s  FAIL" % note_ph)
         ok_all = False

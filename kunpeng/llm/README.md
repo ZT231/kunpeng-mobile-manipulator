@@ -102,10 +102,10 @@ python3 -m unittest discover -s . -p "test_*.py" -v
 - ✅ 能写：「自然语言 → 结构化动作指令的**意图解析层**，mock 实现 + 单元测试通过；契约定死、后端可替换」；「搭建了 ESP32 文本入口的**离线网关**，复用统一串口帧协议与 XOR 校验，44 项单元测试通过」。
 - ✅ 能写（P2，2026-11-11）：「**VLM 语义决策层**：本地检测器出候选，模型只从候选里选编号，坐标交给几何链路；越界编号/非法枚举一律拒绝执行，8 组端到端自测通过」。
 - ❌ 不能写：「接入了云端大模型」「自然语言控制机械臂已实现」「语音→动作闭环」「自动抓取」「已接 ESP32-S3 语音链路 / 语音控制已实现」。
-- ❌ 不能写（P2 专项）：「端到端具身智能」「VLA」。本项目是**分层**：模型出符号（选哪个），几何出坐标（在哪），执行层是开环脉宽。三者是三个模块，靠 JSON 串起来，不是一条神经网络端到端训出来的。
+- ❌ 不能写（P2 专项）：「端到端具身智能」「VLA」。本项目是**分层**：模型出符号（选哪个），几何出坐标（在哪），执行层是**总线舵机位置闭环**（`$ARM,POS` + `$ARM,READ` 回读）。三者是三个模块，靠 JSON 串起来，不是一条神经网络端到端训出来的。
 - `vlm_decider.py` **只产出决策，不执行动作**。它和执行层 `action_primitives.py`（P1）**还没有接成一条自动链路** —— 中间那一步「决策 → `/api/ik/solve` → pick」由人工串。
 - 两个模块都**只输出结构化指令，不下发**。`text_gateway.py` 的帧格式 `$ASR,<文本>*<CK>\r\n` 是**建议草案、未与 ESP32 实机对齐、未接真串口**；模块里没有下发函数、不联网、不读 Key。
-- 当前真正能执行的是「人点画面 → `ArmIK` 逆解 → `$JOINT` 串口帧」这条**开环**链路；自动抓取、下降-闭合-抬起序列、视觉伺服闭环都还没做。
+- 当前真正能执行的是「人点画面 → `ArmIK` 逆解 → `$ARM,POS` 串口帧 → 总线舵机位置闭环」这条链路（旧 PWM 时代的"开环脉宽"口径已作废）；自动抓取、视觉伺服闭环仍没做，`action_primitives.pick()` 的下降-闭合-抬起序列只是**离线自测过**。
 - 枚举里**故意没有 `NAV`**：车体 / 导航是阶段 6，命中导航词一律 `unknown` + warning。
 - `CloudBackend` 是占位，`parse()` 直接抛 `NotImplementedError`；`LLM_API_KEY` 只走环境变量，**绝不写进代码**（`kunpeng/docs/A档执行计划.md` L54）。
 - `params` 恒为空：mock 不猜数值，猜了就是假数据。
@@ -120,8 +120,8 @@ python3 -m unittest discover -s . -p "test_*.py" -v
 | 6 P2→P1 串联 | 决策的 `params.center` → `web_control` 的 `/api/ik/eye/solve` → `action_primitives.pick()` | 📋 待真模型跑通后做 |
 | 6 P3 闭环 | 执行后重新 `/observe` → 问 VLM「原来的物体还在吗」→ 在则换抓取点重试 | 📋 纯规划 |
 | 3 ESP32-S3 语音 | ASR 文本按 `$ASR,<文本>*<CK>\r\n` 发鲲鹏 → `text_gateway.parse_frame()` → `parse_intent()` | 🔶 成品板已到、离线网关已跑通；**未接真串口 / 未下发** |
-| **2 鲲鹏侧收帧服务（11-14 B 项）** | `../robot/voice_gateway.py`：TCP `:9000` 收帧 → 复用本模块 `parse_frame` / `parse_intent` → **本地仲裁白名单** → `/api/cmd` 下发固件原生 `HOME/STOP/RESUME` | ✅ **阶段 2 网关链路 11-14 16:40 已上板实机验证**（**38 项本机 unittest 全绿** + 四层硬判据全绿，记录见 `docs/上板验收-语音网关阶段2.md`）；🔴 ESP32 已接入（发 `$ESTOP/$RESUME` 自检帧）、`$ASR` 帧草案未对齐（语音入口整体仍 🔶）；默认 dry-run、只授权三个无参数命令字；排障见 `docs/排障记录-语音网关.md` |
-| 4 端到端闭环 | 结构化指令 → 鲲鹏决策 → `/api/ik/solve` 或 `$JOINT` → STM32 | 📋 纯规划 |
+| **2 鲲鹏侧收帧服务（11-14 B 项）** | `../robot/voice_gateway.py`：TCP `:9000` 收帧 → 复用本模块 `parse_frame` / `parse_intent` → **本地仲裁白名单** → `/api/cmd` 下发固件原生 `ARM,HOME/ARM,STOP/ARM,RESUME` | ✅ **阶段 2 网关链路 11-14 16:40 已上板实机验证**（**38 项本机 unittest 全绿** + 四层硬判据全绿，记录见 `docs/上板验收-语音网关阶段2.md`）；🔴 ESP32 已接入（发 `$ESTOP/$RESUME` 自检帧，进 STM32 前需改写成 `$ARM,STOP/$ARM,RESUME`）、`$ASR` 帧草案未对齐（语音入口整体仍 🔶）；默认 dry-run、只授权三个无参数命令字；排障见 `docs/排障记录-语音网关.md` |
+| 4 端到端闭环 | 结构化指令 → 鲲鹏决策 → `/api/ik/solve` 或 `$ARM,POS` → STM32 | 📋 纯规划 |
 | 1.2 IoT | 指令可经 MQTT 下发（复用 `device/<id>/telemetry` 之外的命令主题） | 📋 纯规划 |
 
 ## 七、文件清单

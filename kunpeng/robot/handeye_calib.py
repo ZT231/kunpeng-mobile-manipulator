@@ -328,8 +328,8 @@ _STATUS_NOTE = {
 _STATUS_ADVICE = {
     STATUS_OK: "",
     STATUS_WEAK: "多摆几个「转轴不同、角度更大」的姿态重采（J1 与 J4 都要覆盖，别只绕一个轴）",
-    STATUS_NO_SOLUTION: "不是多摆几个姿态能救的：先查 J4 重力下垂、标定板是否被碰动、"
-                        "arm_params.json 的位置↔角度映射是否与实际相符",
+    STATUS_NO_SOLUTION: "不是多摆几个姿态能救的：先查 J4 是否被限位/夹住走不到位、"
+                        "标定板是否被碰动、arm_params.json 的位置↔角度映射是否与实际相符",
 }
 
 

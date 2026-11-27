@@ -168,9 +168,9 @@ def main():
 
     # ---- 用例 9：best_tilt 返回不越软限位的可行姿态 ----
     got = ap.best_tilt(-5.0, 25.0, 2.0)
-    assert got is not None, "(-5, 25) 在 41~96° 内找不到可行姿态"
+    assert got is not None, "(-5, 25) 在 0~90° 内找不到可行姿态"
     bt, bp = got
-    assert bt > 41.0, bt
+    assert 0.0 <= bt <= 90.0 and bt > 0.0, bt
     for i, v in enumerate(bp):
         lo, hi = ap.SAFE_LIMITS[i]
         assert lo <= v <= hi, (i, v, lo, hi)

@@ -78,8 +78,7 @@ JAW_CLOSE = 674          # 仅作「默认全闭」占位；真实抓取闭合�
 JAW_CLOSED_MAX = 674     # 完全闭合（软限位上限）
 
 # 到位判据：6 路位置与目标的差都 ≤ 这个值就算到了（8 位置单位 ≈ 2°）。
-# 🔴 旧 ARRIVE_TOL_US 的「µs 容差」已废弃：这里保留变量名仅避免大改引用，语义已是位置单位。
-ARRIVE_TOL_US = 8
+ARRIVE_TOL_POS = 8
 
 # 开合爪到位后再停一下，让舵机扭矩建立/释放。
 # 有 wait_jaw 兜着，这里只需很短 —— 0.6 s 是 wait_jaw 之前留下的旧值，
@@ -207,13 +206,15 @@ def jaw_for_width(width_cm, grip_ref_positions=674, ref_cm=0.0,
                      + (float(ref_cm) - float(width_cm)) * pos_per_cm))
 
 
-def best_tilt(x, y, z, ik=None, prefer=96.0, floor=41.0, step=2.0,
+def best_tilt(x, y, z, ik=None, prefer=90.0, floor=0.0, step=2.0,
               j3_margin=60):
     """给一个目标点，找「最接近水平、且 6 路都不越软限位」的 tilt。
 
     为什么需要它：抓竖直圆柱时爪指越接近水平越稳，但 J4 有软限位。
-    🔴 旧 PWM 臂实测（tilt=41→J4=1230µs、75→1851µs、96→2257µs）已作废，
-    总线舵机 J4 软限位按 SAFE_LIMITS 重新扫描，不能照搬旧值。
+    扫描上界取 90°（爪指恰好水平，纯物理含义）；**旧 PWM 臂的 96°/41° 端点已作废**，
+    那两个数来自旧舵机脉宽实测（tilt=41→J4=1230µs、96→2257µs），既不是新臂的机械极限，
+    也不该拿来当搜索边界 —— 41° 曾经把「近处目标的竖直抓取」直接排除在搜索之外
+    （r 小的时候 tilt=0 的 r_w=r 明明够得着）。可行与否一律由 SAFE_LIMITS 判定。
     所以「最平可用姿态」是随目标点变的，必须每个点重扫，不能写死。
 
     参数 j3_margin：J3 要留多少 位置单位 余量（默认 60）。🔴 为什么要留：
@@ -362,7 +363,7 @@ def plan_home():
 # ---------------------------------------------------------------------------
 # 执行层：这里才开始真的动臂
 # ---------------------------------------------------------------------------
-def wait_arrive(target, timeout=None, tol=ARRIVE_TOL_US, check_j6=False,
+def wait_arrive(target, timeout=None, tol=ARRIVE_TOL_POS, check_j6=False,
                 poll=0.1):
     """轮询 /api/state 直到 6 路位置都接近 target，返回实际读数。
 
@@ -427,7 +428,7 @@ def wait_jaw(target, timeout=None, tol=60, poll=0.08):
 #     泄力后手掰 J6 全张→全闭，读 $ARM,VIN 的 J6 电压曲线，找「空载基线/接触/
 #     夹住/堵转」的 mV 台阶，再回填 GRIP_*_MV。标定完成前 grip_until_contact 会
 #     直接抛 NotImplementedError，避免用未标定阈值误判。
-CUR_SAMPLES          = 3      # 每次判定读几遍取中位数（接触后单次读数有毛刺）
+VIN_SAMPLES          = 3      # 每次判定读几遍取中位数（接触后单次读数有毛刺）
 GRIP_STEP_COARSE     = 40     # 粗段步长 位置单位：离接触还远，走快点省时间
 GRIP_STEP_FINE       = 15     # 细段步长 位置单位：接近接触区必须小步，别一跨就过
 GRIP_COARSE_UNTIL    = 674    # 🔴 待标定：总线 J6 全闭=674，粗段终点标定后再设
@@ -454,7 +455,7 @@ def _median(vals):
     return (s[n // 2 - 1] + s[n // 2]) // 2
 
 
-def read_j6_vin_mv(samples=CUR_SAMPLES, gap=0.06):
+def read_j6_vin_mv(samples=VIN_SAMPLES, gap=0.06):
     """读 J6 电压（总线舵机 $ARM,VIN 第 6 路），多读几次取中位数，返回 int(mV)。
 
     🔴 总线舵机迁移：旧 $CUR/ACS712 电流判据已删除，改用 $ARM,VIN 电压回读。
@@ -483,7 +484,7 @@ def grip_until_contact(pose5, start=None, max_jaw=GRIP_MAX_JAW,
                        preload=GRIP_PRELOAD, verbose=True):
     """从 start 往 max_jaw 分步合爪，读到「明显夹住」的电压就停。
 
-    返回 (pulse, mv, base)；扫到 max_jaw 仍没接触则返回 None（夹空）。
+    返回 (j6_pos, mv, base)；扫到 max_jaw 仍没接触则返回 None（夹空）。
 
     🔴 总线舵机迁移：判据由 ACS712 电流（mA）改为 $ARM,VIN 电压（mV）。
     ⚠️ 电压堵转阈值（GRIP_RISE_MV / GRIP_HOLD_MV / GRIP_STALL_MV）尚未实机标定，
@@ -523,7 +524,7 @@ def grip_until_contact(pose5, start=None, max_jaw=GRIP_MAX_JAW,
     hold = base + int(hold_mv)
     if verbose:
         print("  基线 %d mV（%d 次中位数）｜碰上 基线+%d｜夹住 基线+%d｜J6 %d → %d"
-              % (base, CUR_SAMPLES, rise_mv, hold_mv, start, max_jaw))
+              % (base, VIN_SAMPLES, rise_mv, hold_mv, start, max_jaw))
 
     cand = None          # 首次「碰上了」的位置：不停爪，只记下来当备选
     last = (start, base)
@@ -792,11 +793,12 @@ def self_test():
         loop_worst = None
         print("（跳过第 7 组：没装 numpy，无法跑 IK→FK 闭环）")
 
-    # 8) 🔴 姿态自适应：best_tilt 必须返回「6 路都不越软限位」的解，且比默认 41° 更平。
+    # 8) 🔴 姿态自适应：best_tilt 必须返回「6 路都不越软限位」的解，且比竖直抓取更平。
     got = best_tilt(-5.0, 25.0, 2.0)
-    assert got is not None, "(-5, 25) 在 41~96° 内找不到可行姿态"
+    assert got is not None, "(-5, 25) 在 0~90° 内找不到可行姿态"
     bt, bp = got
-    assert bt > 41.0, "best_tilt 应比默认 41° 更平，实际 %.1f°" % bt
+    assert 0.0 <= bt <= 90.0, "best_tilt 应落在搜索区间 0~90°，实际 %.1f°" % bt
+    assert bt > 0.0, "该点应能找到比竖直抓取更平的姿态，实际 %.1f°" % bt
     for i, v in enumerate(bp):
         lo, hi = SAFE_LIMITS[i]
         assert lo <= v <= hi, ("best_tilt 越限", JOINT_NAMES[i], v, lo, hi)
@@ -842,7 +844,7 @@ def main():
     p_state = sub.add_parser("state", help="读当前 6 路位置")
     p_home = sub.add_parser("home", help="回初始位")
     p_grip = sub.add_parser("grip", help="电压引导分步合爪：夹到接触就停")
-    p_grip.add_argument("--from", dest="from_pulse", type=int, default=None,
+    p_grip.add_argument("--from", dest="from_pos", type=int, default=None,
                         help="起始 J6 位置，默认当前实际值；离当前位置超过 %d位置单位 会被"
                              "夹回（大跳变的启动冲击会假冒「夹住」）"
                              % GRIP_MAX_FROM_JUMP)
@@ -893,7 +895,7 @@ def main():
             print("  判据：碰上 基线+%s mV（不停爪）／夹住 基线+%s mV（停爪）"
                   % (args.rise_mv, args.hold_mv))
             print("  J6 %s → %d｜粗步 %d位置单位 / 细步 %d位置单位"
-                  % (args.from_pulse or positions[5], args.max_jaw,
+                  % (args.from_pos or positions[5], args.max_jaw,
                      GRIP_STEP_COARSE, GRIP_STEP_FINE))
             print("\n[dry-run] 一条动作命令都没有发出去。")
             return 0
@@ -903,7 +905,7 @@ def main():
             return 3
 
         try:
-            got = grip_until_contact(positions[:5], start=args.from_pulse,
+            got = grip_until_contact(positions[:5], start=args.from_pos,
                                      max_jaw=args.max_jaw,
                                      rise_mv=args.rise_mv,
                                      hold_mv=args.hold_mv)

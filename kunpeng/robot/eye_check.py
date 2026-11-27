@@ -402,10 +402,9 @@ def main():
                          "默认 auto = 无偏置 (0,0)（总线舵机位置闭环，无需下垂补偿）；"
                          "也可手动给 dx,dy")
     ap.add_argument("--radial-fix", default="auto",
-                    help="定位的径向修正系数（补「棋盘被算近」的系统偏差）。"
-                         "默认 auto = 用服务端 web_control._EYE_RADIAL_K（实测 1.091）；"
-                         "给 0 关闭；也可以直接给数，如 1.091。"
-                         "换相机安装角、棋盘远近或重标手眼 X 之后，这个系数必须重测")
+                    help="定位的径向修正系数。默认 auto = 用服务端 web_control._EYE_RADIAL_K"
+                         "（当前 1.0 = 不修正：旧 1.091 是旧 PWM 开环下垂的产物，已作废）；"
+                         "给 0 关闭；也可以直接给数（必须自己实测得出）")
     args = ap.parse_args()
 
     # --radial-fix：auto 就不传字段（服务端有自己的默认值，单一数据源）；
@@ -419,7 +418,7 @@ def main():
         try:
             radial_fix = float(_rf)
         except ValueError:
-            print("--radial-fix 要写 auto / 0 / 一个数字（如 1.091）")
+            print("--radial-fix 要写 auto / 0 / 一个数字（自己实测得出的系数）")
             return 1
         if radial_fix <= 0:
             print("--radial-fix 必须是正数（1.0 = 不修正）")
@@ -572,12 +571,9 @@ def main():
                                 float(r.get("y_raw", r["y"])))
             print("  径向修正    ×%.3f：%.2f → %.2f cm（%+.2f）"
                   % (float(_k_used), _r_raw, _r_fix, _r_fix - _r_raw))
-            print("              ↑ localize 用 FK 算「相机在哪」，可 FK 不知道舵机被重力"
-                  "压下（J2 ≈6.5°）；")
-            print("                相机骑在腕上（|t|≈16.7cm≈L3），被放大成坐标系统性偏近。")
-            print("                系数来自 11-14 实测（定位 27.54 / 钢尺 30.04 ⇒ 1.091）；"
-                  "单点值，换棋盘远近/重标 X 要重测。--radial-fix 0 可关掉对比")
-            print("                ⚠️ 只修径向：横向另有约 1.4cm 稳定系统误差，别拿这个系数凑")
+            print("              ↑ 这是**手动传入/启动参数给的**经验系数（默认 1.0 不修正）；"
+                  "旧的 1.091 来自旧 PWM 开环臂的下垂，已随总线闭环+臂长重标作废")
+            print("                ⚠️ 只修径向：横向偏差属于手眼 X 旋转 / J1 比例，别拿这个系数凑")
         if r.get("depth") is not None:
             print("  视线长度    %.2f cm（相机光心到该点）" % r["depth"])
         print("  水平距离    %.2f cm（距 J1 轴，方位角 %+.1f°）"
@@ -601,15 +597,6 @@ def main():
             # 平面高度必须跟定位用的那个一致，否则安全闸门算错净空
             plane_used = float(args.plane_z) if args.plane_z is not None \
                 else float(plane_default or 0.0)
-            # 径向修正把点往外推了 ⇒ 力矩臂更大 ⇒ 下垂更多 ⇒ 同样 --hover 净空更低。
-            # 提前喊一句，别等闸门报"真实净空 −0.4"才回头改参数。
-            _shift = float(r.get("radial_shift") or 0.0)
-            if _shift > 1.0 and float(args.hover) < 7.0:
-                print("")
-                print("  🔶 目标被径向推远 %.1f cm ⇒ 力矩臂变大、下垂更多："
-                      "同样的 --hover %.1f 真实净空会比标定点低。"
-                      % (_shift, float(args.hover)))
-                print("     若被闸门拒发，它会直接算出该写多少（约 7.5）。")
             rc = do_hover(args.api, float(r["x"]), float(r["y"]),
                           args.hover, positions, args.tilt, bias, plane_used,
                           tip_dx=args.tip_dx)

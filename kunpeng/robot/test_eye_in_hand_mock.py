@@ -1,11 +1,8 @@
-"""端到端 mock 验证：占位 X/K + 模拟串口 -> 像素 -> 眼在手 -> 工作台 -> IK -> 脉宽。
+"""端到端 mock 验证：占位 X/K + 模拟串口 -> 像素 -> 眼在手 -> 工作台 -> IK -> 六路位置。
 
-🔴🔴🔴 待迁移（2026-11-26）🔴🔴🔴
-本测试的假 Flask 仍模拟旧 PWM 协议（$STATE/$JOINT + pulses 字段 + PULSE_RANGES），
-而 web_control.py 已迁到 $ARM,READ/$ARM,POS（positions 字段 + POS_RANGES）。
-当前直接运行会因字段/协议/量程不匹配失败——不是主链路 bug，是 mock 停在旧协议。
-等 B 层（相机标定 + 手眼矩阵重标）后重写本文件。
-🔴🔴🔴 待迁移（2026-11-26）🔴🔴🔴
+协议口径（2026-11-27 迁移完成）：假固件按总线舵机 $ARM 协议应答
+（`ARM,READ` → `OK,POS,p1..p6`，`ARM,POS,...` → `OK,ARM,POS,<ms>`），
+接口字段与 web_control.py 一致：`positions` + `POS_RANGES`。
 
 为什么需要这个脚本（这是「软件先行」的核心价值）：
     真机验证要相机、要串口、要标定板，全齐了才能验一次；
@@ -82,16 +79,22 @@ def install_fake_serial():
             return b""
 
         def write(self, data):
-            # 假固件：识别 PING / STATE / LOG / JOINT，把应答塞进读缓冲
+            # 假固件：按总线舵机 $ARM 协议应答（PING / ARM,READ / ARM,POS / ARM,J / LOG）
             self._sent.append(data)
             text = data.decode("ascii", errors="replace").strip()
             payload = text.strip("$").split("*")[0] if text.startswith("$") else text
             if payload == "PING":
                 self._push("$OK,PONG*3E\r\n")
-            elif payload == "STATE":
-                self._push("$OK,S,C,1580,1900,2400,700,1450,1500*00\r\n")
-            elif payload.startswith("JOINT"):
-                self._push("$OK,JOINT*00\r\n")
+            elif payload == "ARM,READ":
+                # 假固件回一个「爪朝下、相机看得见桌面」的抓取位（不是六轴零位：
+                # 总线臂零位整臂竖直、相机光轴与桌面平行，眼在手会正确地拒绝求交）
+                self._push("$OK,POS,460,620,420,200,494,674*00\r\n")
+            elif payload.startswith("ARM,POS"):
+                self._push("$OK,ARM,POS,800*00\r\n")
+            elif payload.startswith("ARM,J"):
+                self._push("$OK,ARM,J,6,800*00\r\n")
+            elif payload.startswith("ARM,HOME"):
+                self._push("$OK,ARM,HOME,1000*00\r\n")
             elif payload.startswith("LOG"):
                 self._push("$OK,LOG*00\r\n")
             return len(data)
@@ -187,7 +190,7 @@ def main():
         check("/api/open ok", r.get("ok") is True)
 
         r = c.post("/api/state").get_json()
-        check("/api/state 拿到 6 路", len(r.get("pulses") or []) == 6, str(r.get("pulses")))
+        check("/api/state 拿到 6 路", len(r.get("positions") or []) == 6, str(r.get("positions")))
 
         body = {"u": 320, "v": 240, "apply": False}
         r = c.post("/api/ik/eye/solve", json=body).get_json()
@@ -196,10 +199,10 @@ def main():
         check("返回 x/y/z 三坐标", all(k in r for k in ("x", "y", "z")))
         check("返回 depth 且为正", isinstance(r.get("depth"), (int, float)) and r["depth"] > 0,
               "depth=%.2f cm" % (r.get("depth") or 0))
-        check("6 路脉宽齐全", len(r.get("pulses") or []) == 6, str(r.get("pulses")))
-        check("脉宽全在软限位内",
-              all(lo <= p <= hi for p, (lo, hi, _) in zip(r.get("pulses") or [], wc.PULSE_RANGES)),
-              str(r.get("pulses")))
+        check("6 路位置齐全", len(r.get("positions") or []) == 6, str(r.get("positions")))
+        check("位置全在软限位内",
+              all(lo <= p <= hi for p, (lo, hi, _) in zip(r.get("positions") or [], wc.POS_RANGES)),
+              str(r.get("positions")))
         check("placehodler 标记透传到结果", r.get("placeholder") is True)
         check("未下发（applied=False）", r.get("applied") is False)
         check("试算结果带占位警告", "占位" in (r.get("note") or ""), r.get("note", ""))
@@ -207,7 +210,7 @@ def main():
         x0, y0 = r["x"], r["y"]
 
         # ---- 6) 同一个像素，臂不动 -> 结果必须完全一致（确定性）----
-        print("\n[6] 确定性：同一像素 + 同一脉宽 -> 同一结果")
+        print("\n[6] 确定性：同一像素 + 同一位置 -> 同一结果")
         r2 = c.post("/api/ik/eye/solve", json=body).get_json()
         check("两次结果完全相同",
               abs(r2["x"] - x0) < 1e-9 and abs(r2["y"] - y0) < 1e-9,
@@ -216,10 +219,10 @@ def main():
         # ---- 7) 臂换姿态 -> 同一像素必须得到不同结果（这正是眼在手的价值）----
         print("\n[7] 关键差异：换姿态后同一像素结果应改变")
         other = {"u": 320, "v": 240, "apply": False,
-                 "pulses": [1450, 1850, 2350, 730, 1480, 1500]}
+                 "positions": [460, 700, 400, 700, 494, 674]}
         r3 = c.post("/api/ik/eye/solve", json=other).get_json()
         # 注意判据：这里必须允许 IK 失败。因为「相机看得见」和「臂够得着」是两件事——
-        # 相机在末端偏 2cm 朝下看，换个臂姿后视线落点可能刚好越过 25.2cm 臂展。
+        # 相机在末端偏 2cm 朝下看，换个臂姿后视线落点可能刚好越过 23.55cm 臂展。
         # 本项要验的是"坐标随姿态变化"这一几何事实，不是"任意姿态都能抓"。
         check("换姿态后仍返回工作台坐标（IK 可单独失败）",
               "x" in r3 and "y" in r3,
@@ -238,8 +241,8 @@ def main():
               r4.get("ok") is False or "超出范围" in (r4.get("note") or ""),
               "ok=%s error=%s" % (r4.get("ok"), (r4.get("error") or "")[:60]))
 
-        r5 = c.post("/api/ik/eye/solve", json={"u": 320, "v": 240, "pulses": [1, 2]}).get_json()
-        check("脉宽长度非法 -> 回退到串口读取", r5.get("ok") is True, r5.get("error", ""))
+        r5 = c.post("/api/ik/eye/solve", json={"u": 320, "v": 240, "positions": [1, 2]}).get_json()
+        check("位置长度非法 -> 回退到串口读取", r5.get("ok") is True, r5.get("error", ""))
 
         # ---- 9) 真下发 ----
         print("\n[9] apply=True 走真实下发路径（假串口收帧）")
@@ -247,14 +250,16 @@ def main():
         check("下发 ok=True", r6.get("ok") is True, r6.get("error", ""))
         check("applied=True", r6.get("applied") is True)
         check("固件应答 OK", (r6.get("resp") or "").startswith("OK"), r6.get("resp", ""))
-        check("下发的帧含 6 个脉宽", (r6.get("frame") or "").count(",") == 6, r6.get("frame", ""))
+        check("下发的帧是 $ARM,POS 六路",
+              (r6.get("frame") or "").startswith("ARM,POS,")
+              and (r6.get("frame") or "").count(",") == 7, r6.get("frame", ""))
 
         # ---- 10) 旧通路必须完好（不能被新功能改坏）----
         print("\n[10] 回归：旧的 /api/ik/solve 仍按原样工作")
         r7 = c.post("/api/ik/solve", json={"u": 320, "v": 240, "w": 640, "h": 480}).get_json()
         check("旧接口 ok=True", r7.get("ok") is True, r7.get("error", ""))
         check("旧接口无 mode 字段（保持原语义）", "mode" not in r7)
-        check("旧接口仍返回 6 路脉宽", len(r7.get("pulses") or []) == 6)
+        check("旧接口仍返回 6 路位置", len(r7.get("positions") or []) == 6)
 
         # ---- 11) 不启用眼在手时，接口必须明确拒绝 ----
         print("\n[11] 关闭眼在手后接口应拒绝")
@@ -270,7 +275,7 @@ def main():
         page = c.get("/")
         check("GET / 返回 200", page.status_code == 200)
         html = page.get_data(as_text=True)
-        check("页面含滑杆 J1~J6", html.count("pulse") >= 6 or "J6" in html)
+        check("页面含滑杆 J1~J6", html.count("id=\"s") >= 6 or "J6" in html)
         check("页面无渲染异常标记", "Traceback" not in html)
 
     print("\n" + "=" * 60)

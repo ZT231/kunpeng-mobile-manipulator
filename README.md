@@ -56,14 +56,17 @@
 - **边缘视觉服务**：`detector_service.py` :8080 跑 YOLOv8n + MJPEG 推流 / `/detections` / `/health`；
   B 方案抽帧推理 + C 方案 V4L2/MJPG 采集优化后，实测约 **26.6 FPS**（原 6.8 FPS）。
 - **网页控制台 + 点选抓取**：`web_control.py` :5000 内嵌单页，滑杆控六路、1s 状态回填、
-  点画面取点 → 平面约束单目定位 → `ArmIK` 解六路脉宽 → `JOINT` 下发 → `STATE` 回读；
+  点画面取点 → 眼在手定位 → `ArmIK` 解六路位置 → `$ARM,POS` 下发 → `$ARM,READ` 回读；
   标定参数常驻面板 + 浏览器本地预设（保存 / 切换 / 删除）。
+  🔶 协议层已于 2026-11-26 整体迁到总线舵机 `$ARM`（纯软件层已验证：py_compile + 离线
+  自测全绿）；**实机（装车后）复验未做**，手眼 X 需用 Orbbec Gemini E 重标。
 - **板内 IoT 可观测性闭环（1.2b）**：`iot/` 真实串口遥测 → MQTT → EMQX → eKuiper → InfluxDB → Grafana，
   四容器板上跑通、Grafana 六路 `j1~j6` 曲线已出（16:07 `records_in=records_out=59` / `exceptions=0`）；
   `deploy.sh` 动态重绑 firewalld trusted zone、`telemetry_bridge.py` 发布端拦 null 点；收口 `e6cd194`。
   🔴 只叫「可观测性闭环」，不是云端 IoT、不增抓取能力。
-- ⚠️ 上述上位机脚本里的 `$JOINT` / `$STATE` / `$HOME` 命令，**当前 STM32 固件已不再处理**
-  （机械臂代码已删）；脚本保留作历史/面试材料，接入前需重写协议层。
+- 上述上位机脚本已于 2026-11-26 迁移到 `$ARM` 协议（`$JOINT/$STATE/$MOVE/$HOME` 全部替换、
+  `$CUR/ACS712` 换成 `$ARM,VIN` 电压回读）；旧 PWM 时代的示教配方 / 下垂补偿 / C 姿态固定值
+  已一并删除。**新协议只在离线自测里验证过**，装车后仍需实机复验。
 
 ### 🔶 旧 STM32 单板项目已有，当前 Kunpeng 工程未重新实机复验
 
@@ -116,7 +119,8 @@
 ## 三大核心支柱（2026-11-13 历史定位；机械臂链已删除）
 
 > 🔴 **下面是旧「云-边-端移动操作平台」的完整构想，不是当前固件能力。** STM32 端的 PCA9685 / `$JOINT` / `$MOVE` / `STATE` 代码已于 2026-11-24 删除；
-> `kunpeng/robot`、`kunpeng/web` 里的 Python 脚本仍保留，但接当前固件前必须重写协议层。看当前能力请以本节顶部的「代码现状」和 `docs/00-项目总览…` 为准。
+> `kunpeng/robot`、`kunpeng/web` 里的 Python 脚本已于 2026-11-26 把协议层改写成 `$ARM`
+> （纯软件层验证；实机复验待装车）。看当前能力请以本节顶部的「代码现状」和 `docs/00-项目总览…` 为准。
 
 > 🔴 **「核心必备」的唯一判据 = 能演示 + 能讲清边界。** 三根支柱缺一不可：
 > 任何一根只能按实际情况标 ✅ / 🔶 / 📋，**不允许因为「它是核心」就写成已完成**。
@@ -124,7 +128,7 @@
 
 | # | 支柱 | 载体 | 职责 | 代码位置 | 当前状态 |
 |---|---|---|---|---|---|
-| **①** | **视觉引导执行**（端 + 边） | STM32F407VET6 + KunPeng Pro | 网页点选 / 眼在手定位 → `ArmIK` 解 6 路脉宽 → 串口 `$JOINT` → PCA9685 → `STATE` 回读 | `Core/`、`kunpeng/robot`、`kunpeng/vision`、`kunpeng/web` | ✅ 已实机；🔴 定位径向有 2.9cm 系统偏近（根因已定案，修法待落地） |
+| **①** | **视觉引导执行**（端 + 边） | STM32F407VET6 + KunPeng Pro | 网页点选 / 眼在手定位 → `ArmIK` 解六路位置 → `$ARM,POS` → `servo_bus` 总线舵机 → `$ARM,READ` 回读 | `Core/`、`kunpeng/robot`、`kunpeng/vision`、`kunpeng/web` | 🔶 旧 PWM 链 ✅（历史实证）；2026-11-26 换总线舵机 + `$ARM` 协议后**仅离线自测全绿**，装车实机复验待做；旧 1.091 径向系数已作废 |
 | **②** | **语音入口** | **ESP32-S3**（成品板 N16R8）+ 鲲鹏侧收帧服务 | WakeNet 唤醒 + 命令词识别 → 封帧 `$ASR,...*CK` → Wi-Fi 上行鲲鹏 → **本地仲裁 → 固件原生命令字** | `esp32/`、`kunpeng/robot/voice_gateway.py` | 🔶 **P0 核心，整体进行中**：IDF 骨架 **14 文件**（11-14 晚补 `tcp_client.c/.h` Wi-Fi TCP 上行 + 自检帧改纯 ASCII 快速通道，11-21 再补 `audio_tx.c/.h` PCM 上行），本机帧/网关实证 `PASS=24 FAIL=0`、PC 上整机 `set-target`（rc=0）+ `idf.py build` **已通过**（`BUILD_RC=0` / `Project build complete` / 产物齐全，**证据见 `docs/固件与ESP32开发.md`**）；✅ **已烧录实机验证**（SoftAP/TCP 9000 往返 $OK/采音非零；9001 音频上行待验收）；✅ **B 项阶段 2 鲲鹏侧网关链路 11-14 16:40 已上板实机验证**（38 项单测 + 四层硬判据全绿，见 `docs/KunPeng部署与语音网关上板验收.md`）；唤醒/命令词/ESP32 遥测仍无代码 |
 | **③** | **可观测性闭环** | KunPeng Pro（板内四容器） | 节点遥测 → MQTT → EMQX → eKuiper → InfluxDB → Grafana | `iot/` | ✅ 板内已实证：16:07 `records_in=records_out=59` / `exceptions=0`、Grafana 六路 `j1~j6` 曲线；🔶 **尚未覆盖 ESP32 节点、无告警规则** |
 
@@ -132,7 +136,8 @@
 ESP32-S3 听语音 → 鲲鹏意图解析 + `ArmIK` 算 6 路脉宽 → 串口 `$JOINT` → STM32 驱动 PCA9685 → `STATE` 回读；
 全过程六路脉宽与三节点健康度进 EMQX → Grafana。
 
-- **✅ 已打通**：浏览器点选 → 眼在手定位 → `ArmIK` → `$JOINT` → PCA9685 → `STATE` 回读。
+- **✅ 已打通（旧 PWM 链，历史）**：浏览器点选 → 眼在手定位 → `ArmIK` → `$JOINT` → PCA9685 → `STATE` 回读。
+  2026-11-26 起这条链的协议层已换成 `$ARM`，旧链仅作历史对照。
 - **🔶 待打通**：ESP32-S3 语音帧 → 鲲鹏收帧服务。✅ **鲲鹏侧 `voice_gateway.py` 已落盘 + 38 项本机单测全绿 + 11-14 16:40 上板 `--apply` 实机验收四层硬判据全绿**（TCP 收帧 → 帧校验 → 急停快速通道 → 本地仲裁 → `/api/cmd` 下发，默认 dry-run、只授权三个无参数命令字；假帧驱动臂回初始位、`PICK` 被拒、急停可冻结）；🔴 仍缺「ESP32 真的把帧发出来」这一段（11-14 晚已补 `tcp_client.c` 上行代码并本机验证，**但没上板**），`$ASR` 帧**语法层**已本机逐字节对齐、**语义层实机对齐待明天**，语音入口整体档位仍是 🔶。`text_gateway.py` 仍只做离线契约验证、不下发。
 - **✅ 已打通**：STM32 经鲲鹏的串口遥测 → 四容器 → Grafana 六路曲线。
 - **🔶 待打通**：ESP32 自身遥测（RSSI / 堆 / 唤醒计数）进 EMQX，让支柱 ③ 真正覆盖三节点。
@@ -146,7 +151,7 @@ ESP32-S3 听语音 → 鲲鹏意图解析 + `ArmIK` 算 6 路脉宽 → 串口 `
 |---|---|
 | STM32 固件（底盘 + 协议） | ✅ Rebuild 0 Error / 0 Warning（Code=24440 / RO=1016 / RW=212 / ZI=20860）；`PING`、`$CAR/$ODOM` 等**尚未实机验证** |
 | 鲲鹏 YOLOv8 识别 + MJPEG 推流 | ✅ 板上实测约 26.6 FPS（B 抽帧推理 + C V4L2/MJPG 采集优化后） |
-| 鲲鹏网页控制台 + 点选抓取（历史） | 🔶 Python 脚本还在，但 STM32 的 `$JOINT/$STATE` 已删除；接当前固件前必须重写协议层 |
+| 鲲鹏网页控制台 + 点选抓取 | 🔶 协议层已迁 `$ARM`（离线自测全绿）；**装车后实机复验未做**，手眼 X 待用深度相机重标 |
 | **支柱③** `iot/` 可观测性闭环（历史） | 🔶 旧六舵机遥测链路曾跑通（四容器 + Grafana `j1~j6` 曲线）；**STM32 固件已删舵机/机械臂代码，当前没有六路关节遥测**，需改成底盘 `$CAR,ODOM/WHEEL` 遥测后才能复用；ESP32 节点、eKuiper 告警仍未接 |
 | 手眼标定（眼在手，AX=XB） | 🔶 **历史能力**（12 组姿态实标，`resid` 16.7mm→**1.60mm**、`axis_cond` 0.519、`|t|`=16.7cm≈L3）；机械臂代码已于 2026-11-24 删除，`kunpeng/robot/handeye_calib.py` 仍保留 |
 | 蓝牙 / WiFi / RFID 多通道、示教回放 | 🔶 旧项目源码已有，当前工程未重新实机复验（RC522 当前未接） |
@@ -156,8 +161,11 @@ ESP32-S3 听语音 → 鲲鹏意图解析 + `ArmIK` 算 6 路脉宽 → 串口 `
 | 双 STM32 分工、双相机 6D 位姿、LLM 规划、OTA、云端 IoT、数字孪生 | 📋 纯规划，**无代码** |
 
 > 🔴 **读表提醒**：上表中凡涉及 PCA9685 / `$JOINT` / `$MOVE` / `$STATE` / `$HOME` / `$RESUME` / `$ESTOP` 的“✅/🔶”都是 **2026-11-24 之前的历史实证**。
-> 当前 STM32 固件只认 `$PING/$LOG/$CAR,VEL/$CAR,STOP/$CAR,ODOM/$CAR,RESET/$CAR,RAW/$CAR,WHEEL/$CAR,ENC/$CAR,GAIN/$CAR,CLRFAULT/$STOP`，**没有** `$ESTOP/$RESUME/$HOME/$JOINT/$MOVE/$STATE`；
-> `kunpeng/web`、`kunpeng/robot`、`voice_gateway.py` 的机械臂命令不能直接驱动当前固件，ESP32 的 `$ESTOP/$RESUME` 自检帧也必须改；当前底盘急停用 `$CAR,STOP` 或 `$STOP`。
+> 当前 STM32 固件认：`$PING/$LOG/$CAR,*`(VEL/STOP/ODOM/RESET/RAW/WHEEL/ENC/GAIN/CLRFAULT)/`$STOP`，
+> 以及机械臂 `$ARM,*`（POS/J/HOME/STOP/RESUME/READ/TEMP/VIN/CLRFAULT，见 `servo_bus.c` + `arm_robot.c`）；
+> **没有**顶层 `$ESTOP/$RESUME/$HOME/$JOINT/$MOVE/$STATE`。
+> `kunpeng/web`、`kunpeng/robot`、`voice_gateway.py` 已改用 `$ARM`（机械臂）/`$CAR,STOP`（底盘急停）；
+> ESP32 自检帧仍是顶层 `$ESTOP/$RESUME`，进 STM32 前必须改写成 `$ARM,STOP/$ARM,RESUME`。
 
 > 写简历 / 面试时的红线见 `docs/排障记录-固件与ESP32.md`「本阶段诚实边界」（原 `docs/面试与简历材料.md` 已删除，2026-11-24）。
 
@@ -185,7 +193,7 @@ RoboticArm_Kunpeng/
 │   ├── robot/                   机械臂解算与控制
 │   │   ├── arm_ik.py            逆/正运动学（ArmIK）
 │   │   ├── arm_params.json      舵机标定表
-│   │   ├── arm_host.py          串口发帧上位机（$JOINT/$MOVE/$STATE）
+│   │   ├── arm_host.py          旧 PWM 时代串口发帧上位机（$JOINT/$MOVE/$STATE）——已废弃，仅留作对照
 │   │   ├── handeye_calib.py     ✅ 手眼标定（AX=XB）：已实标 resid 1.60mm；A+ 点选链路待实测
 │   │   ├── eye_check.py         🆕 眼在手点选自检：固定棋盘 + 换姿态，看算出的坐标重不重合
 │   │   ├── action_primitives.py 🆕 动作原语：pick/place/home，每步回读关节角确认到位（🔶 离线全绿，未真机跑）
@@ -245,7 +253,7 @@ pip3 install flask pyserial          # 板端已有 ultralytics / opencv / numpy
 # 网页遥控：手机/电脑浏览器打开 http://<板IP>:5000，滑杆控 6 路舵机
 python3 kunpeng/web/web_control.py /dev/ttyUSB0 --baud 115200 --host 0.0.0.0 --port 5000
 
-# 眼在手点选（A+ 方案）：用「内参 K + 实标手眼 X + 当前 STATE 脉宽」把像素反投影成 3D 点再逆解，
+# 眼在手点选（A+ 方案）：用「内参 K + 手眼 X + 当前 $ARM,READ 位置」把像素反投影成 3D 点再逆解，
 # 换任何臂姿都能定位（A 方案 pixel_to_table 只对固定拍照姿态有效）
 python3 kunpeng/web/web_control.py /dev/serial/by-id/usb-1a86_USB_Serial-if00-port0 \
         --host 0.0.0.0 --port 5000 --eye-in-hand

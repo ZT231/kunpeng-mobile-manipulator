@@ -287,7 +287,7 @@ idf.py -p COM7 flash monitor
 | 跑「底盘最小判据」（现行见第五节） | 先把 `MDK-ARM/RoboticArm_Kunpeng.uvprojx` 烧进 **F407VE**（全项目唯一板） | ✅ Rebuild 0/0 通过，未烧录实机 |
 | 鲲鹏第二路 USB-TTL 统一调度 | **旧双板方案已随 `car/` 删除**；现在同一块 F407VE 共用 USART1，不再需要第二路 | 🚫 作废 |
 | **先接入 ESP32-S3** | 鲲鹏侧网关 ✅ 已上板实机验证（16:40）；成品板在手 | ✅ **现在就能推进** |
-| ACS712 + J6 限力夹持 | 见独立方案文档 | 📋 方案阶段 |
+| J6 限力夹持（原 ACS712 电流方案已废） | 总线舵机自带电压回读：`$ARM,J,6,...` 分步合爪 + `$ARM,VIN` 看电压被拉低即判接触 | 📋 命令已实现，阈值 GRIP_RISE_MV/HOLD_MV/STALL_MV 待实机标定 |
 
 🔴 **结论**：旧「A 项实机验收包 = 烧 `car/` + 4 条判据 + 第二路 USB-TTL」是**两块 F407 板**的旧方案，已随 `car/` 删除；现行底盘验收见第五节，目标板只有 **F407VE**，USART1 就是统一调试口。旧 `car/` 烧录仍按你的要求放最后，但它现在已不存在，不再有“第二块底盘板”这一步。
 
@@ -316,7 +316,7 @@ idf.py -p COM7 flash monitor
 | 2 | 阶段 0~1：ESP32 真发帧钉死「帧从板子发出来了」 | ❌ | 📋 |
 | 3 | 最后才进 ESP-SR 命令词（唯一有技术不确定性的一段） | ❌ | 📋 |
 | 4 | IoT 补 ESP32 节点遥测 + eKuiper 告警规则 | ❌ | 🔶 |
-| 5 | ACS712 / J6 限力夹持（📋 方案已出，独立于主线） | ⚠️ 要接线 + 标定 | 📋 |
+| 5 | J6 限力夹持（原 ACS712 电流方案已废，改 `$ARM,VIN` 电压判据；独立于主线） | ⚠️ 要实机标阈值 | 📋 |
 | **6（最后）** | **底盘实机验收**：Rebuild `RoboticArm_Kunpeng.uvprojx` → ST-LINK 烧 **F407VE** → 跑第五节最小判据 | ✅ **必须烧** | 🔶 Rebuild 0/0 通过（Code=24440），未烧录实机 |
 
 ---
@@ -586,8 +586,8 @@ python3 -u /root/kunpeng_vision/robot/voice_gateway.py --host 0.0.0.0 --port 900
 ① 对 ESP32-S3 说唤醒词 → "抓取"
 ② ESP32-S3 封帧 $ASR,pick*CK → Wi-Fi TCP → 鲲鹏 :9000
 ③ 鲲鹏 parse_frame 校验 → parse_intent → 判「需要先定位」
-④ 鲲鹏 eye_check 定位棋盘 → ArmIK 解 6 路 → 串口 $JOINT → STM32 → PCA9685
-⑤ STATE 回读六路脉宽 → 同时经 iot/ 进 EMQX → Grafana 曲线跳动
+④ 鲲鹏 eye_check 定位棋盘 → ArmIK 解 6 路位置 → 串口 $ARM,POS → STM32 → servo_bus 总线舵机
+⑤ $ARM,READ 回读六路位置 → 同时经 iot/ 进 EMQX → Grafana 曲线跳动
 ⑥ 若识别失败/网络断：Grafana 告警面板变红（这条比"成功"更能说明系统完整）
 ```
 
