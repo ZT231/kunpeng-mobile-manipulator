@@ -99,7 +99,7 @@ JOINTS = [
 # 实机用 --probe 核对轴符号，若某轴与注释相反，改该行 gain 符号（+1 ↔ −1），不要改 dir。
 # ("ax", 轴名, 增益) 模拟量；("bt", 键名, 增益) 数字键按住连续走
 ARM_MAP = {
-    "J1": [("ax", "lx", +1.0)],                       # 左摇杆 左右：右推 = 位置增大 = 俯视逆时针
+    "J1": [("ax", "lx", -1.0)],                       # 左摇杆 左右：右推 = 位置减小 = 俯视顺时针（与驾驶模式右推右转一致）
     "J2": [("ax", "ly", -1.0)],                       # 左摇杆 上下：推上 = 位置减小 = 大臂后仰
     "J3": [("ax", "ry", -1.0)],                       # 右摇杆 上下：推上 = 位置增大 = 小臂后折
     "J4": [("ax", "rx", +1.0)],                       # 右摇杆 左右：右推 = 位置增大 = 夹爪前仰
@@ -809,6 +809,7 @@ def run(args):
     mode = "DRIVE"
     estop = False
     homing = False
+    mode_guard = 0.0                  # 切到 DRIVE 后 0.3s 不接受油门，等车真正停稳/松杆
     tick_no = 0
     last_edge = {}                      # 防连击：同一个键 250ms 内只认一次
     next_tick = time.monotonic()
@@ -837,14 +838,15 @@ def run(args):
                     car.vel(*car.last_vel)   # 每两轴再喂一次，别让 6×30ms 攒到 500ms
 
     def switch_mode():
-        nonlocal mode
+        nonlocal mode, mode_guard
         car.stop()                        # 切换瞬间真刹停，并复位 last_vel（下一拍照常输出）
         if mode == "DRIVE":
             mode = "ARM"
             print("[模式] 机械臂（底盘锁定）｜左摇杆 X/Y=J1/J2 · 右摇杆 X/Y=J4/J3 · 十字 ←/→=J5 · LB/RB=夹爪")
         else:
             mode = "DRIVE"
-            print("[模式] 驾驶｜LT 油门 · 左摇杆平移 · 右摇杆 X 自转 · RT 精细")
+            mode_guard = time.monotonic() + 0.3
+            print("[模式] 驾驶｜LT 油门 · 左摇杆平移 · 右摇杆 X 自转 · RT 精细（0.3s 后才接受油门）")
 
     def on_signal(_sig, _frm):
         raise KeyboardInterrupt
@@ -916,7 +918,7 @@ def run(args):
 
             # ---------- 底盘 ----------
             if mode == "DRIVE":
-                thr = lt * fine
+                thr = (lt * fine) if now_s >= mode_guard else 0.0
                 vx = clampf(-ly * VX_MAX * thr, -VX_MAX, VX_MAX)
                 vy = clampf(lx * VY_MAX * thr, -VY_MAX, VY_MAX)
                 wz = clampf(-rx * WZ_MAX * thr, -WZ_MAX, WZ_MAX)
