@@ -94,15 +94,17 @@ JOINTS = [
     {"name": "J6", "id": 6, "lo": 300, "hi": 674, "spd": 140, "home": 674, "dir": -1},  # 夹爪（300=开、674=合；零位=闭合）
 ]
 
-# --- 机械臂模式：关节 <- 输入 绑定（推上/推右按 +1 记，方向不对改 dir） ---
+# --- 机械臂模式：关节 <- 输入 绑定 ---
+# 注释里的"推上/右推"按标准 joydev 轴方向理解（右推/下推=+1、左推/上推=−1）。
+# 实机用 --probe 核对轴符号，若某轴与注释相反，改该行 gain 符号（+1 ↔ −1），不要改 dir。
 # ("ax", 轴名, 增益) 模拟量；("bt", 键名, 增益) 数字键按住连续走
 ARM_MAP = {
-    "J1": [("ax", "lx", +1.0)],                       # 左摇杆 左右 = 底座回转
-    "J2": [("ax", "ly", -1.0)],                       # 左摇杆 上下 = 大臂抬降（推上=抬）
-    "J3": [("ax", "ry", -1.0)],                       # 右摇杆 上下 = 肘伸缩（推上=伸）
-    "J4": [("ax", "rx", +1.0)],                       # 右摇杆 左右 = 腕俯仰
-    "J5": [("ax", "dx", +0.75)],                       # 十字键 左右 = 腕滚转（帽键只有 0/±1，降 25% 更好微调）
-    "J6": [("bt", "LB", +1.0), ("bt", "RB", -1.0)],   # LB=张开 / RB=闭合
+    "J1": [("ax", "lx", +1.0)],                       # 左摇杆 左右：右推 = 位置增大 = 俯视逆时针
+    "J2": [("ax", "ly", -1.0)],                       # 左摇杆 上下：推上 = 位置减小 = 大臂后仰
+    "J3": [("ax", "ry", -1.0)],                       # 右摇杆 上下：推上 = 位置增大 = 小臂后折
+    "J4": [("ax", "rx", +1.0)],                       # 右摇杆 左右：右推 = 位置增大 = 夹爪前仰
+    "J5": [("ax", "dx", +0.75)],                       # 十字键 左右：右 = 位置减小 = 从腕看逆时针（帽键只有 0/±1，降 25% 更好微调）
+    "J6": [("bt", "LB", +1.0), ("bt", "RB", -1.0)],   # LB=位置减小=张开 / RB=位置增大=闭合
 }
 
 # --- 幻尔总线协议常量 ---
@@ -260,6 +262,8 @@ class ServoArm:
             d["target"] = float(jt["home"])   # 目标值（软件内积分，不等同于舵机实测）
             self.j[jt["name"]] = d
         self._dirty = {}
+        # live=False 的关节本次运行完全不发帧（读回失败/位置越界时用，避免把未知姿态的臂拽向 HOME）
+        self.live = {n: True for n in self.j}
         if dry:
             return
         import serial
@@ -280,36 +284,52 @@ class ServoArm:
     def flush(self):
         '''只发本拍变化过的关节，25Hz 下总线不会被打满'''
         for name in list(self._dirty):
-            j = self.j[name]
-            self._tx(j["id"], SB_CMD_MOVE,
-                     struct.pack("<HH", int(round(j["target"])), ARM_SEND_MS))
+            if self.live.get(name, False):
+                j = self.j[name]
+                self._tx(j["id"], SB_CMD_MOVE,
+                         struct.pack("<HH", int(round(j["target"])), ARM_SEND_MS))
         self._dirty.clear()
 
     def hold_all(self):
         '''急停/退出：位置保持。注意 CMD12 之后必须 CMD11 才恢复接受 MOVE'''
-        for j in self.j.values():
-            self._tx(j["id"], SB_CMD_MOVE_STOP)
+        for name, j in self.j.items():
+            if self.live.get(name, False):
+                self._tx(j["id"], SB_CMD_MOVE_STOP)
 
     def resume_all(self):
         '''解除 CMD12 的暂停（不清目标、不重发，重发交给 force_all）'''
-        for j in self.j.values():
-            self._tx(j["id"], SB_CMD_MOVE_START)
+        for name, j in self.j.items():
+            if self.live.get(name, False):
+                self._tx(j["id"], SB_CMD_MOVE_START)
 
     # ---------- 速度积分：把「输入」变成「目标」，不超限、不跳变 ----------
     def step(self, ctrl, dt, scale):
-        '''ctrl 已在 curve() 里过完死区（ARM_DZ/ARM_EXPO），这里不再重复判死区'''
+        '''ctrl 已在 curve() 里过完死区（ARM_DZ/ARM_EXPO），这里不再重复判死区。
+        target 若停在软限位之外（读回值越界），先按 spd 慢速收回限位，绝不一步跳进去。'''
         for name, j in self.j.items():
+            if not self.live.get(name, False):
+                continue
             v = ctrl.get(name, 0.0)
-            nt = j["target"] + j["dir"] * v * j["spd"] * dt * scale
-            nt = min(float(j["hi"]), max(float(j["lo"]), nt))
-            if abs(nt - j["target"]) >= 0.4:
+            lo, hi = float(j["lo"]), float(j["hi"])
+            t = j["target"]
+            step = j["spd"] * dt * scale
+            if t < lo:
+                nt = min(lo, t + step)
+            elif t > hi:
+                nt = max(hi, t - step)
+            else:
+                nt = t + j["dir"] * v * step
+                nt = min(hi, max(lo, nt))
+            if abs(nt - t) >= 0.4:
                 j["target"] = nt
                 self._dirty[name] = True
 
     def home_step(self, dt, scale=1.0):
-        '''一键回 HOME：每拍向 home 靠，全部到位返回 True'''
+        '''一键回 HOME：每拍向 home 靠，全部到位返回 True（home 必在 [lo,hi] 内，不会越界）'''
         done = True
         for name, j in self.j.items():
+            if not self.live.get(name, False):
+                continue
             gap = j["home"] - j["target"]
             if abs(gap) < 1.0:
                 continue
@@ -318,11 +338,11 @@ class ServoArm:
             nt = j["target"] + (step if gap > 0 else -step)
             if abs(j["home"] - nt) < step:      # 别冲过头
                 nt = float(j["home"])
-            j["target"] = min(float(j["hi"]), max(float(j["lo"]), nt))
+            j["target"] = nt
             self._dirty[name] = True
         return done
 
-    # ---------- 尽力读回位置（回包格式未实机核对，失败返回 None，绝不猜） ----------
+    # ---------- 尽力读回位置（回包格式按幻尔手册，PC 验收工具已实测；失败返回 None，绝不猜） ----------
     def read_pos(self, name, timeout=0.03):
         '''读位置（CMD 28）。回包 LEN=5，位置在第 6、7 字节，最后 1 字节是校验和。
         有的转接板会把我们发出去的请求原样回声，解析器只认「CMD28 且 LEN>=5」的合规帧。'''
@@ -353,7 +373,8 @@ class ServoArm:
 
     def force_all(self):
         for name in self.j:
-            self._dirty[name] = True
+            if self.live.get(name, False):
+                self._dirty[name] = True
 
 
 # ============================ 5. 手柄原始 js 解析 ============================
@@ -373,7 +394,13 @@ def js_node_list():
 
 
 def js_name(path):
-    '''取设备名（EVIOCGNAME）。失败返回空串，不抛异常。'''
+    '''取设备名。优先读 sysfs（不需要权限），退回 joydev 的 JSIOCGNAME；失败返回空串。'''
+    node = os.path.basename(path)                 # js0
+    try:
+        with open("/sys/class/input/%s/device/name" % node, "r") as f:
+            return f.read().strip()
+    except OSError:
+        pass
     try:
         import fcntl
     except ImportError:
@@ -384,8 +411,8 @@ def js_name(path):
         return ""
     try:
         buf = bytearray(128)
-        fcntl.ioctl(fd, 0x80004506, buf)          # EVIOCGNAME(128)
-        return buf.split(b"\x00")[0].decode("utf-8", "ignore").strip()
+        fcntl.ioctl(fd, 0x80806A13, buf)          # JSIOCGNAME(128) = _IOC(READ,'j',0x13,128)
+        return bytes(buf).split(b"\x00")[0].decode("utf-8", "ignore").strip()
     except Exception:
         return ""
     finally:
@@ -438,19 +465,17 @@ class JsPad:
     def _norm(self, name, kind, v):
         if kind == "s":
             return max(-1.0, min(1.0, v / 32767.0))
-        # 扳机有三种上报形态，按「首帧静止值」自动判，不需要用户知道是哪种：
-        #   ① -32767(松) → +32767(到底)：Linux joydev 的标准做法（最常见）
-        #   ② 0(松) → 255 或 0 → 32767：少数驱动
-        #   ③ 255(松) → 0(到底)：反相
-        st = self._trig.setdefault(name, {"zero": v, "full": 255.0})
+        # joydev 通常按 absinfo 把扳机归一成 int16，常见三种零点（兼容性分支，都收）：
+        #   ① 松手 ≈ -32767（双极）→ 到底 +32767
+        #   ② 松手 ≈ 0（单极）    → 到底 +32767
+        #   ③ 少数驱动不归一化/反相：松手在高位（如 255）→ 到底 0
+        st = self._trig.setdefault(name, {"zero": v})
         z = st["zero"]
-        if z <= -1000:
-            return max(0.0, min(1.0, (v - z) / (32767.0 - z)))
-        if z >= 200:
-            return max(0.0, min(1.0, (z - v) / float(z)))
-        if v > 512:                      # 行程超过 255 的只可能是 0~32767 的驱动
-            st["full"] = 32767.0
-        return max(0.0, min(1.0, v / st["full"]))
+        if z <= -1000:                          # ①
+            return clampf((v - z) / (32767.0 - z), 0.0, 1.0)
+        if z >= 200:                            # ③
+            return clampf((z - v) / float(z), 0.0, 1.0)
+        return clampf(v / 32767.0, 0.0, 1.0)    # ②
 
     def poll(self):
         '''读光当前所有事件'''
@@ -473,7 +498,8 @@ class JsPad:
                 break
             for off in range(0, len(data) - 7, 8):
                 _t, v, typ, num = struct.unpack_from(JS_FMT, data, off)
-                typ &= 0x7F                              # 去掉 INIT 标志
+                init = bool(typ & 0x80)                  # 打开设备时的状态快照，不是用户动作
+                typ &= 0x7F
                 if typ not in (0x01, 0x02):
                     continue
                 self.events.append((typ, num, v))
@@ -488,7 +514,7 @@ class JsPad:
                     if name is None:
                         continue
                     pressed = v > 0
-                    if pressed and not self.btn[name]:
+                    if pressed and not self.btn[name] and not init:
                         self.edges.append(name)
                     self.btn[name] = pressed
 
@@ -590,15 +616,24 @@ def validate_config():
             bad.append("%s 的 home=%s 落在限位之外" % (j["name"], j["home"]))
         if j["spd"] <= 0:
             bad.append("%s 的 spd 必须 >0" % j["name"])
+        if not (1 <= j["id"] <= 253):
+            bad.append("%s 的舵机 ID=%s 非法（1~253；254 是广播地址）" % (j["name"], j["id"]))
+        if j["dir"] not in (-1, 1):
+            bad.append("%s 的 dir=%s 只能是 +1 或 -1（0 会让该轴永远不动）" % (j["name"], j["dir"]))
 
     used = {}
     for joint, binds in ARM_MAP.items():
         if joint not in names:
             bad.append("ARM_MAP 绑定了不存在的关节 %s" % joint)
         for kind, key, gain in binds:
+            if kind not in ("ax", "bt"):
+                bad.append("%s 的绑定类型 %r 只能是 'ax' 或 'bt'" % (joint, kind))
+                continue
             src = AXES if kind == "ax" else BTNS
             if key not in src:
                 bad.append("%s 绑定的输入 %s 不在 %s 表里" % (joint, key, "AXES" if kind == "ax" else "BTNS"))
+            if gain == 0:
+                bad.append("%s 绑定的 %s 增益为 0（该输入永远不动）" % (joint, key))
             if key in used:
                 bad.append("输入 %s 同时绑给了 %s 和 %s（冲突）" % (key, used[key], joint))
             used[key] = joint
@@ -606,6 +641,12 @@ def validate_config():
                 bad.append("%s 用了扳机 %s：扳机在本方案里是油门/精调，不绑关节" % (joint, key))
             if kind == "bt" and key in RESERVED_BTNS:
                 bad.append("%s 占用了保留键 %s（A/B/START 是急停/回零/状态）" % (joint, key))
+
+    for label, nums in (("AXES", [v[0] for v in AXES.values()]), ("BTNS", list(BTNS.values()))):
+        dup = sorted({n for n in nums if nums.count(n) > 1})
+        if dup:
+            bad.append("%s 编号重复：%s（同一物理通道被绑了两次，--axis/--btn 覆盖后尤其要查）"
+                       % (label, dup))
 
     for n in names:
         if n not in ARM_MAP:
@@ -712,16 +753,32 @@ def run(args):
             print("[!] 打不开舵机转接板 %s：%s → 本次只控底盘" % (args.arm_port, e))
             arm = None
 
-    if arm is not None:
+    if arm is not None and not args.dry_run:   # dry-run 不读舵机，直接进主循环验按键
         got = 0
+        dead = []
+        parked = []
         for jt in JOINTS:
             p = arm.read_pos(jt["name"])
-            if p is not None:
-                arm.adopt(jt["name"], p)
-                got += 1
-                if not (jt["lo"] <= p <= jt["hi"]):
-                    print("[臂] %s 实测 %d 在软限位 %d~%d 之外 —— 先手动摆回再跑，"
-                          "否则第一次动就会先往限位里挤" % (jt["name"], p, jt["lo"], jt["hi"]))
+            if p is None:
+                dead.append(jt["name"])
+                continue
+            got += 1
+            if p > 1000:                          # 停在越程段（1000~1200）：不能作为合法目标
+                arm.live[jt["name"]] = False
+                parked.append((jt["name"], p))
+                continue
+            arm.adopt(jt["name"], p)              # 以实测位置为起点：上电第一帧不跳
+            if not (jt["lo"] <= p <= jt["hi"]):
+                print("[臂] %s 实测 %d 在软限位 %d~%d 之外：本次动作会先按 spd 慢速收回限位，"
+                      "确认结构安全后按第 7 节改 lo/hi" % (jt["name"], p, jt["lo"], jt["hi"]))
+        for name, p in parked:
+            print("[臂] %s 实测 %d 停在越程段(>1000)：本次不发帧，先用官方工具把它移回 0~1000 再重启"
+                  % (name, p))
+        if dead and got:
+            for name in dead:
+                arm.live[name] = False            # 关键：读回失败的轴一律不发帧，绝不按 HOME 硬拽
+            live_n = sum(1 for v in arm.live.values() if v)
+            print("[臂] 未读回：%s → 本次禁用这些轴（其余 %d 轴照常）" % (" ".join(dead), live_n))
         if got == 0:
             if args.arm_home:
                 print("[臂] 读回失败，按 --arm-home 以 HOME 为起点（姿态不符请立刻 A 急停）")
@@ -730,6 +787,10 @@ def run(args):
                 print("     确认六轴当前确实在 HOME 姿态后，加 --arm-home 重跑。")
                 arm.close()
                 arm = None
+        elif not any(arm.live.values()):
+            print("[臂] 六轴全部不可用（越程段/未读回）→ 本次只控底盘")
+            arm.close()
+            arm = None
         else:
             print("[臂] 读回成功 %d/6，起点已对齐实测位置" % got)
         if arm is not None:                  # 起点定了才允许下发，避免上电就甩向 HOME
@@ -754,19 +815,25 @@ def run(args):
 
     def status():
         lines = car.query("CAR,ODOM", want="$ODOM")
-        print("[状态] 里程:", (lines[-1] if lines else "(无应答)"), car.last_err)
+        err = car.last_err                 # 取一次就清，别把上一条旧错误永远打出来
+        car.last_err = ""
+        print("[状态] 里程:", (lines[-1] if lines else "(无应答)"), err)
         if arm is not None:
             car.vel(*car.last_vel)           # 读舵机要花 0.2~0.4s，先喂一次底盘看门狗
             for i, (name, j) in enumerate(arm.j.items(), 1):
-                p = arm.read_pos(name)
+                if arm.live.get(name, False):
+                    p = arm.read_pos(name)
+                    shown = "-" if p is None else p
+                else:
+                    shown = "禁用"
                 print("   %s id=%d 目标=%4d 限位=%d~%d 读回=%s"
-                      % (name, j["id"], int(round(j["target"])), j["lo"], j["hi"],
-                         "-" if p is None else p))
+                      % (name, j["id"], int(round(j["target"])), j["lo"], j["hi"], shown))
                 if i % 2 == 0:
                     car.vel(*car.last_vel)   # 每两轴再喂一次，别让 6×30ms 攒到 500ms
 
     def switch_mode():
         nonlocal mode
+        car.stop()                        # 切换瞬间真刹停，并复位 last_vel（下一拍照常输出）
         if mode == "DRIVE":
             mode = "ARM"
             print("[模式] 机械臂（底盘锁定）｜左摇杆 X/Y=J1/J2 · 右摇杆 X/Y=J4/J3 · 十字 ←/→=J5 · LB/RB=夹爪")
@@ -807,9 +874,9 @@ def run(args):
                             arm.force_all()      # 暂停期间目标没变，重发一遍保证舵机继续认 MOVE
                         print("[急停] 已解除")
                 elif key == "B":
-                    if not estop:
+                    if not estop and arm is not None:
                         homing = True
-                        print("[HOME] 六轴回折叠位，任意摇杆/键动作即中止")
+                        print("[HOME] 六轴回零位（J6 闭合到 674），推任一摇杆或按 LB/RB 即中止")
                 elif key == "START":
                     status()
                 elif key in MODE_SWITCH_BTNS:
@@ -825,7 +892,7 @@ def run(args):
             # RT 是模拟轴（不是按键）：压得越深越慢，1.0 → 0.5 连续过渡
             fine = 1.0 - (1.0 - FINE_SCALE) * curve(pad.val.get("rt", 0.0), TRIG_DZ, 1.0)
 
-            moving = any(abs(v) > 0.05 for v in (lx, ly, rx, ry)) \
+            moving = any(abs(v) > 0.05 for v in (lx, ly, rx, ry, pad.val.get("dx", 0.0), pad.val.get("dy", 0.0))) \
                 or pad.btn.get("LB") or pad.btn.get("RB")
             if homing and moving:
                 homing = False
@@ -835,7 +902,11 @@ def run(args):
                 car.stop()
                 car.drain()
                 next_tick += TICK_S
-                time.sleep(max(0.0, next_tick - time.monotonic()))
+                gap = next_tick - time.monotonic()
+                if gap > 0:
+                    time.sleep(gap)
+                else:
+                    next_tick = time.monotonic()      # 和主循环同一套调度，落后就重对齐
                 continue
 
             # ---------- 底盘 ----------
@@ -855,7 +926,8 @@ def run(args):
                 if homing:
                     if arm.home_step(TICK_S, fine):
                         homing = False
-                        print("[HOME] 已到位")
+                        off = [n for n, live in arm.live.items() if not live]
+                        print("[HOME] 已到位" + ("（禁用轴不参与：%s）" % " ".join(off) if off else ""))
                 elif mode == "ARM":
                     arm_scale = (1.0 + lt * (BOOST_MAX - 1.0)) * fine   # 1.0~2.0，再叠精细档
                     ctrl = {}
@@ -913,12 +985,34 @@ def main():
 
     if args.axis:
         for item in args.axis.split(","):
-            k, v = item.split(":")
-            AXES[k.strip().lower()] = (int(v), AXES[k.strip().lower()][1])
+            item = item.strip()
+            if not item:
+                continue
+            if ":" not in item:
+                raise SystemExit("--axis 格式错：%r，应为 lx:0,ly:1,..." % item)
+            k, v = item.split(":", 1)
+            k = k.strip().lower()
+            if k not in AXES:
+                raise SystemExit("--axis 里有未知轴名：%r（可选：%s）" % (k, ",".join(AXES)))
+            try:
+                AXES[k] = (int(v), AXES[k][1])
+            except ValueError:
+                raise SystemExit("--axis 的编号不是整数：%r" % item)
     if args.btn:
         for item in args.btn.split(","):
-            k, v = item.split(":")
-            BTNS[k.strip().upper()] = int(v)
+            item = item.strip()
+            if not item:
+                continue
+            if ":" not in item:
+                raise SystemExit("--btn 格式错：%r，应为 m1:10,m2:11" % item)
+            k, v = item.split(":", 1)
+            k = k.strip().upper()
+            if k not in BTNS:
+                raise SystemExit("--btn 里有未知键名：%r（可选：%s）" % (k, ",".join(BTNS)))
+            try:
+                BTNS[k] = int(v)
+            except ValueError:
+                raise SystemExit("--btn 的编号不是整数：%r" % item)
 
     if args.selftest:
         raise SystemExit(selftest())
