@@ -799,8 +799,13 @@ def run(args):
         else:
             print("[臂] 读回成功 %d/6，起点已对齐实测位置" % got)
         if arm is not None:                  # 起点定了才允许下发，避免上电就甩向 HOME
-            arm.force_all()
-            arm.flush()
+            try:
+                arm.force_all()
+                arm.flush()
+            except Exception as e:
+                print("[臂] 启动发帧失败：%s → 本次只控底盘" % e)
+                arm.close()
+                arm = None
 
     print(BANNER)
     if args.dry_run:
